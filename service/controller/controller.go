@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/xtls/xray-core/common/protocol"
@@ -412,41 +414,136 @@ func (c *Controller) addNewUser(userInfo *[]api.UserInfo, nodeInfo *api.NodeInfo
 }
 
 func compareUserList(old, new *[]api.UserInfo) (deleted, added []api.UserInfo) {
-	mSrc := make(map[api.UserInfo]byte) // 按源数组建索引
-	mAll := make(map[api.UserInfo]byte) // 源+目所有元素建索引
+	oldMap := make(map[int]api.UserInfo, len(*old))
+	newMap := make(map[int]api.UserInfo, len(*new))
 
-	var set []api.UserInfo // 交集
-
-	// 1.源数组建立map
-	for _, v := range *old {
-		mSrc[v] = 0
-		mAll[v] = 0
+	for _, u := range *old {
+		oldMap[u.UID] = u
 	}
-	// 2.目数组中，存不进去，即重复元素，所有存不进去的集合就是并集
-	for _, v := range *new {
-		l := len(mAll)
-		mAll[v] = 1
-		if l != len(mAll) { // 长度变化，即可以存
-			l = len(mAll)
-		} else { // 存不了，进并集
-			set = append(set, v)
+
+	for _, u := range *new {
+		newMap[u.UID] = u
+
+		oldUser, exists := oldMap[u.UID]
+		if !exists || !reflect.DeepEqual(oldUser, u) {
+			added = append(added, u)
 		}
 	}
-	// 3.遍历交集，在并集中找，找到就从并集中删，删完后就是补集（即并-交=所有变化的元素）
-	for _, v := range set {
-		delete(mAll, v)
-	}
-	// 4.此时，mall是补集，所有元素去源中找，找到就是删除的，找不到的必定能在目数组中找到，即新加的
-	for v := range mAll {
-		_, exist := mSrc[v]
-		if exist {
-			deleted = append(deleted, v)
-		} else {
-			added = append(added, v)
+
+	for _, u := range *old {
+		if _, exists := newMap[u.UID]; !exists {
+			deleted = append(deleted, u)
 		}
 	}
 
 	return deleted, added
+}
+
+type statCounterVisitor interface {
+	VisitCounters(func(string, stats.Counter) bool)
+}
+
+type trafficBucket struct {
+	uid         int
+	email       string
+	upload      int64
+	download    int64
+	upCounter   stats.Counter
+	downCounter stats.Counter
+}
+
+func parseTrafficUser(tag string, fullEmail string) (email string, uid int, ok bool) {
+	prefix := tag + "|"
+	if !strings.HasPrefix(fullEmail, prefix) {
+		return "", 0, false
+	}
+
+	rest := strings.TrimPrefix(fullEmail, prefix)
+	idx := strings.LastIndex(rest, "|")
+	if idx <= 0 || idx >= len(rest)-1 {
+		return "", 0, false
+	}
+
+	uid64, err := strconv.ParseInt(rest[idx+1:], 10, 64)
+	if err != nil {
+		return "", 0, false
+	}
+
+	return rest[:idx], int(uid64), true
+}
+
+func (c *Controller) collectTrafficByCounterVisit() (userTraffic []api.UserTraffic, upCounterList []stats.Counter, downCounterList []stats.Counter, ok bool) {
+	visitor, ok := c.stm.(statCounterVisitor)
+	if !ok {
+		return nil, nil, nil, false
+	}
+
+	buckets := make(map[string]*trafficBucket)
+
+	visitor.VisitCounters(func(name string, counter stats.Counter) bool {
+		value := counter.Value()
+		if value <= 0 {
+			return true
+		}
+
+		parts := strings.Split(name, ">>>")
+		if len(parts) != 4 {
+			return true
+		}
+
+		if parts[0] != "user" || parts[2] != "traffic" {
+			return true
+		}
+
+		email, uid, parsed := parseTrafficUser(c.Tag, parts[1])
+		if !parsed {
+			return true
+		}
+
+		b := buckets[parts[1]]
+		if b == nil {
+			b = &trafficBucket{
+				uid:   uid,
+				email: email,
+			}
+			buckets[parts[1]] = b
+		}
+
+		switch parts[3] {
+		case "uplink":
+			b.upload = value
+			b.upCounter = counter
+		case "downlink":
+			b.download = value
+			b.downCounter = counter
+		}
+
+		return true
+	})
+
+	userTraffic = make([]api.UserTraffic, 0, len(buckets))
+
+	for _, b := range buckets {
+		if b.upload <= 0 && b.download <= 0 {
+			continue
+		}
+
+		userTraffic = append(userTraffic, api.UserTraffic{
+			UID:      b.uid,
+			Email:    b.email,
+			Upload:   b.upload,
+			Download: b.download,
+		})
+
+		if b.upCounter != nil {
+			upCounterList = append(upCounterList, b.upCounter)
+		}
+		if b.downCounter != nil {
+			downCounterList = append(downCounterList, b.downCounter)
+		}
+	}
+
+	return userTraffic, upCounterList, downCounterList, true
 }
 
 func limitUser(c *Controller, user api.UserInfo, silentUsers *[]api.UserInfo) {
@@ -506,14 +603,40 @@ func (c *Controller) userInfoMonitor() (err error) {
 	var userTraffic []api.UserTraffic
 	var upCounterList []stats.Counter
 	var downCounterList []stats.Counter
+
 	AutoSpeedLimit := int64(c.config.AutoSpeedLimitConfig.Limit)
-	UpdatePeriodic := int64(c.config.UpdatePeriodic)
-	limitedUsers := make([]api.UserInfo, 0)
-	for _, user := range *c.userList {
-		up, down, upCounter, downCounter := c.getTraffic(c.buildUserTag(&user))
-		if up > 0 || down > 0 {
-			// Over speed users
-			if AutoSpeedLimit > 0 {
+
+	if AutoSpeedLimit <= 0 {
+		var ok bool
+		userTraffic, upCounterList, downCounterList, ok = c.collectTrafficByCounterVisit()
+		if !ok {
+			for _, user := range *c.userList {
+				up, down, upCounter, downCounter := c.getTraffic(c.buildUserTag(&user))
+				if up > 0 || down > 0 {
+					userTraffic = append(userTraffic, api.UserTraffic{
+						UID:      user.UID,
+						Email:    user.Email,
+						Upload:   up,
+						Download: down,
+					})
+
+					if upCounter != nil {
+						upCounterList = append(upCounterList, upCounter)
+					}
+					if downCounter != nil {
+						downCounterList = append(downCounterList, downCounter)
+					}
+				}
+			}
+		}
+	} else {
+		UpdatePeriodic := int64(c.config.UpdatePeriodic)
+		limitedUsers := make([]api.UserInfo, 0)
+
+		for _, user := range *c.userList {
+			up, down, upCounter, downCounter := c.getTraffic(c.buildUserTag(&user))
+			if up > 0 || down > 0 {
+				// Over speed users
 				if down > AutoSpeedLimit*1000000*UpdatePeriodic/8 || up > AutoSpeedLimit*1000000*UpdatePeriodic/8 {
 					if _, ok := c.limitedUsers[user]; !ok {
 						if c.config.AutoSpeedLimitConfig.WarnTimes == 0 {
@@ -529,28 +652,32 @@ func (c *Controller) userInfoMonitor() (err error) {
 				} else {
 					delete(c.warnedUsers, user)
 				}
-			}
-			userTraffic = append(userTraffic, api.UserTraffic{
-				UID:      user.UID,
-				Email:    user.Email,
-				Upload:   up,
-				Download: down})
 
-			if upCounter != nil {
-				upCounterList = append(upCounterList, upCounter)
+				userTraffic = append(userTraffic, api.UserTraffic{
+					UID:      user.UID,
+					Email:    user.Email,
+					Upload:   up,
+					Download: down,
+				})
+
+				if upCounter != nil {
+					upCounterList = append(upCounterList, upCounter)
+				}
+				if downCounter != nil {
+					downCounterList = append(downCounterList, downCounter)
+				}
+			} else {
+				delete(c.warnedUsers, user)
 			}
-			if downCounter != nil {
-				downCounterList = append(downCounterList, downCounter)
+		}
+
+		if len(limitedUsers) > 0 {
+			if err := c.UpdateInboundLimiter(c.Tag, &limitedUsers); err != nil {
+				log.Print(err)
 			}
-		} else {
-			delete(c.warnedUsers, user)
 		}
 	}
-	if len(limitedUsers) > 0 {
-		if err := c.UpdateInboundLimiter(c.Tag, &limitedUsers); err != nil {
-			log.Print(err)
-		}
-	}
+
 	if len(userTraffic) > 0 {
 		var err error // Define an empty error
 		if !c.config.DisableUploadTraffic {

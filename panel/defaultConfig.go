@@ -12,11 +12,7 @@ func getDefaultLogConfig() *LogConfig {
 
 func getDefaultConnectionConfig() *ConnectionConfig {
 	return &ConnectionConfig{
-		Handshake:    4,
-		ConnIdle:     30,
-		UplinkOnly:   2,
-		DownlinkOnly: 4,
-		BufferSize:   64,
+		Handshake: 4, ConnIdle: 10, UplinkOnly: 0, DownlinkOnly: 0, BufferSize: 16,
 	}
 }
 
