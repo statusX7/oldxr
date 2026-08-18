@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+export TZ=UTC
 
 if [[ $# -lt 5 || $# -gt 6 ]]; then
     echo "用法：$0 GOOS GOARCH GOARM ASSET_NAME VERSION [OUTPUT_DIR]" >&2
