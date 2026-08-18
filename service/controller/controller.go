@@ -30,29 +30,30 @@ type LimitInfo struct {
 }
 
 type Controller struct {
-	server       *core.Instance
-	config       *Config
-	stateMu      sync.RWMutex
-	clientInfo   api.ClientInfo
-	apiClient    api.API
-	nodeInfo     *api.NodeInfo
-	Tag          string
-	userList     *[]api.UserInfo
-	runtimeMu    sync.Mutex
-	lifecycleMu  sync.Mutex
-	taskContext  context.Context
-	cancelTasks  context.CancelFunc
-	taskWG       sync.WaitGroup
-	tasksRunning bool
-	tasks        []periodicTask
-	limitedUsers map[api.UserInfo]LimitInfo
-	warnedUsers  map[api.UserInfo]int
-	panelType    string
-	ibm          inbound.Manager
-	obm          outbound.Manager
-	stm          stats.Manager
-	dispatcher   *mydispatcher.DefaultDispatcher
-	startAt      time.Time
+	server          *core.Instance
+	config          *Config
+	stateMu         sync.RWMutex
+	clientInfo      api.ClientInfo
+	apiClient       api.API
+	nodeInfo        *api.NodeInfo
+	Tag             string
+	userList        *[]api.UserInfo
+	runtimeMu       sync.Mutex
+	lifecycleMu     sync.Mutex
+	taskContext     context.Context
+	cancelTasks     context.CancelFunc
+	taskWG          sync.WaitGroup
+	tasksRunning    bool
+	tasks           []periodicTask
+	limitedUsers    map[api.UserInfo]LimitInfo
+	warnedUsers     map[api.UserInfo]int
+	panelType       string
+	ibm             inbound.Manager
+	obm             outbound.Manager
+	stm             stats.Manager
+	dispatcher      *mydispatcher.DefaultDispatcher
+	trafficCounters userTrafficCounterVisitor
+	startAt         time.Time
 }
 
 type periodicTask struct {
@@ -82,6 +83,7 @@ func New(server *core.Instance, api api.API, config *Config, panelType string) *
 		startAt:    time.Now(),
 	}
 
+	controller.trafficCounters = controller.dispatcher
 	return controller
 }
 
@@ -583,6 +585,10 @@ type statCounterVisitor interface {
 	VisitCounters(func(string, stats.Counter) bool)
 }
 
+type userTrafficCounterVisitor interface {
+	VisitUserTrafficCounters(string, func(string, string, stats.Counter) bool) bool
+}
+
 type trafficBucket struct {
 	uid      int
 	email    string
@@ -611,28 +617,13 @@ func parseTrafficUser(tag string, fullEmail string) (email string, uid int, ok b
 }
 
 func (c *Controller) collectTrafficByCounterVisit(tag string) (userTraffic []api.UserTraffic, deltas []trafficCounterDelta, ok bool) {
-	visitor, ok := c.stm.(statCounterVisitor)
-	if !ok {
-		return nil, nil, false
-	}
-
 	buckets := make(map[string]*trafficBucket)
-
-	visitor.VisitCounters(func(name string, counter stats.Counter) bool {
-		parts := strings.Split(name, ">>>")
-		if len(parts) != 4 {
-			return true
-		}
-
-		if parts[0] != "user" || parts[2] != "traffic" {
-			return true
-		}
-
-		email, uid, parsed := parseTrafficUser(tag, parts[1])
+	collect := func(taggedEmail, direction string, counter stats.Counter) bool {
+		email, uid, parsed := parseTrafficUser(tag, taggedEmail)
 		if !parsed {
 			return true
 		}
-		if parts[3] != "uplink" && parts[3] != "downlink" {
+		if direction != "uplink" && direction != "downlink" {
 			return true
 		}
 
@@ -642,16 +633,16 @@ func (c *Controller) collectTrafficByCounterVisit(tag string) (userTraffic []api
 		}
 		deltas = append(deltas, delta)
 
-		b := buckets[parts[1]]
+		b := buckets[taggedEmail]
 		if b == nil {
 			b = &trafficBucket{
 				uid:   uid,
 				email: email,
 			}
-			buckets[parts[1]] = b
+			buckets[taggedEmail] = b
 		}
 
-		switch parts[3] {
+		switch direction {
 		case "uplink":
 			b.upload = delta.value
 		case "downlink":
@@ -659,7 +650,24 @@ func (c *Controller) collectTrafficByCounterVisit(tag string) (userTraffic []api
 		}
 
 		return true
-	})
+	}
+
+	if c.trafficCounters != nil && c.trafficCounters.VisitUserTrafficCounters(tag, collect) {
+		ok = true
+	} else {
+		visitor, supported := c.stm.(statCounterVisitor)
+		if !supported {
+			return nil, nil, false
+		}
+		visitor.VisitCounters(func(name string, counter stats.Counter) bool {
+			parts := strings.Split(name, ">>>")
+			if len(parts) != 4 || parts[0] != "user" || parts[2] != "traffic" {
+				return true
+			}
+			return collect(parts[1], parts[3], counter)
+		})
+		ok = true
+	}
 
 	userTraffic = make([]api.UserTraffic, 0, len(buckets))
 
@@ -676,7 +684,7 @@ func (c *Controller) collectTrafficByCounterVisit(tag string) (userTraffic []api
 		})
 	}
 
-	return userTraffic, deltas, true
+	return userTraffic, deltas, ok
 }
 
 func limitUser(c *Controller, tag string, user api.UserInfo, silentUsers *[]api.UserInfo) {

@@ -92,14 +92,14 @@ func (r *cachedReader) Interrupt() {
 
 // DefaultDispatcher is a default implementation of Dispatcher.
 type DefaultDispatcher struct {
-	ohm         outbound.Manager
-	router      routing.Router
-	policy      policy.Manager
-	stats       stats.Manager
-	dns         dns.Client
-	fdns        dns.FakeDNSEngine
-	Limiter     *limiter.Limiter
-	RuleManager *rule.Manager
+	ohm             outbound.Manager
+	router          routing.Router
+	policy          policy.Manager
+	dns             dns.Client
+	fdns            dns.FakeDNSEngine
+	Limiter         *limiter.Limiter
+	RuleManager     *rule.Manager
+	trafficCounters *userTrafficCounterIndex
 }
 
 func init() {
@@ -122,7 +122,7 @@ func (d *DefaultDispatcher) Init(config *Config, om outbound.Manager, router rou
 	d.ohm = om
 	d.router = router
 	d.policy = pm
-	d.stats = sm
+	d.trafficCounters = newUserTrafficCounterIndex(sm)
 	d.Limiter = limiter.New()
 	d.RuleManager = rule.New()
 	d.dns = dns
@@ -249,8 +249,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network, sn
 		}
 		p := d.policy.ForLevel(user.Level)
 		if p.Stats.UserUplink {
-			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
-			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
+			if c := d.trafficCounters.getOrRegister(sessionInbound.Tag, user.Email, "uplink"); c != nil {
 				inboundLink.Writer = &SizeStatWriter{
 					Counter: c,
 					Writer:  inboundLink.Writer,
@@ -258,8 +257,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network, sn
 			}
 		}
 		if p.Stats.UserDownlink {
-			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
-			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
+			if c := d.trafficCounters.getOrRegister(sessionInbound.Tag, user.Email, "downlink"); c != nil {
 				outboundLink.Writer = &SizeStatWriter{
 					Counter: c,
 					Writer:  outboundLink.Writer,

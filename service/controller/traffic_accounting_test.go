@@ -9,6 +9,7 @@ import (
 
 	"github.com/XrayR-project/XrayR/api"
 	statsapp "github.com/xtls/xray-core/app/stats"
+	"github.com/xtls/xray-core/features/stats"
 )
 
 type testTrafficCounter struct {
@@ -33,6 +34,25 @@ func (c *testTrafficCounter) Add(value int64) int64 {
 
 type testTrafficReporter struct {
 	report func(*[]api.UserTraffic) error
+}
+
+type testUserTrafficCounterVisitor struct {
+	byTag map[string][]testIndexedTrafficCounter
+}
+
+type testIndexedTrafficCounter struct {
+	taggedEmail string
+	direction   string
+	counter     stats.Counter
+}
+
+func (v *testUserTrafficCounterVisitor) VisitUserTrafficCounters(tag string, visitor func(string, string, stats.Counter) bool) bool {
+	for _, indexed := range v.byTag[tag] {
+		if !visitor(indexed.taggedEmail, indexed.direction, indexed.counter) {
+			break
+		}
+	}
+	return true
 }
 
 func (r testTrafficReporter) ReportUserTraffic(traffic *[]api.UserTraffic) error {
@@ -110,6 +130,38 @@ func TestCollectTrafficByCounterVisitDrainsOnlyControllerCounters(t *testing.T) 
 	}
 	if got := unknownDirection.Value(); got != 400 {
 		t.Fatalf("unknown direction counter = %d, want 400", got)
+	}
+}
+
+func TestCollectTrafficByIndexedVisitDrainsOnlyControllerCounters(t *testing.T) {
+	uplink := newTestTrafficCounter(100)
+	downlink := newTestTrafficCounter(200)
+	other := newTestTrafficCounter(300)
+	controller := &Controller{trafficCounters: &testUserTrafficCounterVisitor{byTag: map[string][]testIndexedTrafficCounter{
+		"node-tag": {
+			{taggedEmail: "node-tag|user@example.com|42", direction: "uplink", counter: uplink},
+			{taggedEmail: "node-tag|user@example.com|42", direction: "downlink", counter: downlink},
+		},
+		"other-tag": {
+			{taggedEmail: "other-tag|user@example.com|42", direction: "uplink", counter: other},
+		},
+	}}}
+
+	traffic, deltas, ok := controller.collectTrafficByCounterVisit("node-tag")
+	if !ok {
+		t.Fatal("indexed counter visitor must be supported")
+	}
+	if len(traffic) != 1 || traffic[0].UID != 42 || traffic[0].Email != "user@example.com" || traffic[0].Upload != 100 || traffic[0].Download != 200 {
+		t.Fatalf("unexpected traffic: %#v", traffic)
+	}
+	if len(deltas) != 2 {
+		t.Fatalf("deltas = %d, want 2", len(deltas))
+	}
+	if uplink.Value() != 0 || downlink.Value() != 0 {
+		t.Fatalf("controller counters were not drained: up=%d down=%d", uplink.Value(), downlink.Value())
+	}
+	if got := other.Value(); got != 300 {
+		t.Fatalf("other controller counter = %d, want 300", got)
 	}
 }
 
