@@ -367,3 +367,30 @@ func TestV2BoardLegacyNoOpReports(t *testing.T) {
 		t.Fatalf("ReportIllegal: %v", err)
 	}
 }
+
+func TestV2BoardInvalidRuleReturnsError(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/server/Deepbwork/config", func(w http.ResponseWriter, r *http.Request) {
+		assertLegacyQuery(t, r, true)
+		writeJSON(t, w, map[string]any{
+			"inbounds": []any{map[string]any{
+				"port":           443,
+				"streamSettings": map[string]any{"network": "tcp", "security": "none"},
+			}},
+			"routing": map[string]any{"rules": []any{
+				map[string]any{"type": "field"},
+				map[string]any{"domain": []string{"regexp:["}},
+			}},
+		})
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client := newClient(server.URL, "V2ray")
+	if _, err := client.GetNodeInfo(); err != nil {
+		t.Fatalf("GetNodeInfo: %v", err)
+	}
+	if _, err := client.GetNodeRule(); err == nil || !strings.Contains(err.Error(), "invalid V2Board rule") {
+		t.Fatalf("GetNodeRule error = %v, want invalid rule error", err)
+	}
+}

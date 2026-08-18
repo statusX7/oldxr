@@ -90,6 +90,15 @@ type DetectRule struct {
 	Pattern *regexp.Regexp
 }
 
+// CompileDetectRule validates and compiles a panel or local audit rule.
+func CompileDetectRule(id int, pattern string) (DetectRule, error) {
+	compiled, err := regexp.Compile(pattern)
+	if err != nil {
+		return DetectRule{}, err
+	}
+	return DetectRule{ID: id, Pattern: compiled}, nil
+}
+
 type DetectResult struct {
 	UID    int
 	RuleID int

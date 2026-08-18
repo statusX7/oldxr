@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"reflect"
-	"regexp"
 	"strconv"
 	"time"
 
@@ -83,10 +83,12 @@ func readLocalRuleList(path string) (LocalRuleList []api.DetectRule) {
 
 		// read line by line
 		for fileScanner.Scan() {
-			LocalRuleList = append(LocalRuleList, api.DetectRule{
-				ID:      -1,
-				Pattern: regexp.MustCompile(fileScanner.Text()),
-			})
+			rule, err := api.CompileDetectRule(-1, fileScanner.Text())
+			if err != nil {
+				log.Printf("忽略无效的本地审计规则：%s", err)
+				continue
+			}
+			LocalRuleList = append(LocalRuleList, rule)
 		}
 		// handle first encountered error while reading
 		if err := fileScanner.Err(); err != nil {
@@ -127,7 +129,7 @@ func (c *APIClient) parseResponse(res *resty.Response, path string, err error) (
 		return nil, fmt.Errorf("request %s failed: %s", c.assembleURL(path), err)
 	}
 
-	if res.StatusCode() > 400 {
+	if res.StatusCode() >= http.StatusBadRequest {
 		body := res.Body()
 		return nil, fmt.Errorf("request %s failed: %s, %s", c.assembleURL(path), string(body), err)
 	}
@@ -357,17 +359,18 @@ func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
 	if err := json.Unmarshal(response.Data, ruleListResponse); err != nil {
 		return nil, fmt.Errorf("unmarshal %s failed: %s", reflect.TypeOf(ruleListResponse), err)
 	}
-	ruleList := c.LocalRuleList
+	ruleList := append([]api.DetectRule(nil), c.LocalRuleList...)
 	// Only support reject rule type
 	if ruleListResponse.Mode != "reject" {
 		return &ruleList, nil
 	} else {
 		for _, r := range ruleListResponse.Rules {
 			if r.Type == "reg" {
-				ruleList = append(ruleList, api.DetectRule{
-					ID:      r.ID,
-					Pattern: regexp.MustCompile(r.Pattern),
-				})
+				rule, compileErr := api.CompileDetectRule(r.ID, r.Pattern)
+				if compileErr != nil {
+					return nil, fmt.Errorf("invalid ProxyPanel rule %d: %w", r.ID, compileErr)
+				}
+				ruleList = append(ruleList, rule)
 			}
 
 		}
