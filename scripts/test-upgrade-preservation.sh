@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if [[ $# -ne 3 ]]; then
-    echo "用法：$0 RELEASE_ARCHIVE INSTALL_SCRIPT SOURCE_BINARY" >&2
+if [[ $# -lt 3 || $# -gt 5 ]]; then
+    echo "用法：$0 RELEASE_ARCHIVE INSTALL_SCRIPT OFFICIAL_BINARY [STATUSX7_XR_BINARY] [OLDXR_R1_BINARY]" >&2
     exit 2
 fi
 
 archive="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 install_script="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
 source_binary="$(cd "$(dirname "$3")" && pwd)/$(basename "$3")"
+statusx7_binary="${4:-${source_binary}}"
+oldxr_r1_binary="${5:-${source_binary}}"
+statusx7_binary="$(cd "$(dirname "${statusx7_binary}")" && pwd)/$(basename "${statusx7_binary}")"
+oldxr_r1_binary="$(cd "$(dirname "${oldxr_r1_binary}")" && pwd)/$(basename "${oldxr_r1_binary}")"
 archive_name="$(basename "${archive}")"
 checksum="${archive}.sha256"
 release_version="$(sed -n 's/^MAINTENANCE_0_9_0="\([^"]*\)"/\1/p' "${install_script}")"
@@ -18,7 +22,7 @@ if [[ ! "${release_version}" =~ ^v0\.9\.0-r[0-9]+$ ]]; then
     exit 1
 fi
 
-for required in "${archive}" "${checksum}" "${install_script}" "${source_binary}"; do
+for required in "${archive}" "${checksum}" "${install_script}" "${source_binary}" "${statusx7_binary}" "${oldxr_r1_binary}"; do
     [[ -f "${required}" ]] || { echo "错误：测试输入不存在：${required}" >&2; exit 1; }
 done
 
@@ -58,6 +62,7 @@ chmod +x "${mock_systemctl}"
 prepare_layout() {
     local name="$1"
     local source_marker="$2"
+    local layout_binary="$3"
     local root="${test_root}/${name}"
     local config_path="/etc/XrayR/config.yml"
 
@@ -68,7 +73,7 @@ prepare_layout() {
     rm -rf "${root}"
     mkdir -p "${root}/usr/local/XrayR" "${root}/etc/XrayR" \
         "${root}/etc/systemd/system" "${root}/usr/bin"
-    cp "${source_binary}" "${root}/usr/local/XrayR/XrayR"
+    cp "${layout_binary}" "${root}/usr/local/XrayR/XrayR"
     chmod +x "${root}/usr/local/XrayR/XrayR"
     printf '#!/usr/bin/env bash\n# %s\n' "${source_marker}" > "${root}/usr/local/XrayR/XrayR.sh"
     cp "${root}/usr/local/XrayR/XrayR.sh" "${root}/usr/bin/XrayR"
@@ -86,6 +91,7 @@ SERVICE
     printf '%s\n' "${config_path}" > "${root}/config-path"
     sha256sum "${root}${config_path}" | awk '{print $1}' > "${root}/config-before"
     sha256sum "${root}/usr/local/XrayR/XrayR" | awk '{print $1}' > "${root}/binary-before"
+    "${root}/usr/local/XrayR/XrayR" -version | sed -n '1p' > "${root}/version-before"
     sha256sum "${root}/etc/systemd/system/XrayR.service" | awk '{print $1}' > "${root}/service-before"
     sha256sum "${root}/usr/bin/XrayR" | awk '{print $1}' > "${root}/manager-before"
     sha256sum "$(dirname "${root}${config_path}")/custom_inbound.json" | awk '{print $1}' > "${root}/custom-before"
@@ -133,6 +139,7 @@ assert_preserved_upgrade() {
     [[ -n "${backup}" && -f "${backup}/manifest" ]]
     grep -F "config_path=${config_path}" "${backup}/manifest" >/dev/null
     grep -F "config_sha256=$(<"${root}/config-before")" "${backup}/manifest" >/dev/null
+    grep -F "version=$(<"${root}/version-before")" "${backup}/manifest" >/dev/null
     [[ -f "${backup}/install/XrayR" ]]
     [[ -f "${backup}/system/XrayR.service" ]]
     [[ -f "${backup}/config/config.yml" ]]
@@ -140,20 +147,21 @@ assert_preserved_upgrade() {
 }
 
 echo "执行 official XrayR v0.9.0 布局升级测试"
-prepare_layout official 'https://github.com/XrayR-project/XrayR'
+prepare_layout official 'https://github.com/XrayR-project/XrayR' "${source_binary}"
 assert_preserved_upgrade official 'official XrayR'
 
 echo "执行 statusX7/XR legacy 布局升级测试"
-prepare_layout statusx7-xr 'https://github.com/statusX7/XR'
+prepare_layout statusx7-xr 'https://github.com/statusX7/XR' "${statusx7_binary}"
 assert_preserved_upgrade statusx7-xr 'statusX7/XR legacy'
 
 echo "执行 oldxr v0.9.0-r1 布局升级测试"
-prepare_layout oldxr-r1 'https://github.com/statusX7/oldxr'
+prepare_layout oldxr-r1 'https://github.com/statusX7/oldxr' "${oldxr_r1_binary}"
 printf 'v0.9.0-r1\n' > "${test_root}/oldxr-r1/usr/local/XrayR/.oldxr-release"
+printf 'v0.9.0-r1\n' > "${test_root}/oldxr-r1/version-before"
 assert_preserved_upgrade oldxr-r1 oldxr
 
 echo "执行 service 启动失败回滚测试"
-prepare_layout rollback 'https://github.com/XrayR-project/XrayR'
+prepare_layout rollback 'https://github.com/XrayR-project/XrayR' "${source_binary}"
 touch "${test_root}/rollback/systemctl-fail-once"
 if run_installer rollback >/dev/null 2>&1; then
     echo "错误：service 启动失败时安装脚本未返回失败。" >&2
