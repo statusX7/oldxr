@@ -257,8 +257,8 @@ git status --short
 - 需要 Redis、panel、TLS、网络或特权端口的测试必须显式标注和隔离。
 - 修复 race 必须保留能够在修复前触发、修复后通过的回归测试。
 - 全仓库验证如果被无关基线问题阻断，必须同时运行受影响 package 的定向验证，并如实报告两者；不得把定向通过写成全仓库通过。
-- 当前 `common/legocmd` 的旧 `github.com/gfw-fuck/XrayR` import 与未锁定依赖会阻断 `go test ./...`、`go vet ./...`、`go test -race ./...`。修复它必须作为独立任务审查，不能偷偷改依赖基线。
-- 当前部分测试使用 unkeyed `api.DetectResult` literal，`go vet` 会失败；不得隐藏该结果。
+- 已从生产依赖图和官方 v0.9.0 tag 之外清理历史污染目录 `common/legocmd`；不得为恢复该目录而引入旧 `github.com/gfw-fuck/XrayR` import、`urfave/cli` 或未锁定的间接依赖。
+- integration test 必须使用 `//go:build integration` 显式隔离，同时仍通过 `-tags=integration -run '^$'` 和相应 vet 保证可编译；不得用 build tag 隐藏静态检查错误。
 
 ## Go 工程规则
 

@@ -80,6 +80,7 @@ func TestBuildSS(t *testing.T) {
 		Path:              "v2ray",
 		EnableTLS:         false,
 		TLSType:           "tls",
+		CypherMethod:      "aes-128-gcm",
 	}
 	DNSEnv := make(map[string]string)
 	DNSEnv["ALICLOUD_ACCESS_KEY"] = "aaa"
