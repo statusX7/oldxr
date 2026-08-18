@@ -112,6 +112,21 @@ func (i *userTrafficCounterIndex) visit(tag string, visitor func(string, string,
 	}
 }
 
+func (i *userTrafficCounterIndex) visitPairs(tag string, visitor func(string, stats.Counter, stats.Counter) bool) {
+	loaded, ok := i.sets.Load(tag)
+	if !ok {
+		return
+	}
+	set := loaded.(*userTrafficCounterSet)
+	set.mu.RLock()
+	defer set.mu.RUnlock()
+	for taggedEmail, pair := range set.byEmail {
+		if !visitor(taggedEmail, pair.uplink, pair.downlink) {
+			return
+		}
+	}
+}
+
 // VisitUserTrafficCounters visits only counters that belong to tag. The
 // callback runs under the tag-local read lock, not xray-core's global stats
 // manager lock.
@@ -120,5 +135,15 @@ func (d *DefaultDispatcher) VisitUserTrafficCounters(tag string, visitor func(st
 		return false
 	}
 	d.trafficCounters.visit(tag, visitor)
+	return true
+}
+
+// VisitUserTrafficCounterPairs visits each user's counters together so traffic
+// reporting can parse the identity and build its report once per user.
+func (d *DefaultDispatcher) VisitUserTrafficCounterPairs(tag string, visitor func(string, stats.Counter, stats.Counter) bool) bool {
+	if d.trafficCounters == nil {
+		return false
+	}
+	d.trafficCounters.visitPairs(tag, visitor)
 	return true
 }

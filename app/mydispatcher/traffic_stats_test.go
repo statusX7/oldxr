@@ -81,6 +81,28 @@ func TestUserTrafficCounterIndexVisitIsIsolatedByTag(t *testing.T) {
 	}
 }
 
+func TestUserTrafficCounterIndexVisitsCounterPairs(t *testing.T) {
+	index, _ := newTestUserTrafficCounterIndex(t)
+	taggedEmail := "node-1|first@example.com|1"
+	uplink := index.getOrRegister("node-1", taggedEmail, "uplink")
+	downlink := index.getOrRegister("node-1", taggedEmail, "downlink")
+	if uplink == nil || downlink == nil {
+		t.Fatal("expected both counters")
+	}
+
+	visits := 0
+	index.visitPairs("node-1", func(email string, up, down featurestats.Counter) bool {
+		visits++
+		if email != taggedEmail || up != uplink || down != downlink {
+			t.Fatalf("unexpected pair: email=%q up=%p down=%p", email, up, down)
+		}
+		return true
+	})
+	if visits != 1 {
+		t.Fatalf("pair visits = %d, want 1", visits)
+	}
+}
+
 func TestUserTrafficCounterIndexConcurrentVisitAndRegistration(t *testing.T) {
 	index, _ := newTestUserTrafficCounterIndex(t)
 	const users = 1_000

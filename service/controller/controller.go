@@ -589,6 +589,10 @@ type userTrafficCounterVisitor interface {
 	VisitUserTrafficCounters(string, func(string, string, stats.Counter) bool) bool
 }
 
+type userTrafficCounterPairVisitor interface {
+	VisitUserTrafficCounterPairs(string, func(string, stats.Counter, stats.Counter) bool) bool
+}
+
 type trafficBucket struct {
 	uid      int
 	email    string
@@ -617,6 +621,37 @@ func parseTrafficUser(tag string, fullEmail string) (email string, uid int, ok b
 }
 
 func (c *Controller) collectTrafficByCounterVisit(tag string) (userTraffic []api.UserTraffic, deltas []trafficCounterDelta, ok bool) {
+	if pairVisitor, supported := c.trafficCounters.(userTrafficCounterPairVisitor); supported {
+		ok = pairVisitor.VisitUserTrafficCounterPairs(tag, func(taggedEmail string, uplink, downlink stats.Counter) bool {
+			email, uid, parsed := parseTrafficUser(tag, taggedEmail)
+			if !parsed {
+				return true
+			}
+
+			var upload, download int64
+			if delta, hasTraffic := drainTrafficCounter(uplink); hasTraffic {
+				upload = delta.value
+				deltas = append(deltas, delta)
+			}
+			if delta, hasTraffic := drainTrafficCounter(downlink); hasTraffic {
+				download = delta.value
+				deltas = append(deltas, delta)
+			}
+			if upload <= 0 && download <= 0 {
+				return true
+			}
+
+			userTraffic = append(userTraffic, api.UserTraffic{
+				UID:      uid,
+				Email:    email,
+				Upload:   upload,
+				Download: download,
+			})
+			return true
+		})
+		return userTraffic, deltas, ok
+	}
+
 	buckets := make(map[string]*trafficBucket)
 	collect := func(taggedEmail, direction string, counter stats.Counter) bool {
 		email, uid, parsed := parseTrafficUser(tag, taggedEmail)
@@ -704,20 +739,21 @@ func (c *Controller) userInfoMonitor() (err error) {
 		return nil
 	}
 
-	// Get server status
-	CPU, Mem, Disk, Uptime, err := serverstatus.GetSystemInfo()
-	if err != nil {
-		log.Print(err)
-	}
-	err = c.apiClient.ReportNodeStatus(
-		&api.NodeStatus{
-			CPU:    CPU,
-			Mem:    Mem,
-			Disk:   Disk,
-			Uptime: Uptime,
-		})
-	if err != nil {
-		log.Print(err)
+	legacyV2Board := skipsLegacyV2BoardNoopReports(c.panelType)
+	if !legacyV2Board {
+		CPU, Mem, Disk, Uptime, statusErr := serverstatus.GetSystemInfo()
+		if statusErr != nil {
+			log.Print(statusErr)
+		}
+		if statusErr = c.apiClient.ReportNodeStatus(
+			&api.NodeStatus{
+				CPU:    CPU,
+				Mem:    Mem,
+				Disk:   Disk,
+				Uptime: Uptime,
+			}); statusErr != nil {
+			log.Print(statusErr)
+		}
 	}
 
 	// Keep runtime snapshots consistent with node reloads. Network reporting is
@@ -823,8 +859,16 @@ func (c *Controller) userInfoMonitor() (err error) {
 		}
 	}
 
-	onlineDevice, onlineErr := c.GetOnlineDevice(state.tag)
-	detectResult, detectErr := c.GetDetectResult(state.tag)
+	var onlineDevice *[]api.OnlineUser
+	var detectResult *[]api.DetectResult
+	var onlineErr, detectErr error
+	if legacyV2Board {
+		onlineErr = c.ResetOnlineDevice(state.tag)
+		c.ResetDetectResult(state.tag)
+	} else {
+		onlineDevice, onlineErr = c.GetOnlineDevice(state.tag)
+		detectResult, detectErr = c.GetDetectResult(state.tag)
+	}
 	c.runtimeMu.Unlock()
 	runtimeUnlocked = true
 
@@ -837,7 +881,7 @@ func (c *Controller) userInfoMonitor() (err error) {
 	// Report Online info
 	if onlineErr != nil {
 		log.Print(onlineErr)
-	} else if len(*onlineDevice) > 0 {
+	} else if !legacyV2Board && len(*onlineDevice) > 0 {
 		if err = c.apiClient.ReportNodeOnlineUsers(onlineDevice); err != nil {
 			log.Print(err)
 		} else {
@@ -848,7 +892,7 @@ func (c *Controller) userInfoMonitor() (err error) {
 	// Report Illegal user
 	if detectErr != nil {
 		log.Print(detectErr)
-	} else if len(*detectResult) > 0 {
+	} else if !legacyV2Board && len(*detectResult) > 0 {
 		if err = c.apiClient.ReportIllegal(detectResult); err != nil {
 			log.Print(err)
 		} else {
@@ -857,6 +901,10 @@ func (c *Controller) userInfoMonitor() (err error) {
 
 	}
 	return nil
+}
+
+func skipsLegacyV2BoardNoopReports(panelType string) bool {
+	return panelType == "V2board"
 }
 
 func (c *Controller) buildNodeTag() string {

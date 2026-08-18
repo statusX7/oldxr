@@ -132,7 +132,20 @@ func (l *Limiter) DeleteInboundLimiter(tag string) error {
 
 func (l *Limiter) GetOnlineDevice(tag string) (*[]api.OnlineUser, error) {
 	var onlineUser []api.OnlineUser
+	err := l.clearOnlineDevice(tag, func(uid int, ip string) {
+		onlineUser = append(onlineUser, api.OnlineUser{UID: uid, IP: ip})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &onlineUser, nil
+}
 
+func (l *Limiter) ResetOnlineDevice(tag string) error {
+	return l.clearOnlineDevice(tag, nil)
+}
+
+func (l *Limiter) clearOnlineDevice(tag string, collect func(int, string)) error {
 	if value, ok := l.InboundInfo.Load(tag); ok {
 		inboundInfo := value.(*InboundInfo)
 		// Clear Speed Limiter bucket for users who are not online
@@ -147,22 +160,21 @@ func (l *Limiter) GetOnlineDevice(tag string) (*[]api.OnlineUser, error) {
 			email := key.(string)
 			localLock := deviceLock(&inboundInfo.localIPLocks, email)
 			localLock.Lock()
-			ipMap := value.(*sync.Map)
-			ipMap.Range(func(key, value interface{}) bool {
-				uid := value.(int)
-				ip := key.(string)
-				onlineUser = append(onlineUser, api.OnlineUser{UID: uid, IP: ip})
-				return true
-			})
+			if collect != nil {
+				ipMap := value.(*sync.Map)
+				ipMap.Range(func(key, value interface{}) bool {
+					collect(value.(int), key.(string))
+					return true
+				})
+			}
 			inboundInfo.UserOnlineIP.Delete(email) // Reset online device
 			localLock.Unlock()
 			return true
 		})
 	} else {
-		return nil, fmt.Errorf("no such inbound in limiter: %s", tag)
+		return fmt.Errorf("no such inbound in limiter: %s", tag)
 	}
-
-	return &onlineUser, nil
+	return nil
 }
 
 func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *rate.Limiter, SpeedLimit bool, Reject bool) {

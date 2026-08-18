@@ -165,6 +165,34 @@ func TestCollectTrafficByIndexedVisitDrainsOnlyControllerCounters(t *testing.T) 
 	}
 }
 
+func TestCollectTrafficByPairVisitDrainsEachUserOnce(t *testing.T) {
+	uplink := newTestTrafficCounter(100)
+	downlink := newTestTrafficCounter(200)
+	other := newTestTrafficCounter(300)
+	index := &benchmarkUserTrafficCounterVisitor{byTag: make(map[string]*benchmarkUserTrafficCounterSet)}
+	index.add("node-tag", "node-tag|user@example.com|42", "uplink", uplink)
+	index.add("node-tag", "node-tag|user@example.com|42", "downlink", downlink)
+	index.add("other-tag", "other-tag|user@example.com|42", "uplink", other)
+	controller := &Controller{trafficCounters: index}
+
+	traffic, deltas, ok := controller.collectTrafficByCounterVisit("node-tag")
+	if !ok {
+		t.Fatal("pair counter visitor must be supported")
+	}
+	if len(traffic) != 1 || traffic[0].UID != 42 || traffic[0].Email != "user@example.com" || traffic[0].Upload != 100 || traffic[0].Download != 200 {
+		t.Fatalf("unexpected traffic: %#v", traffic)
+	}
+	if len(deltas) != 2 {
+		t.Fatalf("deltas = %d, want 2", len(deltas))
+	}
+	if uplink.Value() != 0 || downlink.Value() != 0 {
+		t.Fatalf("controller counters were not drained: up=%d down=%d", uplink.Value(), downlink.Value())
+	}
+	if got := other.Value(); got != 300 {
+		t.Fatalf("other controller counter = %d, want 300", got)
+	}
+}
+
 func TestTrafficReportFailureRestoresConcurrentTraffic(t *testing.T) {
 	uplink := newTestTrafficCounter(100)
 	downlink := newTestTrafficCounter(200)
@@ -376,6 +404,17 @@ func TestDrainTrafficCounterPreservesNegativeValue(t *testing.T) {
 	}
 	if got, want := counter.Value(), int64(-1); got != want {
 		t.Fatalf("negative counter = %d, want %d", got, want)
+	}
+}
+
+func TestLegacyV2BoardNoopReportDecision(t *testing.T) {
+	if !skipsLegacyV2BoardNoopReports("V2board") {
+		t.Fatal("legacy V2Board no-op reports were not skipped")
+	}
+	for _, panelType := range []string{"SSpanel", "NewV2board", "PMpanel", "Proxypanel", "V2RaySocks"} {
+		if skipsLegacyV2BoardNoopReports(panelType) {
+			t.Fatalf("%s reports were unexpectedly skipped", panelType)
+		}
 	}
 }
 

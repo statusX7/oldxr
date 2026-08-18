@@ -45,6 +45,21 @@ func (v *benchmarkUserTrafficCounterVisitor) VisitUserTrafficCounters(tag string
 	return true
 }
 
+func (v *benchmarkUserTrafficCounterVisitor) VisitUserTrafficCounterPairs(tag string, visitor func(string, featurestats.Counter, featurestats.Counter) bool) bool {
+	set := v.byTag[tag]
+	if set == nil {
+		return true
+	}
+	set.mu.RLock()
+	defer set.mu.RUnlock()
+	for taggedEmail, pair := range set.byEmail {
+		if !visitor(taggedEmail, pair.uplink, pair.downlink) {
+			return true
+		}
+	}
+	return true
+}
+
 func (v *benchmarkUserTrafficCounterVisitor) add(tag, taggedEmail, direction string, counter featurestats.Counter) {
 	set := v.byTag[tag]
 	if set == nil {

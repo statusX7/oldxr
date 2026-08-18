@@ -98,6 +98,24 @@ func TestDetectRecordsLastUIDSegment(t *testing.T) {
 	}
 }
 
+func TestResetDetectResultClearsLegacyNoopReport(t *testing.T) {
+	manager := New()
+	if err := manager.UpdateRule("node-1", []api.DetectRule{mustRule(t, 9, `blocked`)}); err != nil {
+		t.Fatal(err)
+	}
+	if !manager.Detect("node-1", "blocked.example", "node-1|user@example.com|42") {
+		t.Fatal("fixture rule did not match")
+	}
+	manager.ResetDetectResult("node-1")
+	results, err := manager.GetDetectResult("node-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(*results) != 0 {
+		t.Fatalf("results after reset: %#v", *results)
+	}
+}
+
 func TestDetectConcurrentRulePublication(t *testing.T) {
 	manager := New()
 	first := []api.DetectRule{mustRule(t, -1, `first`)}

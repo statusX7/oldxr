@@ -73,6 +73,10 @@ func (r *Manager) GetDetectResult(tag string) (*[]api.DetectResult, error) {
 	return &detectResult, nil
 }
 
+func (r *Manager) ResetDetectResult(tag string) {
+	r.InboundDetectResult.Delete(tag)
+}
+
 func (r *Manager) Detect(tag string, destination string, email string) (reject bool) {
 	reject = false
 	var hitRuleID = -1

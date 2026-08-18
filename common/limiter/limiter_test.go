@@ -572,3 +572,77 @@ func BenchmarkGlobalLimiterAtCapacity(b *testing.B) {
 		})
 	}
 }
+
+func TestResetOnlineDeviceClearsWithoutMaterializingUsers(t *testing.T) {
+	l := New()
+	users := []api.UserInfo{{UID: 1, Email: "user@example.com", DeviceLimit: 5, SpeedLimit: 1024}}
+	if err := l.AddInboundLimiter("node-tag", 0, &users, nil); err != nil {
+		t.Fatal(err)
+	}
+	email := "node-tag|user@example.com|1"
+	if _, _, reject := l.GetUserBucket("node-tag", email, "192.0.2.1"); reject {
+		t.Fatal("fixture IP rejected")
+	}
+	if err := l.ResetOnlineDevice("node-tag"); err != nil {
+		t.Fatal(err)
+	}
+	value, _ := l.InboundInfo.Load("node-tag")
+	inbound := value.(*InboundInfo)
+	if got := syncMapLen(inbound.UserOnlineIP); got != 0 {
+		t.Fatalf("online users after reset = %d, want 0", got)
+	}
+	if got := syncMapLen(inbound.BucketHub); got != 1 {
+		t.Fatalf("active bucket after first reset = %d, want 1", got)
+	}
+	if err := l.ResetOnlineDevice("node-tag"); err != nil {
+		t.Fatal(err)
+	}
+	if got := syncMapLen(inbound.BucketHub); got != 0 {
+		t.Fatalf("offline bucket after second reset = %d, want 0", got)
+	}
+}
+
+func BenchmarkOnlineDeviceReset(b *testing.B) {
+	const users = 1000
+	userList := make([]api.UserInfo, users)
+	for i := range userList {
+		userList[i] = api.UserInfo{UID: i + 1, Email: fmt.Sprintf("user-%d@example.com", i+1), DeviceLimit: 5}
+	}
+	for _, benchmark := range []struct {
+		name string
+		run  func(*Limiter) error
+	}{
+		{
+			name: "CollectLegacySlice",
+			run: func(l *Limiter) error {
+				online, err := l.GetOnlineDevice("node-tag")
+				if err == nil && len(*online) != users {
+					return fmt.Errorf("online users = %d, want %d", len(*online), users)
+				}
+				return err
+			},
+		},
+		{name: "ResetOnly", run: func(l *Limiter) error { return l.ResetOnlineDevice("node-tag") }},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				l := New()
+				if err := l.AddInboundLimiter("node-tag", 0, &userList, nil); err != nil {
+					b.Fatal(err)
+				}
+				for userIndex, user := range userList {
+					email := formatUserKey("node-tag", user.Email, user.UID)
+					if _, _, reject := l.GetUserBucket("node-tag", email, fmt.Sprintf("192.0.%d.%d", userIndex/250, userIndex%250+1)); reject {
+						b.Fatal("fixture IP rejected")
+					}
+				}
+				b.StartTimer()
+				if err := benchmark.run(l); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
