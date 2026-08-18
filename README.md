@@ -19,13 +19,7 @@ oldxr 是以 XrayR v0.9.0 为固定核心基线、长期兼容 V2Board 1.6.0 的
 bash <(curl -Ls https://raw.githubusercontent.com/statusX7/oldxr/master/install.sh) 0.9.0
 ```
 
-参数 `0.9.0` 是 maintenance channel。安装脚本会明确显示它当前解析到的不可变 release tag，例如 `v0.9.0-r1`，并校验下载 archive 的 SHA256。
-
-也可以显式安装维护版本：
-
-```bash
-bash <(curl -Ls https://raw.githubusercontent.com/statusX7/oldxr/master/install.sh) 0.9.0-r1
-```
+参数 `0.9.0` 是 maintenance channel。安装脚本会明确显示它当前解析到的不可变 `v0.9.0-rN` release tag，并校验下载 archive 的 SHA256。
 
 安装后配置文件位于 `/etc/XrayR/config.yml`，管理命令为 `XrayR` 或 `xrayr`。
 

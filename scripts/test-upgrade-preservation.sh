@@ -11,6 +11,12 @@ install_script="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
 source_binary="$(cd "$(dirname "$3")" && pwd)/$(basename "$3")"
 archive_name="$(basename "${archive}")"
 checksum="${archive}.sha256"
+release_version="$(sed -n 's/^MAINTENANCE_0_9_0="\([^"]*\)"/\1/p' "${install_script}")"
+
+if [[ ! "${release_version}" =~ ^v0\.9\.0-r[0-9]+$ ]]; then
+    echo "错误：无法从 install.sh 解析 maintenance release。" >&2
+    exit 1
+fi
 
 for required in "${archive}" "${checksum}" "${install_script}" "${source_binary}"; do
     [[ -f "${required}" ]] || { echo "错误：测试输入不存在：${required}" >&2; exit 1; }
@@ -20,9 +26,9 @@ test_root="$(mktemp -d)"
 trap 'rm -rf "${test_root}"' EXIT
 release_root="${test_root}/releases"
 mock_systemctl="${test_root}/systemctl"
-mkdir -p "${release_root}/v0.9.0-r1"
-cp "${archive}" "${release_root}/v0.9.0-r1/${archive_name}"
-cp "${checksum}" "${release_root}/v0.9.0-r1/${archive_name}.sha256"
+mkdir -p "${release_root}/${release_version}"
+cp "${archive}" "${release_root}/${release_version}/${archive_name}"
+cp "${checksum}" "${release_root}/${release_version}/${archive_name}.sha256"
 
 cat > "${mock_systemctl}" <<'MOCK'
 #!/usr/bin/env bash
@@ -119,7 +125,8 @@ assert_preserved_upgrade() {
     [[ "$(<"${root}/custom-before")" == "$(sha256sum "$(dirname "${root}${config_path}")/custom_inbound.json" | awk '{print $1}')" ]]
     grep -Fx "ExecStart=/usr/local/XrayR/XrayR --config ${config_path}" "${root}/etc/systemd/system/XrayR.service" >/dev/null
     [[ -f "${root}/usr/local/XrayR/.oldxr-release" ]]
-    grep -Fx 'v0.9.0-r1' "${root}/usr/local/XrayR/.oldxr-release" >/dev/null
+    grep -Fx "${release_version}" "${root}/usr/local/XrayR/.oldxr-release" >/dev/null
+    "${root}/usr/local/XrayR/XrayR" -version | grep -F "XrayR ${release_version#v}" >/dev/null
     [[ -f "${root}/systemctl-active" ]]
 
     backup="$(find "${root}/etc/XrayR/backups" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
