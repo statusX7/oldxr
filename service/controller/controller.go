@@ -257,9 +257,9 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		}
 
 	} else {
-		var deleted, added []api.UserInfo
+		var deleted, added, limitUpdated []api.UserInfo
 		if usersChanged {
-			deleted, added = compareUserList(c.userList, newUserInfo)
+			deleted, added, limitUpdated = compareUserList(c.userList, newUserInfo)
 			if len(deleted) > 0 {
 				deletedEmail := make([]string, len(deleted))
 				for i, u := range deleted {
@@ -275,13 +275,17 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 				if err != nil {
 					log.Print(err)
 				}
-				// Update Limiter
-				if err := c.UpdateInboundLimiter(c.Tag, &added); err != nil {
+			}
+			if len(added) > 0 || len(limitUpdated) > 0 {
+				limiterUpdates := make([]api.UserInfo, 0, len(added)+len(limitUpdated))
+				limiterUpdates = append(limiterUpdates, added...)
+				limiterUpdates = append(limiterUpdates, limitUpdated...)
+				if err := c.UpdateInboundLimiter(c.Tag, &limiterUpdates); err != nil {
 					log.Print(err)
 				}
 			}
 		}
-		log.Printf("%s %d user deleted, %d user added", c.logPrefix(), len(deleted), len(added))
+		log.Printf("%s %d user deleted, %d user added, %d user limits updated", c.logPrefix(), len(deleted), len(added), len(limitUpdated))
 	}
 	c.userList = newUserInfo
 	return nil
@@ -413,30 +417,54 @@ func (c *Controller) addNewUser(userInfo *[]api.UserInfo, nodeInfo *api.NodeInfo
 	return nil
 }
 
-func compareUserList(old, new *[]api.UserInfo) (deleted, added []api.UserInfo) {
-	oldMap := make(map[int]api.UserInfo, len(*old))
-	newMap := make(map[int]api.UserInfo, len(*new))
+func sameRuntimeUser(old, new api.UserInfo) bool {
+	return old.UID == new.UID &&
+		old.Email == new.Email &&
+		old.Passwd == new.Passwd &&
+		old.Port == new.Port &&
+		old.Method == new.Method &&
+		old.Protocol == new.Protocol &&
+		old.ProtocolParam == new.ProtocolParam &&
+		old.Obfs == new.Obfs &&
+		old.ObfsParam == new.ObfsParam &&
+		old.UUID == new.UUID &&
+		old.AlterID == new.AlterID
+}
 
-	for _, u := range *old {
-		oldMap[u.UID] = u
+func compareUserList(old, new *[]api.UserInfo) (deleted, added, limitUpdated []api.UserInfo) {
+	oldIndex := make(map[int]int, len(*old))
+	newUIDs := make(map[int]struct{}, len(*new))
+
+	for i, u := range *old {
+		oldIndex[u.UID] = i
 	}
 
 	for _, u := range *new {
-		newMap[u.UID] = u
+		newUIDs[u.UID] = struct{}{}
 
-		oldUser, exists := oldMap[u.UID]
-		if !exists || !reflect.DeepEqual(oldUser, u) {
+		oldPosition, exists := oldIndex[u.UID]
+		if !exists {
 			added = append(added, u)
+			continue
+		}
+		oldUser := (*old)[oldPosition]
+		if !sameRuntimeUser(oldUser, u) {
+			deleted = append(deleted, oldUser)
+			added = append(added, u)
+			continue
+		}
+		if oldUser.SpeedLimit != u.SpeedLimit || oldUser.DeviceLimit != u.DeviceLimit {
+			limitUpdated = append(limitUpdated, u)
 		}
 	}
 
 	for _, u := range *old {
-		if _, exists := newMap[u.UID]; !exists {
+		if _, exists := newUIDs[u.UID]; !exists {
 			deleted = append(deleted, u)
 		}
 	}
 
-	return deleted, added
+	return deleted, added, limitUpdated
 }
 
 type statCounterVisitor interface {
