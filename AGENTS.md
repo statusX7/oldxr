@@ -273,12 +273,12 @@ git status --short
 
 ## 工程报告规则
 
-- 每次正式工程审计、重要正确性修复、并发修复、性能优化、低资源验证和 Release 都必须在 `docs/engineering-reports/` 新建独立 Markdown 报告。
+- 每次正式工程审计、重要正确性修复、并发修复、性能优化、低资源验证和 Release 都必须在仓库外的 `/root/projects/oldxr-reports/` 新建独立 Markdown 报告。
 - 文件名使用 `YYYYMMDD-HHMM-phase-name.md`，正文使用简体中文；代码标识符、路径、命令、API 字段和技术专有名词保持英文。
 - 报告至少记录日期/时区、阶段、branch、commit/HEAD、Go 与 xray-core 版本、测试环境、证据、根因、方案、修改文件、兼容性、test/vet/race/build、benchmark before/after、风险和下一步。
 - 性能报告必须记录可获得的 `ns/op`、`B/op`、`allocs/op`、CPU、heap、RSS、goroutine、GC、mutex/block；无法可靠测量的项目明确写“未测 / 无可靠数据”，不得估算或编造。
 - 报告不得包含 token、private key、生产凭据、订阅信息、用户数据或带密钥 URL。
-- 大型 `.pprof`、core dump、临时 binary 和海量 raw benchmark 输出不得提交；提交可复核的关键命令、摘要和结论。
+- 所有工程报告、`.pprof`、core dump、临时 binary 和 raw benchmark 输出均不得提交 Git；profile 和 raw 数据分别保存在 `/root/projects/oldxr-reports/profiles/` 与 `/root/projects/oldxr-reports/raw/`。
 
 ## Git 工作流
 
