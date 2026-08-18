@@ -444,12 +444,10 @@ type statCounterVisitor interface {
 }
 
 type trafficBucket struct {
-	uid         int
-	email       string
-	upload      int64
-	download    int64
-	upCounter   stats.Counter
-	downCounter stats.Counter
+	uid      int
+	email    string
+	upload   int64
+	download int64
 }
 
 func parseTrafficUser(tag string, fullEmail string) (email string, uid int, ok bool) {
@@ -472,20 +470,15 @@ func parseTrafficUser(tag string, fullEmail string) (email string, uid int, ok b
 	return rest[:idx], int(uid64), true
 }
 
-func (c *Controller) collectTrafficByCounterVisit() (userTraffic []api.UserTraffic, upCounterList []stats.Counter, downCounterList []stats.Counter, ok bool) {
+func (c *Controller) collectTrafficByCounterVisit() (userTraffic []api.UserTraffic, deltas []trafficCounterDelta, ok bool) {
 	visitor, ok := c.stm.(statCounterVisitor)
 	if !ok {
-		return nil, nil, nil, false
+		return nil, nil, false
 	}
 
 	buckets := make(map[string]*trafficBucket)
 
 	visitor.VisitCounters(func(name string, counter stats.Counter) bool {
-		value := counter.Value()
-		if value <= 0 {
-			return true
-		}
-
 		parts := strings.Split(name, ">>>")
 		if len(parts) != 4 {
 			return true
@@ -499,6 +492,15 @@ func (c *Controller) collectTrafficByCounterVisit() (userTraffic []api.UserTraff
 		if !parsed {
 			return true
 		}
+		if parts[3] != "uplink" && parts[3] != "downlink" {
+			return true
+		}
+
+		delta, hasTraffic := drainTrafficCounter(counter)
+		if !hasTraffic {
+			return true
+		}
+		deltas = append(deltas, delta)
 
 		b := buckets[parts[1]]
 		if b == nil {
@@ -511,11 +513,9 @@ func (c *Controller) collectTrafficByCounterVisit() (userTraffic []api.UserTraff
 
 		switch parts[3] {
 		case "uplink":
-			b.upload = value
-			b.upCounter = counter
+			b.upload = delta.value
 		case "downlink":
-			b.download = value
-			b.downCounter = counter
+			b.download = delta.value
 		}
 
 		return true
@@ -534,16 +534,9 @@ func (c *Controller) collectTrafficByCounterVisit() (userTraffic []api.UserTraff
 			Upload:   b.upload,
 			Download: b.download,
 		})
-
-		if b.upCounter != nil {
-			upCounterList = append(upCounterList, b.upCounter)
-		}
-		if b.downCounter != nil {
-			downCounterList = append(downCounterList, b.downCounter)
-		}
 	}
 
-	return userTraffic, upCounterList, downCounterList, true
+	return userTraffic, deltas, true
 }
 
 func limitUser(c *Controller, user api.UserInfo, silentUsers *[]api.UserInfo) {
@@ -601,17 +594,16 @@ func (c *Controller) userInfoMonitor() (err error) {
 
 	// Get User traffic
 	var userTraffic []api.UserTraffic
-	var upCounterList []stats.Counter
-	var downCounterList []stats.Counter
+	var trafficDeltas []trafficCounterDelta
 
 	AutoSpeedLimit := int64(c.config.AutoSpeedLimitConfig.Limit)
 
 	if AutoSpeedLimit <= 0 {
 		var ok bool
-		userTraffic, upCounterList, downCounterList, ok = c.collectTrafficByCounterVisit()
+		userTraffic, trafficDeltas, ok = c.collectTrafficByCounterVisit()
 		if !ok {
 			for _, user := range *c.userList {
-				up, down, upCounter, downCounter := c.getTraffic(c.buildUserTag(&user))
+				up, down, deltas := c.drainTraffic(c.buildUserTag(&user))
 				if up > 0 || down > 0 {
 					userTraffic = append(userTraffic, api.UserTraffic{
 						UID:      user.UID,
@@ -620,12 +612,7 @@ func (c *Controller) userInfoMonitor() (err error) {
 						Download: down,
 					})
 
-					if upCounter != nil {
-						upCounterList = append(upCounterList, upCounter)
-					}
-					if downCounter != nil {
-						downCounterList = append(downCounterList, downCounter)
-					}
+					trafficDeltas = append(trafficDeltas, deltas...)
 				}
 			}
 		}
@@ -634,7 +621,7 @@ func (c *Controller) userInfoMonitor() (err error) {
 		limitedUsers := make([]api.UserInfo, 0)
 
 		for _, user := range *c.userList {
-			up, down, upCounter, downCounter := c.getTraffic(c.buildUserTag(&user))
+			up, down, deltas := c.drainTraffic(c.buildUserTag(&user))
 			if up > 0 || down > 0 {
 				// Over speed users
 				if down > AutoSpeedLimit*1000000*UpdatePeriodic/8 || up > AutoSpeedLimit*1000000*UpdatePeriodic/8 {
@@ -660,12 +647,7 @@ func (c *Controller) userInfoMonitor() (err error) {
 					Download: down,
 				})
 
-				if upCounter != nil {
-					upCounterList = append(upCounterList, upCounter)
-				}
-				if downCounter != nil {
-					downCounterList = append(downCounterList, downCounter)
-				}
+				trafficDeltas = append(trafficDeltas, deltas...)
 			} else {
 				delete(c.warnedUsers, user)
 			}
@@ -679,15 +661,8 @@ func (c *Controller) userInfoMonitor() (err error) {
 	}
 
 	if len(userTraffic) > 0 {
-		var err error // Define an empty error
-		if !c.config.DisableUploadTraffic {
-			err = c.apiClient.ReportUserTraffic(&userTraffic)
-		}
-		// If report traffic error, not clear the traffic
-		if err != nil {
+		if err := flushUserTraffic(c.apiClient, c.config.DisableUploadTraffic, userTraffic, trafficDeltas); err != nil {
 			log.Print(err)
-		} else {
-			c.resetTraffic(&upCounterList, &downCounterList)
 		}
 	}
 
