@@ -5,7 +5,12 @@ green='\033[0;32m'
 yellow='\033[0;33m'
 plain='\033[0m'
 
-version="v1.0.0"
+version="v1.1.0-oldxr"
+repo="statusX7/oldxr"
+stable_branch="master"
+raw_base="${OLDXR_RAW_BASE:-https://raw.githubusercontent.com/${repo}/${stable_branch}}"
+install_url="${raw_base}/install.sh"
+manager_file="${OLDXR_MANAGER_FILE:-/usr/bin/XrayR}"
 
 # check root
 [[ $EUID -ne 0 ]] && echo -e "${red}错误: ${plain} 必须使用root用户运行此脚本！\n" && exit 1
@@ -85,8 +90,22 @@ before_show_menu() {
     show_menu
 }
 
+run_installer() {
+    local installer_file installer_status
+    installer_file=$(mktemp) || return 1
+    if ! curl --fail --location --silent --show-error --output "${installer_file}" "${install_url}"; then
+        rm -f "${installer_file}"
+        echo -e "${red}下载安装脚本失败：${install_url}${plain}"
+        return 1
+    fi
+    bash "${installer_file}" "$@"
+    installer_status=$?
+    rm -f "${installer_file}"
+    return ${installer_status}
+}
+
 install() {
-    bash <(curl -Ls https://raw.githubusercontent.com/statusX7/XR/master/install.sh)
+    run_installer 0.9.0
     if [[ $? == 0 ]]; then
         if [[ $# == 0 ]]; then
             start
@@ -112,7 +131,7 @@ update() {
     #     return 0
     # fi
 
-    bash <(curl -Ls https://raw.githubusercontent.com/statusX7/XR/master/install.sh) $version
+    run_installer "${version:-0.9.0}"
     if [[ $? == 0 ]]; then
         echo -e "${green}更新完成，已自动重启 XrayR，请使用 XrayR log 查看运行日志${plain}"
         exit
@@ -278,13 +297,13 @@ install_bbr() {
 }
 
 update_shell() {
-    wget -O /usr/bin/XrayR -N --no-check-certificate https://raw.githubusercontent.com/statusX7/XR/master/XrayR.sh
+    wget -O "${manager_file}" "${raw_base}/XrayR.sh"
     if [[ $? != 0 ]]; then
         echo ""
         echo -e "${red}下载脚本失败，请检查本机能否连接 Github${plain}"
         before_show_menu
     else
-        chmod +x /usr/bin/XrayR
+        chmod +x "${manager_file}"
         echo -e "${green}升级脚本成功，请重新运行脚本${plain}" && exit 0
     fi
 }
@@ -326,6 +345,9 @@ check_uninstall() {
 }
 
 check_install() {
+    if [[ "${OLDXR_SKIP_INSTALL_CHECK:-0}" == "1" ]]; then
+        return 0
+    fi
     check_status
     if [[ $? == 2 ]]; then
         echo ""
@@ -397,7 +419,7 @@ show_usage() {
 show_menu() {
     echo -e "
   ${green}XrayR 后端管理脚本，${plain}${red}不适用于docker${plain}
---- https://github.com/statusX7/XR ---
+--- https://github.com/statusX7/oldxr ---
   ${green}0.${plain} 修改配置
 ————————————————
   ${green}1.${plain} 安装 XrayR
@@ -449,7 +471,7 @@ if [[ $# > 0 ]]; then
     "enable") check_install 0 && enable 0 ;;
     "disable") check_install 0 && disable 0 ;;
     "log") check_install 0 && show_log 0 ;;
-    "update") check_install 0 && update 0 $2 ;;
+    "update") check_install 0 && update 0 "${2:-0.9.0}" ;;
     "config") config $* ;;
     "install") check_uninstall 0 && install 0 ;;
     "uninstall") check_install 0 && uninstall 0 ;;

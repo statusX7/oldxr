@@ -1,5 +1,5 @@
 # Build go
-FROM golang:1.20-alpine AS builder
+FROM golang:1.20.14-alpine3.18 AS builder
 WORKDIR /app
 COPY . .
 ENV CGO_ENABLED=0
@@ -7,7 +7,7 @@ RUN go mod download
 RUN go build -v -o XrayR -trimpath -ldflags "-s -w -buildid=" ./main
 
 # Release
-FROM  alpine
+FROM alpine:3.18
 # 安装必要的工具包
 RUN  apk --update --no-cache add tzdata ca-certificates \
     && cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
