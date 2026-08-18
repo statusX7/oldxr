@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/XrayR-project/XrayR/api"
@@ -52,6 +54,7 @@ func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 }
 
 func TestV2BoardV2rayCompatibility(t *testing.T) {
+	userRequests := 0
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/server/Deepbwork/config", func(w http.ResponseWriter, r *http.Request) {
 		assertLegacyQuery(t, r, true)
@@ -75,6 +78,11 @@ func TestV2BoardV2rayCompatibility(t *testing.T) {
 	})
 	mux.HandleFunc("/api/v1/server/Deepbwork/user", func(w http.ResponseWriter, r *http.Request) {
 		assertLegacyQuery(t, r, false)
+		userRequests++
+		if r.Header.Get("If-None-Match") == `"vmess-users-v1"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
 		w.Header().Set("ETag", `"vmess-users-v1"`)
 		writeJSON(t, w, map[string]any{
 			"msg": "ok",
@@ -118,6 +126,12 @@ func TestV2BoardV2rayCompatibility(t *testing.T) {
 	if len(*users) != 1 || !reflect.DeepEqual((*users)[0], wantUser) {
 		t.Fatalf("users = %#v, want %#v", *users, []api.UserInfo{wantUser})
 	}
+	if _, err := client.GetUserList(); err == nil || err.Error() != "users no change" {
+		t.Fatalf("second GetUserList error = %v, want users no change", err)
+	}
+	if userRequests != 2 {
+		t.Fatalf("user endpoint requests = %d, want 2", userRequests)
+	}
 
 	rules, err := client.GetNodeRule()
 	if err != nil {
@@ -139,6 +153,11 @@ func TestV2BoardTrojanCompatibility(t *testing.T) {
 	})
 	mux.HandleFunc("/api/v1/server/TrojanTidalab/user", func(w http.ResponseWriter, r *http.Request) {
 		assertLegacyQuery(t, r, false)
+		if r.Header.Get("If-None-Match") == `"trojan-users-v1"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", `"trojan-users-v1"`)
 		writeJSON(t, w, map[string]any{
 			"data": []any{map[string]any{
 				"id":          202,
@@ -164,6 +183,9 @@ func TestV2BoardTrojanCompatibility(t *testing.T) {
 	if len(*users) != 1 || (*users)[0].UID != 202 || (*users)[0].UUID != "legacy-trojan-password" || (*users)[0].Email != "legacy-trojan-password" {
 		t.Fatalf("unexpected users: %#v", *users)
 	}
+	if _, err := client.GetUserList(); err == nil || err.Error() != "users no change" {
+		t.Fatalf("second GetUserList error = %v, want users no change", err)
+	}
 }
 
 func TestV2BoardShadowsocksCompatibility(t *testing.T) {
@@ -172,6 +194,11 @@ func TestV2BoardShadowsocksCompatibility(t *testing.T) {
 	mux.HandleFunc("/api/v1/server/ShadowsocksTidalab/user", func(w http.ResponseWriter, r *http.Request) {
 		requests++
 		assertLegacyQuery(t, r, false)
+		if r.Header.Get("If-None-Match") == `"ss-users-v1"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", `"ss-users-v1"`)
 		writeJSON(t, w, map[string]any{
 			"data": []any{map[string]any{
 				"id":     303,
@@ -199,8 +226,102 @@ func TestV2BoardShadowsocksCompatibility(t *testing.T) {
 	if len(*users) != 1 || (*users)[0].UID != 303 || (*users)[0].Passwd != "legacy-shadowsocks-secret" || (*users)[0].Method != "aes-128-gcm" {
 		t.Fatalf("unexpected users: %#v", *users)
 	}
+	if requests != 1 {
+		t.Fatalf("user endpoint requests = %d, want 1 shared config/user fetch", requests)
+	}
+	if _, err := client.GetNodeInfo(); err != nil {
+		t.Fatalf("second GetNodeInfo using cached users: %v", err)
+	}
+	if _, err := client.GetUserList(); err == nil || err.Error() != "users no change" {
+		t.Fatalf("second monitor GetUserList error = %v, want users no change", err)
+	}
 	if requests != 2 {
-		t.Fatalf("user endpoint requests = %d, want 2", requests)
+		t.Fatalf("user endpoint requests = %d, want 2 after conditional refresh", requests)
+	}
+}
+
+func TestV2BoardUserETagLifecycleAndIsolation(t *testing.T) {
+	var state struct {
+		sync.Mutex
+		version int
+		invalid bool
+		headers []string
+	}
+	state.version = 1
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/server/Deepbwork/user", func(w http.ResponseWriter, r *http.Request) {
+		assertLegacyQuery(t, r, false)
+		state.Lock()
+		version := state.version
+		invalid := state.invalid
+		state.headers = append(state.headers, r.Header.Get("If-None-Match"))
+		state.Unlock()
+		eTag := `"users-v` + string(rune('0'+version)) + `"`
+		if r.Header.Get("If-None-Match") == eTag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", eTag)
+		if invalid {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("not-json"))
+			return
+		}
+		writeJSON(t, w, map[string]any{
+			"data": []any{map[string]any{
+				"id": version,
+				"v2ray_user": map[string]any{
+					"uuid":     "11111111-1111-1111-1111-111111111111",
+					"email":    "etag@example.com",
+					"alter_id": 0,
+				},
+			}},
+		})
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client := newClient(server.URL, "V2ray")
+	users, err := client.GetUserList()
+	if err != nil || len(*users) != 1 || (*users)[0].UID != 1 {
+		t.Fatalf("initial users=%#v err=%v", users, err)
+	}
+	if _, err := client.GetUserList(); err == nil || err.Error() != "users no change" {
+		t.Fatalf("304 error = %v, want users no change", err)
+	}
+
+	state.Lock()
+	state.version = 2
+	state.Unlock()
+	users, err = client.GetUserList()
+	if err != nil || (*users)[0].UID != 2 {
+		t.Fatalf("changed users=%#v err=%v", users, err)
+	}
+
+	state.Lock()
+	state.version = 3
+	state.invalid = true
+	state.Unlock()
+	if _, err := client.GetUserList(); err == nil || !strings.Contains(err.Error(), "invalid") {
+		t.Fatalf("invalid response error = %v", err)
+	}
+	state.Lock()
+	state.invalid = false
+	state.Unlock()
+	users, err = client.GetUserList()
+	if err != nil || (*users)[0].UID != 3 {
+		t.Fatalf("recovery users=%#v err=%v", users, err)
+	}
+
+	secondClient := newClient(server.URL, "V2ray")
+	if _, err := secondClient.GetUserList(); err != nil {
+		t.Fatalf("second client initial fetch: %v", err)
+	}
+	state.Lock()
+	headers := append([]string(nil), state.headers...)
+	state.Unlock()
+	if got := headers[len(headers)-1]; got != "" {
+		t.Fatalf("second client leaked first client ETag %q", got)
 	}
 }
 
