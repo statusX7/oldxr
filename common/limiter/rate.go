@@ -2,7 +2,7 @@ package limiter
 
 import (
 	"context"
-	"io"
+	"fmt"
 
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
@@ -12,13 +12,21 @@ import (
 type Writer struct {
 	writer  buf.Writer
 	limiter *rate.Limiter
-	w       io.Writer
+	ctx     context.Context
 }
 
 func (l *Limiter) RateWriter(writer buf.Writer, limiter *rate.Limiter) buf.Writer {
+	return l.RateWriterContext(context.Background(), writer, limiter)
+}
+
+func (l *Limiter) RateWriterContext(ctx context.Context, writer buf.Writer, limiter *rate.Limiter) buf.Writer {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	return &Writer{
 		writer:  writer,
 		limiter: limiter,
+		ctx:     ctx,
 	}
 }
 
@@ -27,7 +35,29 @@ func (w *Writer) Close() error {
 }
 
 func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
-	ctx := context.Background()
-	w.limiter.WaitN(ctx, int(mb.Len()))
+	if err := waitRateLimit(w.ctx, w.limiter, int(mb.Len())); err != nil {
+		return err
+	}
 	return w.writer.WriteMultiBuffer(mb)
+}
+
+func waitRateLimit(ctx context.Context, limiter *rate.Limiter, bytes int) error {
+	if bytes <= 0 {
+		return nil
+	}
+	burst := limiter.Burst()
+	if burst <= 0 {
+		return fmt.Errorf("rate limiter burst must be positive")
+	}
+	for bytes > 0 {
+		chunk := bytes
+		if chunk > burst {
+			chunk = burst
+		}
+		if err := limiter.WaitN(ctx, chunk); err != nil {
+			return err
+		}
+		bytes -= chunk
+	}
+	return nil
 }

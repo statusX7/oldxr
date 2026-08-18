@@ -261,6 +261,223 @@ func TestGlobalIPCacheClosedOnDeleteAndReplace(t *testing.T) {
 	}
 }
 
+func syncMapLen(values *sync.Map) int {
+	count := 0
+	values.Range(func(key, value any) bool {
+		count++
+		return true
+	})
+	return count
+}
+
+func TestDeleteInboundLimiterUsersCleansRuntimeState(t *testing.T) {
+	l := New()
+	users := []api.UserInfo{
+		{UID: 1, Email: "deleted@example.com", SpeedLimit: 1024, DeviceLimit: 1},
+		{UID: 2, Email: "kept@example.com", SpeedLimit: 1024, DeviceLimit: 1},
+	}
+	if err := l.AddInboundLimiter("node-tag", 0, &users, nil); err != nil {
+		t.Fatal(err)
+	}
+	deletedEmail := "node-tag|deleted@example.com|1"
+	keptEmail := "node-tag|kept@example.com|2"
+	deletedBucket, _, reject := l.GetUserBucket("node-tag", deletedEmail, "192.0.2.1")
+	if reject || deletedBucket == nil {
+		t.Fatal("failed to build deleted user state")
+	}
+	if _, _, reject := l.GetUserBucket("node-tag", keptEmail, "192.0.2.2"); reject {
+		t.Fatal("failed to build kept user state")
+	}
+	if err := l.DeleteInboundLimiterUsers("node-tag", &[]api.UserInfo{users[0]}); err != nil {
+		t.Fatalf("DeleteInboundLimiterUsers: %v", err)
+	}
+
+	value, _ := l.InboundInfo.Load("node-tag")
+	inboundInfo := value.(*InboundInfo)
+	if _, exists := inboundInfo.UserInfo.Load(deletedEmail); exists {
+		t.Fatal("deleted UserInfo retained")
+	}
+	if _, exists := inboundInfo.BucketHub.Load(deletedEmail); exists {
+		t.Fatal("deleted BucketHub entry retained")
+	}
+	if _, exists := inboundInfo.UserOnlineIP.Load(deletedEmail); exists {
+		t.Fatal("deleted UserOnlineIP entry retained")
+	}
+	if _, exists := inboundInfo.UserInfo.Load(keptEmail); !exists {
+		t.Fatal("kept UserInfo was removed")
+	}
+	if deletedBucket.Burst() != 1024 {
+		t.Fatal("cleanup mutated a bucket already owned by an active connection")
+	}
+}
+
+func TestDeleteInboundLimiterUsersConcurrentWithConnections(t *testing.T) {
+	l := New()
+	user := api.UserInfo{UID: 1, Email: "deleted@example.com", SpeedLimit: 1024, DeviceLimit: 1000}
+	users := []api.UserInfo{user}
+	if err := l.AddInboundLimiter("node-tag", 0, &users, nil); err != nil {
+		t.Fatal(err)
+	}
+	email := formatUserKey("node-tag", user.Email, user.UID)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			l.GetUserBucket("node-tag", email, fmt.Sprintf("198.51.100.%d", i+1))
+		}(i)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		if err := l.DeleteInboundLimiterUsers("node-tag", &users); err != nil {
+			t.Errorf("DeleteInboundLimiterUsers: %v", err)
+		}
+	}()
+	close(start)
+	wg.Wait()
+
+	value, _ := l.InboundInfo.Load("node-tag")
+	inboundInfo := value.(*InboundInfo)
+	if _, exists := inboundInfo.UserInfo.Load(email); exists {
+		t.Fatal("concurrent connection recreated UserInfo")
+	}
+	if _, exists := inboundInfo.BucketHub.Load(email); exists {
+		t.Fatal("concurrent connection recreated BucketHub entry")
+	}
+	if _, exists := inboundInfo.UserOnlineIP.Load(email); exists {
+		t.Fatal("concurrent connection recreated UserOnlineIP entry")
+	}
+}
+
+func TestDeleteInboundLimiterUsersChurnDoesNotRetainHistory(t *testing.T) {
+	const total = 1000
+	users := make([]api.UserInfo, total)
+	for i := range users {
+		users[i] = api.UserInfo{
+			UID:         i + 1,
+			Email:       fmt.Sprintf("user-%d@example.com", i+1),
+			SpeedLimit:  1024,
+			DeviceLimit: 1,
+		}
+	}
+	l := New()
+	if err := l.AddInboundLimiter("node-tag", 0, &users, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, user := range users {
+		email := fmt.Sprintf("node-tag|%s|%d", user.Email, user.UID)
+		if _, _, reject := l.GetUserBucket("node-tag", email, "192.0.2.1"); reject {
+			t.Fatalf("fixture user %d rejected", user.UID)
+		}
+	}
+	deleted := users[:900]
+	if err := l.DeleteInboundLimiterUsers("node-tag", &deleted); err != nil {
+		t.Fatal(err)
+	}
+	value, _ := l.InboundInfo.Load("node-tag")
+	inboundInfo := value.(*InboundInfo)
+	for name, values := range map[string]*sync.Map{
+		"UserInfo":     inboundInfo.UserInfo,
+		"BucketHub":    inboundInfo.BucketHub,
+		"UserOnlineIP": inboundInfo.UserOnlineIP,
+	} {
+		if got, want := syncMapLen(values), 100; got != want {
+			t.Fatalf("%s entries = %d, want %d", name, got, want)
+		}
+	}
+}
+
+func TestLimiterRepeatedUserChurnHasBoundedState(t *testing.T) {
+	const (
+		activeUsers = 1000
+		churnUsers  = 900
+		cycles      = 20
+	)
+	makeUsers := func(firstUID int, count int) []api.UserInfo {
+		users := make([]api.UserInfo, count)
+		for i := range users {
+			uid := firstUID + i
+			users[i] = api.UserInfo{
+				UID:         uid,
+				Email:       fmt.Sprintf("user-%d@example.com", uid),
+				SpeedLimit:  1024,
+				DeviceLimit: 1,
+			}
+		}
+		return users
+	}
+	connectUsers := func(t *testing.T, l *Limiter, users []api.UserInfo) {
+		t.Helper()
+		for _, user := range users {
+			email := formatUserKey("node-tag", user.Email, user.UID)
+			if _, _, reject := l.GetUserBucket("node-tag", email, "192.0.2.1"); reject {
+				t.Fatalf("fixture user %d rejected", user.UID)
+			}
+		}
+	}
+
+	current := makeUsers(1, activeUsers)
+	l := New()
+	if err := l.AddInboundLimiter("node-tag", 0, &current, nil); err != nil {
+		t.Fatal(err)
+	}
+	connectUsers(t, l, current)
+	nextUID := activeUsers + 1
+	for cycle := 0; cycle < cycles; cycle++ {
+		deleted := current[:churnUsers]
+		kept := append([]api.UserInfo(nil), current[churnUsers:]...)
+		added := makeUsers(nextUID, churnUsers)
+		nextUID += churnUsers
+		if err := l.DeleteInboundLimiterUsers("node-tag", &deleted); err != nil {
+			t.Fatal(err)
+		}
+		if err := l.UpdateInboundLimiter("node-tag", &added); err != nil {
+			t.Fatal(err)
+		}
+		connectUsers(t, l, added)
+		current = append(kept, added...)
+
+		value, _ := l.InboundInfo.Load("node-tag")
+		inboundInfo := value.(*InboundInfo)
+		for name, values := range map[string]*sync.Map{
+			"UserInfo":     inboundInfo.UserInfo,
+			"BucketHub":    inboundInfo.BucketHub,
+			"UserOnlineIP": inboundInfo.UserOnlineIP,
+		} {
+			if got := syncMapLen(values); got != activeUsers {
+				t.Fatalf("cycle %d: %s entries = %d, want %d", cycle, name, got, activeUsers)
+			}
+		}
+	}
+}
+
+func BenchmarkDeleteInboundLimiterUsers(b *testing.B) {
+	for _, size := range []int{1000, 10_000, 50_000} {
+		b.Run(fmt.Sprintf("users-%d", size), func(b *testing.B) {
+			users := make([]api.UserInfo, size)
+			for i := range users {
+				users[i] = api.UserInfo{UID: i + 1, Email: fmt.Sprintf("user-%d@example.com", i+1)}
+			}
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				l := New()
+				if err := l.AddInboundLimiter("node-tag", 0, &users, nil); err != nil {
+					b.Fatal(err)
+				}
+				b.StartTimer()
+				if err := l.DeleteInboundLimiterUsers("node-tag", &users); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func benchmarkLocalLimiterExistingIP(b *testing.B) {
 	l := New()
 	users := []api.UserInfo{{UID: 1, Email: "user@example.com", DeviceLimit: 5}}
@@ -284,6 +501,32 @@ func benchmarkLocalLimiterExistingIP(b *testing.B) {
 
 func BenchmarkLocalLimiterExistingIP(b *testing.B) {
 	benchmarkLocalLimiterExistingIP(b)
+}
+
+func BenchmarkLocalLimiterExistingIPWithSpeedLimit(b *testing.B) {
+	l := New()
+	users := []api.UserInfo{{
+		UID:         1,
+		Email:       "user@example.com",
+		DeviceLimit: 5,
+		SpeedLimit:  1024 * 1024,
+	}}
+	if err := l.AddInboundLimiter("node-tag", 0, &users, nil); err != nil {
+		b.Fatal(err)
+	}
+	email := "node-tag|user@example.com|1"
+	if _, speedLimited, reject := l.GetUserBucket("node-tag", email, "192.0.2.1"); reject || !speedLimited {
+		b.Fatal("initial speed-limited IP was not accepted")
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if _, speedLimited, reject := l.GetUserBucket("node-tag", email, "192.0.2.1"); reject || !speedLimited {
+				b.Fatal("existing speed-limited IP was not accepted")
+			}
+		}
+	})
 }
 
 func BenchmarkLocalLimiterAtCapacity(b *testing.B) {

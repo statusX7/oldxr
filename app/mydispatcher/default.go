@@ -244,8 +244,8 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network, sn
 			return nil, nil, newError("Devices reach the limit: ", user.Email)
 		}
 		if ok {
-			inboundLink.Writer = d.Limiter.RateWriter(inboundLink.Writer, bucket)
-			outboundLink.Writer = d.Limiter.RateWriter(outboundLink.Writer, bucket)
+			inboundLink.Writer = d.Limiter.RateWriterContext(ctx, inboundLink.Writer, bucket)
+			outboundLink.Writer = d.Limiter.RateWriterContext(ctx, outboundLink.Writer, bucket)
 		}
 		p := d.policy.ForLevel(user.Level)
 		if p.Stats.UserUplink {
