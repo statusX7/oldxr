@@ -90,9 +90,9 @@ func TestCollectTrafficByCounterVisitDrainsOnlyControllerCounters(t *testing.T) 
 	downlink := register("user>>>node-tag|user@example.com|42>>>traffic>>>downlink", 200)
 	otherController := register("user>>>other-tag|user@example.com|42>>>traffic>>>uplink", 300)
 	unknownDirection := register("user>>>node-tag|user@example.com|42>>>traffic>>>other", 400)
-	controller := &Controller{stm: manager, Tag: "node-tag"}
+	controller := &Controller{stm: manager}
 
-	traffic, deltas, ok := controller.collectTrafficByCounterVisit()
+	traffic, deltas, ok := controller.collectTrafficByCounterVisit("node-tag")
 	if !ok {
 		t.Fatal("stats manager must support counter visiting")
 	}
