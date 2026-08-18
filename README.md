@@ -36,12 +36,4 @@ bash <(curl -Ls https://raw.githubusercontent.com/statusX7/oldxr/master/install.
 - `module github.com/XrayR-project/XrayR` 是代码兼容 identity，不因 GitHub 仓库名改变而重命名。
 - V2Board `node_id`、`token`、legacy user/config/submit route、traffic 字段和 VMess `alter_id` 等兼容行为不得删除。
 
-## 工程报告
-
-正式正确性修复、并发修复、性能优化、低资源测试与 Release 验证记录位于：
-
-```text
-docs/engineering-reports/
-```
-
 项目长期维护规则见 `AGENTS.md`。
