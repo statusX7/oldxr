@@ -6,19 +6,20 @@
 
 ## 项目使命
 
-`oldxr` 是以 XrayR v0.9.0 为固定核心基线、长期兼容 V2Board 1.6.0 的维护型 fork。项目目标是：
+`oldxr` 是以 XrayR v0.9.0 的配置与用户可见行为为兼容基线、长期兼容 V2Board 1.6.0 的高性能节点后端。项目目标是：
 
 ```text
-XrayR v0.9.0
+XrayR v0.9.0 config / user-visible compatibility
 + V2Board 1.6.0 完整兼容
 + bug 修复
 + 并发安全
-+ CPU / 内存 / GC / 高并发优化
++ 可替换的现代 data engine
++ CPU / 内存 / GC / 网络 / 高并发优化
 + 长期运行稳定性
 + 可验证、可复现的构建与发布
 ```
 
-本项目不以追随最新 XrayR、xray-core 或 Go 生态为目标。正确性、V2Board 1.6.0 兼容性和长期稳定性优先于新功能、代码现代化和局部性能指标。
+本项目冻结 compatibility contract，不冻结 implementation dependency。正确性、V2Board 1.6.0 兼容性、安全语义、计费、限速、无损升级和长期稳定性优先于任何性能指标；在这些合同不变且有可复现证据时，允许升级或替换 Go toolchain、xray-core、协议引擎、依赖和内部架构。
 
 ## 语言规则
 
@@ -28,17 +29,17 @@ XrayR v0.9.0
 - 遵循现有注释风格。公开 API 的 GoDoc 如原本使用英文，应继续使用英文。
 - Git commit message 必须使用英文，例如 `fix: synchronize controller shared state`。
 
-## 固定技术基线
+## 兼容合同与当前实现基线
 
-- 固定代码基线：XrayR v0.9.0。
-- 正式兼容面板：V2Board 1.6.0。
-- 当前 `go.mod` 基线：Go 1.20、`github.com/xtls/xray-core v1.7.5`。
+- 固定兼容基线：XrayR v0.9.0 的 `config.yml`、legacy panel contract 和用户可见行为。
+- 固定正式兼容面板：V2Board 1.6.0。
+- 当前已发布 r2 的实现基线是 Go 1.20、`github.com/xtls/xray-core v1.7.5`；它们是 rollback/reference baseline，不是未来实现冻结线。
 - 当前模块路径 `github.com/XrayR-project/XrayR` 属于代码兼容身份，不得仅为仓库改名而修改。
 - 仓库 tag `v0.9.0` 指向导入快照 `23feadd`；它的核心业务源码与官方 XrayR v0.9.0 对应文件一致，但仓库树还包含工作流、依赖和 `common/legocmd` 差异，不能宣称整个 tree 与官方 tag 字节级相同。
-- XrayR v0.9.1 及后续版本仅可用于历史、bug 和性能设计对比，不得成为升级、merge、cherry-pick 或同步目标。
+- XrayR v0.9.1 及后续版本不得替换 legacy V2Board panel layer；其中可验证的 core、runtime、bug 或性能设计可以在隔离实验中研究和有选择地重新实现或 backport。
 - 官方 XrayR commit `5ab352f9c90c7b...` 的 `update: remove old v2board api` 已删除本项目必须保留的 legacy V2Board adapter；任何相似删除均视为兼容性破坏。
 
-未经用户明确批准，禁止修改以上基线，禁止升级 xray-core，禁止大规模升级依赖，禁止执行 `go get -u`，也不得以“修复构建”为由擅自执行会改动基线的 `go mod tidy`。
+Go version、xray-core version、dependency version、toolchain、internal engine 和 repository architecture 均可在独立 branch 中变更。每项变更必须独立 A/B，记录来源/version/commit、license、安全、依赖 diff、CPU/RAM/network delta 和维护成本；禁止无目的执行 `go get -u ./...`，也不得以“修复构建”为由让依赖树发生无法归因的漂移。
 
 ## V2Board 1.6.0 强兼容契约
 
@@ -109,10 +110,10 @@ HekiCore 文档和 soga Release notes 只用于发现问题方向、设计 bench
 
 ## 外部项目研究规则
 
-- 外部项目只能只读研究、对比和验证，不得批量复制、替换 oldxr 架构、修改 V2Board 1.6.0 API 或引入大量依赖。
+- 外部项目可用于只读研究、对比、prototype 和经 license 审计的重新实现；有可复现性能与正确性证据时，允许替换 oldxr 内部架构或 data engine，但不得修改 V2Board 1.6.0 API、静默降低功能或引入无法审计的依赖。
 - 新实现更现代、代码更短或声称更快，都不能作为采用依据。
 - 必须同时检查优点、缺点、Issues、已知 bug、锁、goroutine、GC、依赖、复杂度、兼容风险和维护成本。
-- 只有 oldxr 自身的 test、race、benchmark、pprof 或可复现代码证据能推动实际修改。
+- 只有 oldxr 自身的 test、race、benchmark、pprof 或可复现代码证据能推动正式采用；外部 benchmark 只能形成假设。
 - 每项候选设计必须按以下字段记录：
 
 ```text
@@ -238,7 +239,7 @@ P3 cleanup
 
 ## 测试与验证规则
 
-使用仓库声明的 Go 1.20 toolchain 和锁定依赖。常规验证顺序：
+使用当前候选明确锁定的 Go patch toolchain 和依赖。A/B 的每一侧必须记录实际版本且不得混入其他变量。常规验证顺序：
 
 ```bash
 gofmt
@@ -262,9 +263,9 @@ git status --short
 
 ## Go 工程规则
 
-- 保持 Go 1.20 语法和标准库兼容性，除非用户明确批准基线变更。
+- Go 语法和标准库最低版本由当前正式 release manifest 明确声明；升级 Go 必须单独 benchmark，并完成 build/test/vet/race、amd64 runtime、arm64 build、release 与升级兼容验证。
 - 依赖必须有必要性、许可、维护、安全、二进制体积、GC 和跨平台评估。
-- 优先最小、可审查修改，避免为性能问题进行无证据的大规模抽象。
+- 优先可审查、可 bisect 的修改；允许有证据的大规模重构，但每个 major architecture commit 必须有独立 baseline、benchmark、correctness 和保留/淘汰结论。
 - error 必须保留上下文；不得无故 panic。来自 panel/config 的输入必须验证。
 - HTTP response body 必须关闭；request 必须有 timeout/cancel；重试必须有上限和 backoff。
 - 不得在 hot path 添加高频 `fmt.Sprintf`、反射、无界 cache、无界日志或 goroutine。
@@ -329,7 +330,7 @@ source
 
 - 正式仓库和下载来源必须最终统一为 `statusX7/oldxr`。
 - workflow branch 必须与默认分支 `main` 一致；不得保留只触发 `master` 而使 CI 静默失效的配置。
-- `install.sh`、`XrayR.sh`、service、README、Docker image、GitHub Release asset 名必须相互匹配。
+- `install.sh`、`XrayR.sh`、service、README 和 GitHub Release asset 名必须相互匹配。Docker 不属于 oldxr 的部署、性能或 Release Gate 目标。
 - Release toolchain 应固定到经验证的 Go patch version；不得使用会漂移到未来版本的宽泛范围。
 - `geoip.dat`、`geosite.dat` 和第三方资产必须固定版本并校验 hash，避免构建时抓取移动的 `latest` 造成不可复现。
 - Release 前必须在干净 checkout 执行 build/test/vet/race 和代表性 cross-build，检查 `go version -m`、版本输出、archive 内容、checksum 与安装/升级路径。
@@ -353,16 +354,15 @@ source
 - macOS: amd64、arm64；
 - Android: arm64。
 
-“可交叉编译”不等于“已在目标系统运行验证”。修改 platform-specific、network、filesystem、service、certificate 或 syscall 行为时，必须缩小声明或增加目标系统验证。Docker 当前声明 linux/amd64、linux/arm64、linux/arm/v7，也必须单独验证镜像构建和启动。
+“可交叉编译”不等于“已在目标系统运行验证”。修改 platform-specific、network、filesystem、service、certificate 或 syscall 行为时，必须缩小声明或增加目标系统验证。既有 Docker 配置不作为本项目的部署或性能目标，不得为 Docker workflow 阻塞普通 Linux binary Release。
 
 ## 永久禁止事项
 
-除非用户在当前任务明确授权，否则禁止：
+无论内部实现如何现代化，永久禁止：
 
-- 升级到 XrayR v0.9.1 或其他版本；
-- merge、cherry-pick 或同步新版 XrayR；
-- 升级 xray-core；
-- 大规模升级依赖或 Go version；
+- 用 XrayR v0.9.1+ panel/adapter 替换 legacy V2Board 1.6.0 compatibility layer；
+- 无归因地 merge、cherry-pick 或同步整个新版 XrayR；
+- 无独立 A/B、安全、license、依赖和兼容性证据地升级或替换 core、依赖、Go toolchain 或 data engine；
 - 删除 `api/v2board`、legacy route、legacy field、JSON tag 或 `alter_id`；
 - 改变 V2Board 1.6.0 Panel API 语义；
 - 用 VProxy/UniProxy/其他面板 adapter 替换 legacy V2Board adapter；
