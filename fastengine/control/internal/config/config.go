@@ -1,12 +1,19 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
+
+var ErrLegacyRequired = errors.New("configuration requires LegacyEngine")
+
+func LegacyRequired(format string, arguments ...any) error {
+	return fmt.Errorf("%w: %s", ErrLegacyRequired, fmt.Sprintf(format, arguments...))
+}
 
 type File struct {
 	Nodes []Node `yaml:"Nodes"`
@@ -99,10 +106,10 @@ func LoadFastEngine(path string) ([]Node, error) {
 	nodes := make([]Node, 0, len(all))
 	for _, node := range all {
 		if !strings.EqualFold(node.PanelType, "V2board") {
-			return nil, fmt.Errorf("node panel type %q requires LegacyEngine", node.PanelType)
+			return nil, LegacyRequired("node panel type %q is not supported by FastEngine", node.PanelType)
 		}
 		if !strings.EqualFold(node.API.NodeType, "V2ray") && !strings.EqualFold(node.API.NodeType, "Shadowsocks") {
-			return nil, fmt.Errorf("V2Board node type %q requires LegacyEngine", node.API.NodeType)
+			return nil, LegacyRequired("V2Board node type %q is not supported by FastEngine", node.API.NodeType)
 		}
 		node, err = normalize(node)
 		if err != nil {

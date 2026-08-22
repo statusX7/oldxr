@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -60,7 +61,7 @@ func normalizeVMessUsers(users []v2board.User) ([]fastengine.VMessUser, error) {
 			return nil, fmt.Errorf("VMess user has an empty UID or UUID")
 		}
 		if user.AlterID != 0 {
-			return nil, fmt.Errorf("VMess user %d uses alter_id=%d; FastVMess currently requires AEAD alter_id=0", user.UID, user.AlterID)
+			return nil, config.LegacyRequired("VMess user %d uses alter_id=%d; FastVMess requires AEAD alter_id=0", user.UID, user.AlterID)
 		}
 		if _, exists := seenUID[user.UID]; exists {
 			return nil, fmt.Errorf("VMess user list has duplicate UID %d", user.UID)
@@ -84,8 +85,11 @@ func normalizeShadowsocksUsers(users []v2board.User) ([]fastengine.ShadowsocksUs
 	seenUID := make(map[uint64]struct{}, len(users))
 	seenPassword := make(map[string]struct{}, len(users))
 	for _, user := range users {
-		if user.UID == 0 || user.Password == "" || user.Port != port || !strings.EqualFold(user.Cipher, "aes-128-gcm") {
-			return nil, 0, fmt.Errorf("unsupported Shadowsocks user uid=%d port=%d cipher=%q", user.UID, user.Port, user.Cipher)
+		if user.UID == 0 || user.Password == "" || user.Port != port {
+			return nil, 0, fmt.Errorf("invalid Shadowsocks user uid=%d port=%d cipher=%q", user.UID, user.Port, user.Cipher)
+		}
+		if !strings.EqualFold(user.Cipher, "aes-128-gcm") {
+			return nil, 0, config.LegacyRequired("Shadowsocks cipher %q is not supported by FastEngine", user.Cipher)
 		}
 		if _, exists := seenUID[user.UID]; exists {
 			return nil, 0, fmt.Errorf("Shadowsocks user list has duplicate UID %d", user.UID)
@@ -105,13 +109,13 @@ func normalizeShadowsocksUsers(users []v2board.User) ([]fastengine.ShadowsocksUs
 
 func validateVMessNode(info v2board.NodeInfo) error {
 	if !strings.EqualFold(info.Network, "tcp") {
-		return fmt.Errorf("VMess transport %q requires LegacyEngine", info.Network)
+		return config.LegacyRequired("VMess transport %q is not supported by FastEngine", info.Network)
 	}
 	if info.Security != "" && !strings.EqualFold(info.Security, "none") {
-		return fmt.Errorf("VMess transport security %q requires LegacyEngine", info.Security)
+		return config.LegacyRequired("VMess transport security %q is not supported by FastEngine", info.Security)
 	}
 	if info.HeaderType != "" && !strings.EqualFold(info.HeaderType, "none") {
-		return fmt.Errorf("VMess TCP header %q requires LegacyEngine", info.HeaderType)
+		return config.LegacyRequired("VMess TCP header %q is not supported by FastEngine", info.HeaderType)
 	}
 	return nil
 }
@@ -213,7 +217,7 @@ func (node *managedNode) pushUsers(ctx context.Context, users []v2board.User) er
 			return err
 		}
 		if port != node.port {
-			return fmt.Errorf("Shadowsocks site %d listen port changed from %d to %d; transactional listener replacement requires LegacyEngine", node.engineSite, node.port, port)
+			return config.LegacyRequired("Shadowsocks site %d listen port changed from %d to %d", node.engineSite, node.port, port)
 		}
 		if err := node.engine.ReplaceShadowsocksUsers(ctx, node.engineSite, normalized); err != nil {
 			return err
@@ -266,7 +270,7 @@ func (node *managedNode) refreshVMessPolicy(ctx context.Context) error {
 	node.mu.Lock()
 	defer node.mu.Unlock()
 	if info.Port != node.port {
-		return fmt.Errorf("listen port changed from %d to %d; transactional listener replacement requires LegacyEngine", node.port, info.Port)
+		return config.LegacyRequired("VMess listen port changed from %d to %d", node.port, info.Port)
 	}
 	previous := node.rules
 	node.rules = append([]string(nil), info.Rules...)
@@ -340,7 +344,7 @@ func engineInputs(nodes []*managedNode) ([]engineListenerConfig, string, []strin
 		if ssAddress == "" {
 			ssAddress = node.config.Controller.ListenIP
 		} else if ssAddress != node.config.Controller.ListenIP {
-			return nil, "", nil, errors.New("multiple Shadowsocks ListenIP values require LegacyEngine")
+			return nil, "", nil, config.LegacyRequired("multiple Shadowsocks ListenIP values are not supported by FastEngine")
 		}
 		ssPorts = append(ssPorts, strconv.Itoa(node.port))
 	}
@@ -429,16 +433,83 @@ func runNode(ctx context.Context, node *managedNode, offset, total int) {
 	}
 }
 
+var version = "0.9.0-dev"
+
+const versionIntro = "A high-performance XrayR 0.9.0 compatible backend"
+
+func showVersion() {
+	fmt.Printf("XrayR %s (%s) \n", version, versionIntro)
+}
+
+func siblingBinary(name string) string {
+	executable, err := os.Executable()
+	if err != nil {
+		return name
+	}
+	return filepath.Join(filepath.Dir(executable), name)
+}
+
+func execLegacy(binary, configPath string, reason error) {
+	if reason != nil {
+		log.Printf("当前配置切换至 LegacyEngine：%v", reason)
+	}
+	arguments := []string{binary}
+	if configPath != "" {
+		arguments = append(arguments, "-config", configPath)
+	}
+	if err := syscall.Exec(binary, arguments, os.Environ()); err != nil {
+		log.Fatalf("启动 LegacyEngine %q 失败：%v", binary, err)
+	}
+}
+
+func invocationArguments(arguments []string) ([]string, bool) {
+	if len(arguments) == 0 {
+		return arguments, false
+	}
+	switch arguments[0] {
+	case "version":
+		return nil, true
+	case "run":
+		return arguments[1:], false
+	default:
+		return arguments, false
+	}
+}
+
 func main() {
-	configPath := flag.String("config", "config.yml", "oldxr config.yml path")
-	engineBinary := flag.String("engine", "../fastvmess-uring/target/release/oldxr-phase7-fastvmess-uring", "FastEngine binary")
-	adminSocket := flag.String("engine-admin", "/tmp/oldxr-phase7-fastengine.sock", "FastEngine Unix admin socket")
-	metricsAddress := flag.String("metrics", "127.0.0.1:6062", "control-plane metrics address")
-	debugStatus := flag.String("engine-debug-status", "", "optional FastEngine debug status JSON")
-	flag.Parse()
+	arguments, versionCommand := invocationArguments(os.Args[1:])
+	if versionCommand {
+		showVersion()
+		return
+	}
+
+	flags := flag.NewFlagSet("XrayR", flag.ContinueOnError)
+	configPath := flags.String("config", "config.yml", "Config file for XrayR.")
+	printVersion := flags.Bool("version", false, "show version")
+	engineBinary := flags.String("engine", siblingBinary("XrayR-fastengine"), "FastEngine binary")
+	legacyBinary := flags.String("legacy-engine", siblingBinary("XrayR-legacy"), "LegacyEngine binary")
+	adminSocket := flags.String("engine-admin", "/tmp/oldxr-phase7-fastengine.sock", "FastEngine Unix admin socket")
+	metricsAddress := flags.String("metrics", "127.0.0.1:6062", "control-plane metrics address")
+	debugStatus := flags.String("engine-debug-status", "", "optional FastEngine debug status JSON")
+	if err := flags.Parse(arguments); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
+		execLegacy(*legacyBinary, *configPath, fmt.Errorf("FastEngine命令行不支持：%w", err))
+	}
+	if flags.NArg() != 0 {
+		execLegacy(*legacyBinary, *configPath, fmt.Errorf("FastEngine不支持命令 %q", strings.Join(flags.Args(), " ")))
+	}
+	if *printVersion {
+		showVersion()
+		return
+	}
 
 	nodes, err := config.LoadFastEngine(*configPath)
 	if err != nil {
+		if errors.Is(err, config.ErrLegacyRequired) {
+			execLegacy(*legacyBinary, *configPath, err)
+		}
 		log.Fatal(err)
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -446,10 +517,16 @@ func main() {
 	engine := fastengine.New(*adminSocket)
 	managed, err := discover(ctx, nodes, engine)
 	if err != nil {
+		if errors.Is(err, config.ErrLegacyRequired) {
+			execLegacy(*legacyBinary, *configPath, err)
+		}
 		log.Fatal(err)
 	}
 	vmessConfigs, ssAddress, ssPorts, err := engineInputs(managed)
 	if err != nil {
+		if errors.Is(err, config.ErrLegacyRequired) {
+			execLegacy(*legacyBinary, *configPath, err)
+		}
 		log.Fatal(err)
 	}
 	engineConfigPath, err := writeEngineConfig(vmessConfigs)
@@ -489,6 +566,7 @@ func main() {
 		stopEngine()
 		log.Fatal(err)
 	}
+	showVersion()
 	for _, node := range managed {
 		if err := node.pushPolicy(ctx); err != nil {
 			stopEngine()

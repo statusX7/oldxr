@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -35,11 +36,22 @@ func TestNormalizeShadowsocksRequiresOnePortAndCipher(t *testing.T) {
 }
 
 func TestValidateVMessNodeFailsClosedForUnsupportedTransport(t *testing.T) {
-	if err := validateVMessNode(v2board.NodeInfo{Port: 443, Network: "ws", Security: "tls"}); err == nil {
+	if err := validateVMessNode(v2board.NodeInfo{Port: 443, Network: "ws", Security: "tls"}); !errors.Is(err, config.ErrLegacyRequired) {
 		t.Fatal("unsupported VMess transport unexpectedly entered FastVMess")
 	}
 	if err := validateVMessNode(v2board.NodeInfo{Port: 21001, Network: "tcp", Security: "none", HeaderType: "none"}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestInvocationArgumentsPreserveLegacyCompatibleForms(t *testing.T) {
+	arguments, versionOnly := invocationArguments([]string{"run", "--config", "/tmp/config.yml"})
+	if versionOnly || len(arguments) != 2 || arguments[0] != "--config" || arguments[1] != "/tmp/config.yml" {
+		t.Fatalf("run arguments = %#v, version=%v", arguments, versionOnly)
+	}
+	arguments, versionOnly = invocationArguments([]string{"version"})
+	if !versionOnly || arguments != nil {
+		t.Fatalf("version arguments = %#v, version=%v", arguments, versionOnly)
 	}
 }
 
