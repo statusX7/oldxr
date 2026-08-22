@@ -1,0 +1,25 @@
+[package]
+name = "oldxr-phase7-fastvmess-uring"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[dependencies]
+aws-lc-rs = { version = "=1.17.1", default-features = false, features = ["aws-lc-sys"] }
+digest = "=0.11.3"
+io-uring = "=0.7.13"
+libc = "=0.2.189"
+md-5 = "=0.11.0"
+regex = "=1.13.1"
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+shake = "=0.1.0"
+shadowsocks-crypto = { version = "=0.7.0", default-features = false, features = ["v1", "v1-aead", "aws-lc"] }
+uuid = "=1.23.5"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = true
