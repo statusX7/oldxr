@@ -10,7 +10,7 @@ yellow='\033[0;33m'
 plain='\033[0m'
 
 REPO="statusX7/oldxr"
-MAINTENANCE_0_9_0="v0.9.0-r2"
+MAINTENANCE_0_9_0="v0.9.0-r3"
 RELEASE_BASE="${OLDXR_RELEASE_BASE:-https://github.com/${REPO}/releases/download}"
 INSTALL_ROOT="${OLDXR_INSTALL_ROOT:-}"
 SYSTEMCTL_BIN="${OLDXR_SYSTEMCTL_BIN:-systemctl}"
@@ -211,9 +211,11 @@ backup_existing_install() {
     if [[ -f "${active_binary_file}" ]]; then
         cp -a "${active_binary_file}" "${persistent_backup_dir}/install/XrayR"
     fi
-    if [[ -f "${INSTALL_DIR}/XrayR.sh" ]]; then
-        cp -a "${INSTALL_DIR}/XrayR.sh" "${persistent_backup_dir}/install/XrayR.sh"
-    fi
+    for file in XrayR-fastengine XrayR-legacy XrayR.sh; do
+        if [[ -f "${INSTALL_DIR}/${file}" ]]; then
+            cp -a "${INSTALL_DIR}/${file}" "${persistent_backup_dir}/install/${file}"
+        fi
+    done
     if [[ ${had_service} -eq 1 ]]; then
         cp -a "${SERVICE_FILE}" "${persistent_backup_dir}/system/XrayR.service"
     fi
@@ -280,6 +282,11 @@ resolve_version() {
     esac
 }
 
+release_requires_fastengine() {
+    local revision="${resolved_version##*-r}"
+    [[ "${revision}" =~ ^[0-9]+$ ]] && (( revision >= 3 ))
+}
+
 download_file() {
     local url="$1"
     local output="$2"
@@ -292,6 +299,11 @@ download_file() {
 download_and_verify_release() {
     local archive_name="XrayR-linux-${arch_name}.zip"
     local release_url="${RELEASE_BASE}/${resolved_version}"
+    local -a required_files
+    if release_requires_fastengine && [[ "${arch_name}" != "64" && "${arch_name}" != "arm64-v8a" ]]; then
+        echo -e "${red}错误：${plain}${resolved_version} FastEngine Release 仅支持 linux/amd64 与 linux/arm64。" >&2
+        exit 2
+    fi
     temp_dir="$(mktemp -d)"
     archive_path="${temp_dir}/${archive_name}"
     checksum_path="${archive_path}.sha256"
@@ -307,13 +319,20 @@ download_and_verify_release() {
 
     mkdir -p "${stage_dir}"
     unzip -q "${archive_path}" -d "${stage_dir}"
-    for required in XrayR config.yml geoip.dat geosite.dat XrayR.service XrayR.sh; do
+    required_files=(XrayR config.yml geoip.dat geosite.dat XrayR.service XrayR.sh)
+    if release_requires_fastengine; then
+        required_files+=(XrayR-fastengine XrayR-legacy FASTENGINE-LICENSE FASTENGINE-NOTICE.md)
+    fi
+    for required in "${required_files[@]}"; do
         if [[ ! -f "${stage_dir}/${required}" ]]; then
             echo -e "${red}错误：${plain}Release archive 缺少 ${required}。" >&2
             exit 1
         fi
     done
     chmod +x "${stage_dir}/XrayR" "${stage_dir}/XrayR.sh"
+    if release_requires_fastengine; then
+        chmod +x "${stage_dir}/XrayR-fastengine" "${stage_dir}/XrayR-legacy"
+    fi
     "${stage_dir}/XrayR" -version
 }
 
@@ -374,6 +393,9 @@ activate_install() {
     fi
     cp -f "${INSTALL_DIR}/XrayR.sh" "${MANAGER_FILE}" || return 1
     chmod +x "${INSTALL_DIR}/XrayR" "${MANAGER_FILE}" || return 1
+    if release_requires_fastengine; then
+        chmod +x "${INSTALL_DIR}/XrayR-fastengine" "${INSTALL_DIR}/XrayR-legacy" || return 1
+    fi
     rm -f "${MANAGER_LINK}" || return 1
     ln -s "${MANAGER_FILE}" "${MANAGER_LINK}" || return 1
 

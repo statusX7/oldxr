@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if [[ $# -lt 3 || $# -gt 5 ]]; then
-    echo "用法：$0 RELEASE_ARCHIVE INSTALL_SCRIPT OFFICIAL_BINARY [STATUSX7_XR_BINARY] [OLDXR_R1_BINARY]" >&2
+if [[ $# -lt 3 || $# -gt 6 ]]; then
+    echo "用法：$0 RELEASE_ARCHIVE INSTALL_SCRIPT OFFICIAL_BINARY [STATUSX7_XR_BINARY] [OLDXR_R1_BINARY] [OLDXR_R2_BINARY]" >&2
     exit 2
 fi
 
@@ -11,8 +11,10 @@ install_script="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
 source_binary="$(cd "$(dirname "$3")" && pwd)/$(basename "$3")"
 statusx7_binary="${4:-${source_binary}}"
 oldxr_r1_binary="${5:-${source_binary}}"
+oldxr_r2_binary="${6:-${source_binary}}"
 statusx7_binary="$(cd "$(dirname "${statusx7_binary}")" && pwd)/$(basename "${statusx7_binary}")"
 oldxr_r1_binary="$(cd "$(dirname "${oldxr_r1_binary}")" && pwd)/$(basename "${oldxr_r1_binary}")"
+oldxr_r2_binary="$(cd "$(dirname "${oldxr_r2_binary}")" && pwd)/$(basename "${oldxr_r2_binary}")"
 archive_name="$(basename "${archive}")"
 checksum="${archive}.sha256"
 release_version="$(sed -n 's/^MAINTENANCE_0_9_0="\([^"]*\)"/\1/p' "${install_script}")"
@@ -22,7 +24,7 @@ if [[ ! "${release_version}" =~ ^v0\.9\.0-r[0-9]+$ ]]; then
     exit 1
 fi
 
-for required in "${archive}" "${checksum}" "${install_script}" "${source_binary}" "${statusx7_binary}" "${oldxr_r1_binary}"; do
+for required in "${archive}" "${checksum}" "${install_script}" "${source_binary}" "${statusx7_binary}" "${oldxr_r1_binary}" "${oldxr_r2_binary}"; do
     [[ -f "${required}" ]] || { echo "错误：测试输入不存在：${required}" >&2; exit 1; }
 done
 
@@ -86,15 +88,18 @@ SERVICE
     mkdir -p "$(dirname "${root}${config_path}")"
     printf 'PanelType: "V2board"\nApiKey: "phase3-%s-sentinel"\n' "${name}" > "${root}${config_path}"
     chmod 640 "${root}${config_path}"
-    printf '{"sentinel":"%s"}\n' "${name}" > "$(dirname "${root}${config_path}")/custom_inbound.json"
+    for custom_file in custom_inbound.json custom_outbound.json route.json dns.json rulelist; do
+        printf '{"sentinel":"%s-%s"}\n' "${name}" "${custom_file}" > "$(dirname "${root}${config_path}")/${custom_file}"
+        sha256sum "$(dirname "${root}${config_path}")/${custom_file}" | awk '{print $1}' > "${root}/${custom_file}-before"
+    done
 
     printf '%s\n' "${config_path}" > "${root}/config-path"
     sha256sum "${root}${config_path}" | awk '{print $1}' > "${root}/config-before"
+    stat -c '%u:%g' "${root}${config_path}" > "${root}/config-owner-before"
     sha256sum "${root}/usr/local/XrayR/XrayR" | awk '{print $1}' > "${root}/binary-before"
     "${root}/usr/local/XrayR/XrayR" -version | sed -n '1p' > "${root}/version-before"
     sha256sum "${root}/etc/systemd/system/XrayR.service" | awk '{print $1}' > "${root}/service-before"
     sha256sum "${root}/usr/bin/XrayR" | awk '{print $1}' > "${root}/manager-before"
-    sha256sum "$(dirname "${root}${config_path}")/custom_inbound.json" | awk '{print $1}' > "${root}/custom-before"
     touch "${root}/systemctl-active"
 }
 
@@ -128,9 +133,14 @@ assert_preserved_upgrade() {
     grep -F "配置已保留：${config_path}" <<<"${output}" >/dev/null
     [[ "$(<"${root}/config-before")" == "$(sha256sum "${root}${config_path}" | awk '{print $1}')" ]]
     [[ "$(stat -c '%a' "${root}${config_path}")" == "640" ]]
-    [[ "$(<"${root}/custom-before")" == "$(sha256sum "$(dirname "${root}${config_path}")/custom_inbound.json" | awk '{print $1}')" ]]
+    [[ "$(<"${root}/config-owner-before")" == "$(stat -c '%u:%g' "${root}${config_path}")" ]]
+    for custom_file in custom_inbound.json custom_outbound.json route.json dns.json rulelist; do
+        [[ "$(<"${root}/${custom_file}-before")" == "$(sha256sum "$(dirname "${root}${config_path}")/${custom_file}" | awk '{print $1}')" ]]
+    done
     grep -Fx "ExecStart=/usr/local/XrayR/XrayR --config ${config_path}" "${root}/etc/systemd/system/XrayR.service" >/dev/null
     [[ -f "${root}/usr/local/XrayR/.oldxr-release" ]]
+    [[ -x "${root}/usr/local/XrayR/XrayR-fastengine" ]]
+    [[ -x "${root}/usr/local/XrayR/XrayR-legacy" ]]
     grep -Fx "${release_version}" "${root}/usr/local/XrayR/.oldxr-release" >/dev/null
     "${root}/usr/local/XrayR/XrayR" -version | grep -F "XrayR ${release_version#v}" >/dev/null
     [[ -f "${root}/systemctl-active" ]]
@@ -143,7 +153,9 @@ assert_preserved_upgrade() {
     [[ -f "${backup}/install/XrayR" ]]
     [[ -f "${backup}/system/XrayR.service" ]]
     [[ -f "${backup}/config/config.yml" ]]
-    [[ -f "${backup}/config/custom/custom_inbound.json" ]]
+    for custom_file in custom_inbound.json custom_outbound.json route.json dns.json rulelist; do
+        [[ -f "${backup}/config/custom/${custom_file}" ]]
+    done
 }
 
 echo "执行 official XrayR v0.9.0 布局升级测试"
@@ -160,6 +172,12 @@ printf 'v0.9.0-r1\n' > "${test_root}/oldxr-r1/usr/local/XrayR/.oldxr-release"
 printf 'v0.9.0-r1\n' > "${test_root}/oldxr-r1/version-before"
 assert_preserved_upgrade oldxr-r1 oldxr
 
+echo "执行 oldxr v0.9.0-r2 布局升级测试"
+prepare_layout oldxr-r2 'https://github.com/statusX7/oldxr' "${oldxr_r2_binary}"
+printf 'v0.9.0-r2\n' > "${test_root}/oldxr-r2/usr/local/XrayR/.oldxr-release"
+printf 'v0.9.0-r2\n' > "${test_root}/oldxr-r2/version-before"
+assert_preserved_upgrade oldxr-r2 oldxr
+
 echo "执行 service 启动失败回滚测试"
 prepare_layout rollback 'https://github.com/XrayR-project/XrayR' "${source_binary}"
 touch "${test_root}/rollback/systemctl-fail-once"
@@ -172,11 +190,15 @@ rollback_config="$(<"${test_root}/rollback/config-path")"
 [[ "$(<"${test_root}/rollback/binary-before")" == "$(sha256sum "${test_root}/rollback/usr/local/XrayR/XrayR" | awk '{print $1}')" ]]
 [[ "$(<"${test_root}/rollback/service-before")" == "$(sha256sum "${test_root}/rollback/etc/systemd/system/XrayR.service" | awk '{print $1}')" ]]
 [[ "$(<"${test_root}/rollback/manager-before")" == "$(sha256sum "${test_root}/rollback/usr/bin/XrayR" | awk '{print $1}')" ]]
-[[ "$(<"${test_root}/rollback/custom-before")" == "$(sha256sum "${test_root}/rollback/etc/XrayR/custom_inbound.json" | awk '{print $1}')" ]]
+for custom_file in custom_inbound.json custom_outbound.json route.json dns.json rulelist; do
+    [[ "$(<"${test_root}/rollback/${custom_file}-before")" == "$(sha256sum "${test_root}/rollback/etc/XrayR/${custom_file}" | awk '{print $1}')" ]]
+done
 [[ -f "${test_root}/rollback/systemctl-active" ]]
 [[ ! -e "${test_root}/rollback/usr/local/XrayR/.oldxr-release" ]]
-for absent_after_rollback in custom_outbound.json route.json dns.json rulelist geoip.dat geosite.dat; do
+[[ ! -e "${test_root}/rollback/usr/local/XrayR/XrayR-fastengine" ]]
+[[ ! -e "${test_root}/rollback/usr/local/XrayR/XrayR-legacy" ]]
+for absent_after_rollback in geoip.dat geosite.dat; do
     [[ ! -e "${test_root}/rollback/etc/XrayR/${absent_after_rollback}" ]]
 done
 
-echo "PASS：三类历史布局均保留配置与自定义文件，持久备份和 service 失败回滚有效。"
+echo "PASS：official、statusX7/XR、r1、r2 四类历史布局均保留配置与全部自定义文件，持久备份和 service 失败回滚有效。"

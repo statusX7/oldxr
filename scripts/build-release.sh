@@ -13,14 +13,16 @@ target_arm="$3"
 asset_name="$4"
 release_version="$5"
 output_dir="${6:-dist}"
-go_bin="${GO_BIN:-go}"
+legacy_go_bin="${LEGACY_GO_BIN:-${GO_BIN:-go}}"
+control_go_bin="${CONTROL_GO_BIN:-${GO_BIN:-go}}"
+cargo_bin="${CARGO_BIN:-cargo}"
 
-if [[ ! "${target_os}" =~ ^[a-z0-9]+$ || ! "${target_arch}" =~ ^[a-z0-9]+$ ]]; then
-    echo "错误：无效的 GOOS/GOARCH。" >&2
+if [[ "${target_os}" != "linux" || ! "${target_arch}" =~ ^(amd64|arm64)$ ]]; then
+    echo "错误：FastEngine Release 当前只支持 linux/amd64 与 linux/arm64。" >&2
     exit 2
 fi
-if [[ -n "${target_arm}" && ! "${target_arm}" =~ ^[0-9]+$ ]]; then
-    echo "错误：无效的 GOARM。" >&2
+if [[ -n "${target_arm}" ]]; then
+    echo "错误：linux/amd64 与 linux/arm64 不应设置 GOARM。" >&2
     exit 2
 fi
 if [[ ! "${asset_name}" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -32,6 +34,13 @@ if [[ ! "${release_version}" =~ ^v?0\.9\.0-r[0-9]+$ ]]; then
     exit 2
 fi
 
+for tool in "${legacy_go_bin}" "${control_go_bin}" "${cargo_bin}" zip sha256sum; do
+    command -v "${tool}" >/dev/null 2>&1 || {
+        echo "错误：构建工具不存在：${tool}" >&2
+        exit 1
+    }
+done
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 mkdir -p "${output_dir}"
@@ -39,36 +48,63 @@ output_dir="$(cd "${output_dir}" && pwd)"
 stage_root="$(mktemp -d)"
 trap 'rm -rf "${stage_root}"' EXIT
 stage_dir="${stage_root}/build_assets"
-mkdir -p "${stage_dir}"
+cargo_target_dir="${CARGO_TARGET_DIR:-${stage_root}/cargo-target}"
+mkdir -p "${stage_dir}" "${cargo_target_dir}"
 
-binary_name="XrayR"
-if [[ "${target_os}" == "windows" ]]; then
-    binary_name="XrayR.exe"
-fi
+case "${target_arch}" in
+    amd64)
+        rust_target="x86_64-unknown-linux-gnu"
+        rust_binary_dir="${cargo_target_dir}/release"
+        ;;
+    arm64)
+        rust_target="aarch64-unknown-linux-gnu"
+        rust_binary_dir="${cargo_target_dir}/${rust_target}/release"
+        cross_cc="${AARCH64_CC:-aarch64-linux-gnu-gcc}"
+        command -v "${cross_cc}" >/dev/null 2>&1 || {
+            echo "错误：arm64 FastEngine 交叉编译器不存在：${cross_cc}" >&2
+            exit 1
+        }
+        ;;
+esac
 
 version_value="${release_version#v}"
-build_flags=(-trimpath -ldflags "-s -w -buildid= -X main.version=${version_value}")
+legacy_build_flags=(-trimpath -buildvcs=false -ldflags "-s -w -buildid= -X main.version=${version_value}")
+control_build_flags=(-trimpath -buildvcs=false -ldflags "-s -w -buildid= -X main.version=${version_value}")
 
-echo "构建 ${target_os}/${target_arch}${target_arm:+/v${target_arm}} -> XrayR-${asset_name}.zip"
+echo "构建 ${target_os}/${target_arch} -> XrayR-${asset_name}.zip"
 (
     cd "${repo_root}"
     env \
         CGO_ENABLED=0 \
         GOOS="${target_os}" \
         GOARCH="${target_arch}" \
-        GOARM="${target_arm}" \
-        "${go_bin}" build "${build_flags[@]}" -o "${stage_dir}/${binary_name}" ./main
-
-    if [[ "${target_arch}" == "mips" || "${target_arch}" == "mipsle" ]]; then
+        "${legacy_go_bin}" build "${legacy_build_flags[@]}" \
+        -o "${stage_dir}/XrayR-legacy" ./main
+)
+(
+    cd "${repo_root}/fastengine/control"
+    env \
+        CGO_ENABLED=0 \
+        GOOS="${target_os}" \
+        GOARCH="${target_arch}" \
+        "${control_go_bin}" build "${control_build_flags[@]}" \
+        -o "${stage_dir}/XrayR" ./cmd/fastengine-control
+)
+(
+    cd "${repo_root}/fastengine"
+    if [[ "${target_arch}" == "arm64" ]]; then
         env \
-            CGO_ENABLED=0 \
-            GOOS="${target_os}" \
-            GOARCH="${target_arch}" \
-            GOARM="${target_arm}" \
-            GOMIPS=softfloat \
-            "${go_bin}" build "${build_flags[@]}" -o "${stage_dir}/XrayR_softfloat" ./main
+            CARGO_TARGET_DIR="${cargo_target_dir}" \
+            CC_aarch64_unknown_linux_gnu="${cross_cc}" \
+            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="${cross_cc}" \
+            "${cargo_bin}" build --release --locked --target "${rust_target}"
+    else
+        env CARGO_TARGET_DIR="${cargo_target_dir}" \
+            "${cargo_bin}" build --release --locked
     fi
 )
+cp "${rust_binary_dir}/oldxr-phase7-fastvmess-uring" \
+    "${stage_dir}/XrayR-fastengine"
 
 for source in \
     README.md \
@@ -82,7 +118,9 @@ for source in \
     main/rulelist \
     main/config.yml.example \
     main/geoip.dat \
-    main/geosite.dat; do
+    main/geosite.dat \
+    fastengine/LICENSE \
+    fastengine/NOTICE.md; do
     if [[ ! -f "${repo_root}/${source}" ]]; then
         echo "错误：Release 必需文件不存在：${source}" >&2
         exit 1
@@ -91,6 +129,8 @@ done
 
 cp "${repo_root}/README.md" "${stage_dir}/README.md"
 cp "${repo_root}/LICENSE" "${stage_dir}/LICENSE"
+cp "${repo_root}/fastengine/LICENSE" "${stage_dir}/FASTENGINE-LICENSE"
+cp "${repo_root}/fastengine/NOTICE.md" "${stage_dir}/FASTENGINE-NOTICE.md"
 cp "${repo_root}/XrayR.service" "${stage_dir}/XrayR.service"
 cp "${repo_root}/XrayR.sh" "${stage_dir}/XrayR.sh"
 cp "${repo_root}/main/dns.json" "${stage_dir}/dns.json"
@@ -102,7 +142,8 @@ cp "${repo_root}/main/config.yml.example" "${stage_dir}/config.yml"
 cp "${repo_root}/main/geoip.dat" "${stage_dir}/geoip.dat"
 cp "${repo_root}/main/geosite.dat" "${stage_dir}/geosite.dat"
 
-chmod +x "${stage_dir}/${binary_name}" "${stage_dir}/XrayR.sh"
+chmod +x "${stage_dir}/XrayR" "${stage_dir}/XrayR-fastengine" \
+    "${stage_dir}/XrayR-legacy" "${stage_dir}/XrayR.sh"
 
 source_date_epoch="${SOURCE_DATE_EPOCH:-$(git -C "${repo_root}" show -s --format=%ct HEAD)}"
 find "${stage_dir}" -type f -exec touch -d "@${source_date_epoch}" {} +

@@ -6,7 +6,7 @@ on:
       version:
         description: Maintenance version to build
         required: true
-        default: v0.9.0-r2
+        default: v0.9.0-r3
   push:
     tags:
       - "v0.9.0-r*"
@@ -15,17 +15,17 @@ permissions:
   contents: read
 
 jobs:
-  validate:
+  validate-legacy:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
-      - name: Set up Go 1.20.14
-        uses: actions/setup-go@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up legacy Go 1.20.14
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.20.14
           cache: true
-      - name: Validate
+      - name: Validate LegacyEngine
         env:
           GOFLAGS: -mod=readonly
         run: |
@@ -34,59 +34,110 @@ jobs:
           go vet ./...
           go test -race ./...
 
+  validate-control:
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: fastengine/control
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Go 1.27.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.0
+          cache-dependency-path: fastengine/control/go.sum
+      - name: Validate compatibility control plane
+        env:
+          GOFLAGS: -mod=readonly
+        run: |
+          go version
+          go test ./...
+          go vet ./...
+          go test -race ./...
+
+  validate-fastengine:
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: fastengine
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Rust 1.97.1
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable on 2026-08-22
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - name: Validate FastEngine
+        run: |
+          cargo fmt --all -- --check
+          cargo test --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+      - name: Install pinned audit tools
+        run: |
+          cargo install --locked cargo-audit --version 0.22.2
+          cargo install --locked cargo-deny --version 0.20.2
+      - name: Audit FastEngine dependencies
+        run: |
+          cargo audit
+          cargo deny check advisories licenses sources
+
   build:
-    needs: validate
+    needs: [validate-legacy, validate-control, validate-fastengine]
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { goos: linux, goarch: amd64, goarm: "", asset: linux-64 }
-          - { goos: linux, goarch: "386", goarm: "", asset: linux-32 }
-          - { goos: linux, goarch: arm64, goarm: "", asset: linux-arm64-v8a }
-          - { goos: linux, goarch: arm, goarm: "7", asset: linux-arm32-v7a }
-          - { goos: linux, goarch: arm, goarm: "6", asset: linux-arm32-v6a }
-          - { goos: linux, goarch: arm, goarm: "5", asset: linux-arm32-v5 }
-          - { goos: linux, goarch: riscv64, goarm: "", asset: linux-riscv64 }
-          - { goos: linux, goarch: mips, goarm: "", asset: linux-mips32 }
-          - { goos: linux, goarch: mipsle, goarm: "", asset: linux-mips32le }
-          - { goos: linux, goarch: mips64, goarm: "", asset: linux-mips64 }
-          - { goos: linux, goarch: mips64le, goarm: "", asset: linux-mips64le }
-          - { goos: linux, goarch: ppc64le, goarm: "", asset: linux-ppc64le }
-          - { goos: linux, goarch: s390x, goarm: "", asset: linux-s390x }
-          - { goos: windows, goarch: amd64, goarm: "", asset: windows-64 }
-          - { goos: windows, goarch: "386", goarm: "", asset: windows-32 }
-          - { goos: darwin, goarch: amd64, goarm: "", asset: macos-64 }
-          - { goos: darwin, goarch: arm64, goarm: "", asset: macos-arm64-v8a }
-          - { goos: freebsd, goarch: amd64, goarm: "", asset: freebsd-64 }
-          - { goos: freebsd, goarch: "386", goarm: "", asset: freebsd-32 }
-          - { goos: freebsd, goarch: arm64, goarm: "", asset: freebsd-arm64-v8a }
-          - { goos: freebsd, goarch: arm, goarm: "7", asset: freebsd-arm32-v7a }
-          - { goos: openbsd, goarch: amd64, goarm: "", asset: openbsd-64 }
-          - { goos: dragonfly, goarch: amd64, goarm: "", asset: dragonfly-64 }
-          - { goos: android, goarch: arm64, goarm: "", asset: android-arm64-v8a }
+          - { goarch: amd64, asset: linux-64, rust_target: x86_64-unknown-linux-gnu }
+          - { goarch: arm64, asset: linux-arm64-v8a, rust_target: aarch64-unknown-linux-gnu }
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
-      - name: Set up Go 1.20.14
-        uses: actions/setup-go@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up legacy Go 1.20.14
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: 1.20.14
           cache: true
-      - name: Build deterministic archive
+      - name: Remember legacy Go compiler
+        run: echo "LEGACY_GO_BIN=$(go env GOROOT)/bin/go" >> "${GITHUB_ENV}"
+      - name: Set up control Go 1.27.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.27.0
+          cache-dependency-path: fastengine/control/go.sum
+      - name: Remember control Go compiler
+        run: echo "CONTROL_GO_BIN=$(go env GOROOT)/bin/go" >> "${GITHUB_ENV}"
+      - name: Set up Rust 1.97.1
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable on 2026-08-22
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.rust_target }}
+      - name: Install arm64 linker
+        if: matrix.goarch == 'arm64'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build deterministic FastEngine archive
         env:
           GOFLAGS: -mod=readonly
           VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version }}
         run: |
           ./scripts/build-release.sh \
-            "${{ matrix.goos }}" \
+            linux \
             "${{ matrix.goarch }}" \
-            "${{ matrix.goarm }}" \
+            "" \
             "${{ matrix.asset }}" \
             "${VERSION}" \
             dist
+      - name: Verify archive contents
+        run: |
+          unzip -Z1 "dist/XrayR-${{ matrix.asset }}.zip" | sort > archive-files.txt
+          for required in XrayR XrayR-fastengine XrayR-legacy FASTENGINE-LICENSE FASTENGINE-NOTICE.md; do
+            grep -Fx "${required}" archive-files.txt
+          done
+          (cd dist && sha256sum --check "XrayR-${{ matrix.asset }}.zip.sha256")
       - name: Upload archive artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-${{ matrix.asset }}
           path: |
@@ -102,7 +153,7 @@ jobs:
       contents: write
     steps:
       - name: Download release artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: release-*
           path: dist
@@ -117,6 +168,6 @@ jobs:
             gh release create "${TAG}" \
               --verify-tag \
               --title "oldxr ${TAG}" \
-              --notes "仍基于 XrayR v0.9.0、xray-core v1.7.5，并保持 V2Board 1.6.0 legacy API 兼容。使用 maintenance channel 安装或升级：bash <(curl -Ls https://raw.githubusercontent.com/statusX7/oldxr/master/install.sh) 0.9.0"
+              --notes "保持 XrayR v0.9.0 config 与 V2Board 1.6.0 legacy API 兼容；内部采用 Go 1.27 control plane、Rust FastEngine，并为不支持的历史配置保留 XrayR v0.9.0 LegacyEngine fallback。使用 maintenance channel 安装或升级：bash <(curl -Ls https://raw.githubusercontent.com/statusX7/oldxr/master/install.sh) 0.9.0"
           fi
           gh release upload "${TAG}" dist/* --clobber

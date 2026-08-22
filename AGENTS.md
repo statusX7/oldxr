@@ -345,6 +345,8 @@ source
 - 安装参数 `0.9.0` 表示 XrayR v0.9.0 compatibility maintenance channel，必须明确解析到当前稳定 `v0.9.0-rN`，日志必须显示实际 tag；显式 `0.9.0-rN` 也应可安装。
 - `install.sh` 与 `XrayR.sh update` 必须只从 `statusX7/oldxr` 获取脚本和 Release asset，不得静默回退到 `statusX7/XR` 或任意第三方源。
 - Release 至少验证 `XrayR-linux-64.zip` 和 `XrayR-linux-arm64-v8a.zip` 的内容、SHA256、fresh install、update、systemd 与实际 binary 启动；正式发布必须记录 `main`、`master` 和 release tag SHA。
+- FastEngine maintenance Release 使用同目录三二进制：`XrayR` 是 V2Board/config compatibility control 与 engine selector，`XrayR-fastengine` 是现代数据面，`XrayR-legacy` 是不支持配置的显式 fallback。构建、installer、备份与回滚必须把三者作为一个不可拆分单元，不能静默遗漏 sidecar。
+- Go control 与 LegacyEngine 可使用不同且已锁定的 Go toolchain；Rust FastEngine 必须锁定 Rust target、`Cargo.lock`、第三方许可说明及 dependency audit。Release 报告必须如实注明实际 engine/core，而不能继续笼统声称内部 core 固定为 v1.7.5。
 
 ## 兼容平台
 
@@ -359,6 +361,8 @@ source
 - Android: arm64。
 
 “可交叉编译”不等于“已在目标系统运行验证”。修改 platform-specific、network、filesystem、service、certificate 或 syscall 行为时，必须缩小声明或增加目标系统验证。oldxr 不以 Docker 为部署、性能或 Release Gate 目标；第三方 OCI 样本的隔离安全研究不改变此规则。
+
+Phase 7 FastEngine 使用 Linux `io_uring`，正式 FastEngine archive 仅声明 Linux amd64 与 arm64；上面的广泛平台列表是稳定 r2 LegacyEngine 的历史构建范围，不得自动沿用为新引擎支持声明。Go control/LegacyEngine 仍以 `CGO_ENABLED=0` 构建，Rust FastEngine 当前依赖目标系统的 glibc 与 `libgcc_s`，必须在归档审计和安装说明中明确。
 
 ## 永久禁止事项
 

@@ -75,6 +75,10 @@ grep -F "oldxr ${release_version} 安装完成" <<<"${fresh_output}" >/dev/null
 
 for required in \
     usr/local/XrayR/XrayR \
+    usr/local/XrayR/XrayR-fastengine \
+    usr/local/XrayR/XrayR-legacy \
+    usr/local/XrayR/FASTENGINE-LICENSE \
+    usr/local/XrayR/FASTENGINE-NOTICE.md \
     usr/local/XrayR/config.yml \
     usr/local/XrayR/geoip.dat \
     usr/local/XrayR/geosite.dat \
@@ -86,6 +90,12 @@ for required in \
     etc/systemd/system/XrayR.service \
     usr/bin/XrayR; do
     [[ -f "${install_root}/${required}" ]] || { echo "错误：fresh install 缺少 ${required}" >&2; exit 1; }
+done
+for executable in XrayR XrayR-fastengine XrayR-legacy XrayR.sh; do
+    [[ -x "${install_root}/usr/local/XrayR/${executable}" ]] || {
+        echo "错误：${executable} 不可执行" >&2
+        exit 1
+    }
 done
 [[ -L "${install_root}/usr/bin/xrayr" ]] || { echo "错误：缺少 xrayr symlink" >&2; exit 1; }
 "${install_root}/usr/local/XrayR/XrayR" -version | grep -F "XrayR ${release_version#v}" >/dev/null
@@ -106,6 +116,13 @@ grep -F "XrayR service 已启动" <<<"${update_output}" >/dev/null
 config_hash_after="$(sha256sum "${install_root}/etc/XrayR/config.yml" | awk '{print $1}')"
 [[ "${config_hash_before}" == "${config_hash_after}" ]] || { echo "错误：update 覆盖了 config.yml" >&2; exit 1; }
 grep -Fx "start XrayR" "${systemctl_log}" >/dev/null
+update_backup="$(find "${install_root}/etc/XrayR/backups" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
+for backed_up in XrayR XrayR-fastengine XrayR-legacy XrayR.sh; do
+    [[ -f "${update_backup}/install/${backed_up}" ]] || {
+        echo "错误：update backup 缺少 ${backed_up}" >&2
+        exit 1
+    }
+done
 
 echo "执行 XrayR.sh update channel test"
 manager_output="$(env \
@@ -124,6 +141,8 @@ grep -F "更新完成" <<<"${manager_output}" >/dev/null
 
 echo "执行 checksum failure preservation test"
 installed_hash_before="$(sha256sum "${install_root}/usr/local/XrayR/XrayR" | awk '{print $1}')"
+engine_hash_before="$(sha256sum "${install_root}/usr/local/XrayR/XrayR-fastengine" | awk '{print $1}')"
+legacy_hash_before="$(sha256sum "${install_root}/usr/local/XrayR/XrayR-legacy" | awk '{print $1}')"
 printf 'corrupt' >> "${release_root}/${release_version}/${archive_name}"
 if run_installer 0.9.0 >/dev/null 2>&1; then
     echo "错误：损坏 archive 未被 checksum 拒绝" >&2
@@ -131,10 +150,18 @@ if run_installer 0.9.0 >/dev/null 2>&1; then
 fi
 installed_hash_after="$(sha256sum "${install_root}/usr/local/XrayR/XrayR" | awk '{print $1}')"
 [[ "${installed_hash_before}" == "${installed_hash_after}" ]] || { echo "错误：checksum 失败后已安装 binary 被修改" >&2; exit 1; }
+[[ "${engine_hash_before}" == "$(sha256sum "${install_root}/usr/local/XrayR/XrayR-fastengine" | awk '{print $1}')" ]] || {
+    echo "错误：checksum 失败后 FastEngine 被修改" >&2
+    exit 1
+}
+[[ "${legacy_hash_before}" == "$(sha256sum "${install_root}/usr/local/XrayR/XrayR-legacy" | awk '{print $1}')" ]] || {
+    echo "错误：checksum 失败后 LegacyEngine 被修改" >&2
+    exit 1
+}
 
 if run_installer 0.9.1 >/dev/null 2>&1; then
     echo "错误：不兼容版本参数 0.9.1 未被拒绝" >&2
     exit 1
 fi
 
-echo "PASS：fresh install、update、config preservation、systemd wiring 与 checksum failure 均符合预期。"
+echo "PASS：三二进制 fresh install、update、备份、config preservation、systemd wiring 与 checksum failure 均符合预期。"
