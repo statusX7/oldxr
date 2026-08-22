@@ -22,9 +22,9 @@ import (
 	"syscall"
 	"time"
 
-	"oldxr.local/phase6/fastss/internal/config"
-	"oldxr.local/phase6/fastss/internal/fastengine"
-	"oldxr.local/phase6/fastss/internal/v2board"
+	"github.com/statusX7/oldxr/fastengine/control/internal/config"
+	"github.com/statusX7/oldxr/fastengine/control/internal/fastengine"
+	"github.com/statusX7/oldxr/fastengine/control/internal/v2board"
 )
 
 type engineProtocolConfig struct {

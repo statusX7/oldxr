@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"oldxr.local/phase6/fastss/internal/config"
-	"oldxr.local/phase6/fastss/internal/v2board"
+	"github.com/statusX7/oldxr/fastengine/control/internal/config"
+	"github.com/statusX7/oldxr/fastengine/control/internal/v2board"
 )
 
 func TestNormalizeVMessRejectsLegacyAlterID(t *testing.T) {
