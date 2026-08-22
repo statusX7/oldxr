@@ -505,7 +505,7 @@ func main() {
 		return
 	}
 
-	nodes, err := config.LoadFastEngine(*configPath)
+	loaded, err := config.LoadFastEngine(*configPath)
 	if err != nil {
 		if errors.Is(err, config.ErrLegacyRequired) {
 			execLegacy(*legacyBinary, *configPath, err)
@@ -515,7 +515,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	engine := fastengine.New(*adminSocket)
-	managed, err := discover(ctx, nodes, engine)
+	managed, err := discover(ctx, loaded.Nodes, engine)
 	if err != nil {
 		if errors.Is(err, config.ErrLegacyRequired) {
 			execLegacy(*legacyBinary, *configPath, err)

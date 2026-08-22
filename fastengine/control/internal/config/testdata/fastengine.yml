@@ -1,0 +1,43 @@
+Log:
+  Level: error
+ConnectionConfig:
+  Handshake: 8
+  ConnIdle: 60
+  UplinkOnly: 0
+  DownlinkOnly: 0
+  BufferSize: 16
+Nodes:
+  - PanelType: V2board
+    ApiConfig:
+      ApiHost: http://127.0.0.1:18081
+      ApiKey: fixture-token
+      NodeID: 1001
+      NodeType: V2ray
+      Timeout: 5
+      SpeedLimit: 1000
+      DeviceLimit: 5
+    ControllerConfig:
+      ListenIP: 127.0.0.1
+      SendIP: 0.0.0.0
+      UpdatePeriodic: 60
+      DisableSniffing: true
+      DNSType: AsIs
+      CertConfig:
+        CertMode: none
+  - PanelType: V2board
+    ApiConfig:
+      ApiHost: http://127.0.0.1:18081
+      ApiKey: fixture-token
+      NodeID: 1001
+      NodeType: Shadowsocks
+      Timeout: 5
+      SpeedLimit: 1000
+      DeviceLimit: 5
+    ControllerConfig:
+      ListenIP: 127.0.0.1
+      SendIP: 0.0.0.0
+      UpdatePeriodic: 60
+      DisableSniffing: true
+      DNSType: AsIs
+      CertConfig:
+        CertMode: none
