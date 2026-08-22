@@ -1,6 +1,7 @@
 use crate::accounting::complete_record_write;
 use crate::diagnostics::{connection_error, ErrorScope};
 use crate::netaddr::{peer_ip, resolve_target, socket_address, socket_domain, RawSocketAddress};
+use crate::timeout::{TcpTimeoutState, TcpTimeouts};
 use io_uring::{opcode, squeue, types, IoUring};
 use regex::RegexSet;
 use serde::{Deserialize, Serialize};
@@ -319,6 +320,7 @@ struct Connection {
     closing: bool,
     failed: bool,
     generation: u64,
+    timeout: TcpTimeoutState,
 }
 
 struct UdpListenerState {
@@ -1457,6 +1459,7 @@ fn process_encrypted(
             extend_deadline(&mut connection.upload_ready_at, wait);
             append_upload_from_input(connection, payload_start, payload_length)?;
             connection.header_complete = true;
+            connection.timeout.authenticated(Instant::now());
             target = Some(address);
         } else {
             let wait = reserve_budget(
@@ -1575,6 +1578,7 @@ pub struct Engine {
     features: Features,
     tcp_nodelay: bool,
     fixed_file_base: u32,
+    tcp_timeouts: TcpTimeouts,
 }
 
 impl Engine {
@@ -1590,6 +1594,7 @@ impl Engine {
         tcp_nodelay: bool,
         fixed_file_base: u32,
         udp_idle_timeout: Duration,
+        tcp_timeouts: TcpTimeouts,
     ) -> io::Result<Self> {
         let speed_bytes_per_second = speed_mbps.saturating_mul(1_000_000) / 8;
         let sites = build_sites(
@@ -1641,6 +1646,7 @@ impl Engine {
             features: Features::parse(features),
             tcp_nodelay,
             fixed_file_base,
+            tcp_timeouts,
         })
     }
 
@@ -1737,6 +1743,18 @@ impl Engine {
 
     pub fn open_connections(&self) -> usize {
         self.active_connections + self.active_udp_associations
+    }
+
+    pub fn has_tcp_connections(&self) -> bool {
+        self.active_connections != 0
+    }
+
+    pub fn expire_tcp(&mut self, now: Instant) {
+        for state in self.connections.iter_mut().flatten() {
+            if !state.closing && state.timeout.expired(now, self.tcp_timeouts) {
+                begin_close(state);
+            }
+        }
     }
 
     pub fn replace_users(
@@ -2416,6 +2434,7 @@ impl Engine {
                 closing: false,
                 failed: false,
                 generation,
+                timeout: TcpTimeoutState::new(Instant::now()),
             };
             queue_connection!(&mut state, pending, recv_inbound_entry(id, &mut state)?);
             if id == self.connections.len() {
@@ -2431,6 +2450,7 @@ impl Engine {
         let id = id_or_site;
         let features = self.features;
         let tcp_nodelay = self.tcp_nodelay;
+        let tcp_timeouts = self.tcp_timeouts;
         let sites = &mut self.sites;
         let timers = &mut self.timers;
         let Some(state) = self.connections.get_mut(id).and_then(Option::as_mut) else {
@@ -2466,10 +2486,15 @@ impl Engine {
                             return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
                         }
                         state.inbound_read_eof = true;
+                        if state.timeout.upload_closed(Instant::now(), tcp_timeouts) {
+                            begin_close(state);
+                            return Ok(());
+                        }
                         finish_upload_half(state);
                         finish_graceful_close(state);
                         return Ok(());
                     }
+                    state.timeout.note_activity();
                     state.input_length += result as usize;
                     let site = &mut sites[state.site];
                     let target = process_encrypted(state, site, features)?;
@@ -2519,10 +2544,15 @@ impl Engine {
                 OP_RECV_OUTBOUND => {
                     if result == 0 {
                         state.outbound_read_eof = true;
+                        if state.timeout.download_closed(Instant::now(), tcp_timeouts) {
+                            begin_close(state);
+                            return Ok(());
+                        }
                         finish_download_half(state);
                         finish_graceful_close(state);
                         return Ok(());
                     }
+                    state.timeout.note_activity();
                     let site = state.site;
                     prepare_download(state, &mut sites[site], features, result as usize)?;
                     if state.download_ready_at.is_none() {

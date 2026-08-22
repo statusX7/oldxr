@@ -61,3 +61,19 @@ func TestLoadFastEngineFallsBackWhenSniffingIsEnabled(t *testing.T) {
 		t.Fatalf("sniffing-enabled config error = %v", err)
 	}
 }
+
+func TestLoadFastEngineFallsBackForUnsupportedBufferSize(t *testing.T) {
+	contents, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "config.yml")
+	contents = []byte(strings.Replace(string(contents), "BufferSize: 16", "BufferSize: 32", 1))
+	if err := os.WriteFile(path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = LoadFastEngine(path)
+	if !errors.Is(err, ErrLegacyRequired) {
+		t.Fatalf("unsupported BufferSize error = %v", err)
+	}
+}

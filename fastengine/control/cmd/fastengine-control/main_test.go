@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/statusX7/oldxr/fastengine/control/internal/config"
@@ -14,6 +15,21 @@ func TestNormalizeVMessRejectsLegacyAlterID(t *testing.T) {
 	_, err := normalizeVMessUsers([]v2board.User{{UID: 1, UUID: "00000001-0001-4000-8000-000100000001", AlterID: 4}})
 	if err == nil {
 		t.Fatal("legacy alter_id unexpectedly entered FastVMess")
+	}
+}
+
+func TestConnectionPolicyArgumentsReachFastEngine(t *testing.T) {
+	got := appendConnectionArguments(nil, config.ConnectionConfig{
+		Handshake: 8, ConnIdle: 60, UplinkOnly: 2, DownlinkOnly: 3,
+	})
+	want := []string{
+		"--handshake-seconds", "8",
+		"--conn-idle-seconds", "60",
+		"--uplink-only-seconds", "2",
+		"--downlink-only-seconds", "3",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("connection arguments = %#v, want %#v", got, want)
 	}
 }
 

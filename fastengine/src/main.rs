@@ -3,6 +3,7 @@ mod codec;
 mod diagnostics;
 mod netaddr;
 mod ss;
+mod timeout;
 
 use accounting::complete_record_write;
 use codec::{
@@ -28,6 +29,7 @@ use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 use std::time::{Duration, Instant};
+use timeout::{TcpTimeoutState, TcpTimeouts};
 use uuid::Uuid;
 
 const RING_ENTRIES: u32 = 4096;
@@ -713,6 +715,7 @@ struct Connection {
     closing: bool,
     failed: bool,
     generation: u64,
+    timeout: TcpTimeoutState,
 }
 
 macro_rules! queue_connection {
@@ -1152,6 +1155,18 @@ fn next_deadline(
             return Some(entry.0);
         }
         timers.pop();
+    }
+}
+
+fn expire_tcp_connections(
+    now: Instant,
+    connections: &mut [Option<Connection>],
+    timeouts: TcpTimeouts,
+) {
+    for state in connections.iter_mut().flatten() {
+        if !state.closing && state.timeout.expired(now, timeouts) {
+            begin_close(state);
+        }
     }
 }
 
@@ -2275,6 +2290,12 @@ fn main() -> io::Result<()> {
     let speed_mbps = numeric_argument("--speed-mbps", 1000)? as u64;
     let speed_bytes_per_second = speed_mbps.saturating_mul(1_000_000) / 8;
     let device_limit = numeric_argument("--device-limit", 5)?;
+    let tcp_timeouts = TcpTimeouts::from_seconds(
+        numeric_argument("--handshake-seconds", 4)?,
+        numeric_argument("--conn-idle-seconds", 10)?,
+        numeric_argument("--uplink-only-seconds", 0)?,
+        numeric_argument("--downlink-only-seconds", 0)?,
+    );
     let configs: Vec<Config> = serde_json::from_slice(&fs::read(config_path()?)?)?;
     let mut listeners = Vec::with_capacity(configs.len());
     for config in configs {
@@ -2316,6 +2337,7 @@ fn main() -> io::Result<()> {
         true,
         VMESS_FIXED_FILE_SLOTS,
         Duration::from_secs(numeric_argument("--ss-udp-idle-seconds", 120)? as u64),
+        tcp_timeouts,
     )?;
     let mut admin_control = if admin_socket_path.is_empty() {
         None
@@ -2334,6 +2356,7 @@ fn main() -> io::Result<()> {
     let mut accept_armed_count = 0;
     let mut accept_cursor = 0;
     let mut active_connections = 0;
+    let mut next_policy_sweep = Instant::now() + Duration::from_secs(1);
     let mut pending = Vec::with_capacity(RING_ENTRIES as usize);
     let mut completions = Vec::with_capacity(RING_ENTRIES as usize);
     arm_accepts(
@@ -2355,6 +2378,12 @@ fn main() -> io::Result<()> {
 
     loop {
         let now = Instant::now();
+        if (active_connections != 0 || ss_engine.has_tcp_connections()) && now >= next_policy_sweep
+        {
+            expire_tcp_connections(now, &mut connections, tcp_timeouts);
+            ss_engine.expire_tcp(now);
+            next_policy_sweep = now + Duration::from_secs(1);
+        }
         resume_due(
             now,
             &mut timers,
@@ -2367,14 +2396,16 @@ fn main() -> io::Result<()> {
         for entry in pending.drain(..) {
             push(&mut ring, entry)?;
         }
-        let deadline = match (
+        let policy_deadline = (active_connections != 0 || ss_engine.has_tcp_connections())
+            .then_some(next_policy_sweep);
+        let deadline = [
             next_deadline(&mut timers, &connections),
             ss_engine.next_deadline(),
-        ) {
-            (Some(left), Some(right)) => Some(left.min(right)),
-            (left @ Some(_), None) => left,
-            (None, right) => right,
-        };
+            policy_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         if let Some(deadline) = deadline {
             let wait = deadline
                 .saturating_duration_since(Instant::now())
@@ -2518,6 +2549,7 @@ fn main() -> io::Result<()> {
                     closing: false,
                     failed: false,
                     generation,
+                    timeout: TcpTimeoutState::new(Instant::now()),
                 };
                 let receive = recv_client_entry(connection_id, &mut state)?;
                 queue_connection!(&mut state, pending, receive);
@@ -2645,6 +2677,7 @@ fn main() -> io::Result<()> {
                         }
                         continue;
                     }
+                    state.timeout.note_activity();
                     if state.session.is_none() {
                         state.client_end += result as usize;
                         match listeners[state.listener]
@@ -2706,6 +2739,7 @@ fn main() -> io::Result<()> {
                                 state.user = Some(user_index);
                                 state.client_start = consumed;
                                 state.session = Some(session);
+                                state.timeout.authenticated(Instant::now());
                                 state.target_udp = target_udp;
                                 state.xudp = xudp;
                                 let one_shot = features.limiter
@@ -2942,6 +2976,7 @@ fn main() -> io::Result<()> {
                         }
                         continue;
                     }
+                    state.timeout.note_activity();
                     if !state.target_one_shot {
                         let Some(buffer_id) = cqueue::buffer_select(completion_flags) else {
                             fail(state, "multishot target receive has no buffer");
@@ -3098,6 +3133,19 @@ fn main() -> io::Result<()> {
                     }
                 }
                 _ => fail(state, "unknown completion"),
+            }
+            if !state.closing && state.session.is_some() {
+                if state.target_write_shutdown
+                    && state.timeout.upload_closed(Instant::now(), tcp_timeouts)
+                {
+                    begin_close(state);
+                }
+                if !state.closing
+                    && state.client_write_shutdown
+                    && state.timeout.download_closed(Instant::now(), tcp_timeouts)
+                {
+                    begin_close(state);
+                }
             }
         }
 

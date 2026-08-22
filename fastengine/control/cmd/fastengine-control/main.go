@@ -381,6 +381,15 @@ func writeEngineConfig(configs []engineListenerConfig) (string, error) {
 	return path, nil
 }
 
+func appendConnectionArguments(arguments []string, connection config.ConnectionConfig) []string {
+	return append(arguments,
+		"--handshake-seconds", strconv.FormatUint(uint64(connection.Handshake), 10),
+		"--conn-idle-seconds", strconv.FormatUint(uint64(connection.ConnIdle), 10),
+		"--uplink-only-seconds", strconv.FormatUint(uint64(connection.UplinkOnly), 10),
+		"--downlink-only-seconds", strconv.FormatUint(uint64(connection.DownlinkOnly), 10),
+	)
+}
+
 func waitForEngine(ctx context.Context, client *fastengine.Client, exited <-chan error) error {
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -548,6 +557,7 @@ func main() {
 		"--ss-revision", "0",
 		"--admin-socket", *adminSocket,
 	}
+	args = appendConnectionArguments(args, loaded.Connection)
 	if *debugStatus != "" {
 		args = append(args, "--debug-status-path", *debugStatus)
 	}

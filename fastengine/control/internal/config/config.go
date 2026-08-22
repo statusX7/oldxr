@@ -239,5 +239,9 @@ func LoadFastEngine(path string) (FastEngineFile, error) {
 	if len(nodes) == 0 {
 		return FastEngineFile{}, fmt.Errorf("no compatible V2Board VMess or Shadowsocks nodes in %s", path)
 	}
-	return FastEngineFile{Nodes: nodes, Connection: normalizedConnection(file.ConnectionConfig)}, nil
+	connection := normalizedConnection(file.ConnectionConfig)
+	if connection.BufferSize != 16 {
+		return FastEngineFile{}, LegacyRequired("ConnectionConfig.BufferSize %d is not supported by FastEngine", connection.BufferSize)
+	}
+	return FastEngineFile{Nodes: nodes, Connection: connection}, nil
 }
