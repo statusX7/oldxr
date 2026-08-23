@@ -1,15 +1,14 @@
 # oldxr
 
-oldxr 是以 XrayR v0.9.0 为固定核心基线、长期兼容 V2Board 1.6.0 的维护型 fork。
+oldxr 是长期兼容 XrayR v0.9.0 配置与用户可观察行为、长期兼容 V2Board 1.6.0 的高性能维护型后端。
 
-项目固定使用：
+项目固定的是兼容合同：
 
 - XrayR v0.9.0 compatibility baseline；
-- xray-core v1.7.5；
-- Go 1.20 系列；
-- V2Board 1.6.0 legacy API。
+- V2Board 1.6.0 legacy API；
+- 现有 `config.yml`、协议安全、计费、限速、规则与无损升级语义。
 
-本项目不会自动跟随 XrayR v0.9.1 或后续 upstream，也不会用升级 xray-core 代替兼容性修复。
+内部 Go、core 与 data engine 按 Release 锁定并经过回归验证，不作为永久冻结线。本项目不会自动跟随会删除 V2Board 1.6.0 legacy API 的 XrayR v0.9.1 或后续 panel adapter。
 
 ## 安装
 
