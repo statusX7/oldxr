@@ -10,7 +10,7 @@ yellow='\033[0;33m'
 plain='\033[0m'
 
 REPO="statusX7/oldxr"
-MAINTENANCE_0_9_0="v0.9.0-r3"
+MAINTENANCE_0_9_0="v0.9.0-r4"
 RELEASE_BASE="${OLDXR_RELEASE_BASE:-https://github.com/${REPO}/releases/download}"
 INSTALL_ROOT="${OLDXR_INSTALL_ROOT:-}"
 SYSTEMCTL_BIN="${OLDXR_SYSTEMCTL_BIN:-systemctl}"
