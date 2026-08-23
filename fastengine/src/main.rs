@@ -1178,15 +1178,65 @@ impl IoDriver {
     }
 }
 
+fn probe_io_uring_readiness(ring: &mut IoUring) -> io::Result<()> {
+    const PROBE_USER_DATA: u64 = u64::MAX - 1;
+
+    let (mut probe_reader, mut probe_writer) = UnixStream::pair()?;
+    probe_reader.set_nonblocking(true)?;
+    probe_writer.set_nonblocking(true)?;
+    let probe = opcode::PollAdd::new(types::Fd(probe_reader.as_raw_fd()), libc::POLLIN as _)
+        .build()
+        .user_data(PROBE_USER_DATA);
+    unsafe {
+        ring.submission()
+            .push(&probe)
+            .map_err(|_| io::Error::other("io_uring readiness probe submission queue is full"))?;
+    }
+    probe_writer.write_all(&[0xa5])?;
+    ring.submit_and_wait(1)?;
+    let (user_data, result) = {
+        let mut completions = ring.completion();
+        let completion = completions
+            .next()
+            .ok_or_else(|| io::Error::other("io_uring readiness probe completed without a CQE"))?;
+        (completion.user_data(), completion.result())
+    };
+    if user_data != PROBE_USER_DATA {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "io_uring readiness probe returned unexpected user data",
+        ));
+    }
+    if result < 0 {
+        return Err(io::Error::from_raw_os_error(-result));
+    }
+    if result & i32::from(libc::POLLIN) == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "io_uring PollAdd readiness probe did not report readable data",
+        ));
+    }
+    let mut marker = [0_u8; 1];
+    probe_reader.read_exact(&mut marker)?;
+    if marker != [0xa5] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "io_uring readiness probe payload mismatch",
+        ));
+    }
+    Ok(())
+}
+
 fn advanced_io_backend() -> io::Result<(IoDriver, IoBackend, UploadBufferRing, DownloadBufferRing)>
 {
-    let ring = IoUring::builder()
+    let mut ring = IoUring::builder()
         .setup_single_issuer()
         .setup_defer_taskrun()
         .build(RING_ENTRIES)?;
     ring.submitter().register_files_sparse(FIXED_FILE_SLOTS)?;
     let upload = UploadBufferRing::new(&ring)?;
     let download = DownloadBufferRing::new(&ring)?;
+    probe_io_uring_readiness(&mut ring)?;
     Ok((
         IoDriver::uring(ring, IoBackend::UringAdvanced),
         IoBackend::UringAdvanced,
@@ -1196,8 +1246,11 @@ fn advanced_io_backend() -> io::Result<(IoDriver, IoBackend, UploadBufferRing, D
 }
 
 fn compat_io_backend() -> io::Result<(IoDriver, IoBackend, UploadBufferRing, DownloadBufferRing)> {
+    let mut ring = IoUring::new(RING_ENTRIES)?;
+    probe_io_uring_readiness(&mut ring)?;
+
     Ok((
-        IoDriver::uring(IoUring::new(RING_ENTRIES)?, IoBackend::UringCompat),
+        IoDriver::uring(ring, IoBackend::UringCompat),
         IoBackend::UringCompat,
         UploadBufferRing::compat(),
         DownloadBufferRing::compat(),
