@@ -183,9 +183,6 @@ func validateFastEngineNode(node Node) error {
 		return LegacyRequired("VLESS or XTLS is enabled")
 	}
 	controller := node.Controller
-	if !controller.DisableSniffing {
-		return LegacyRequired("payload sniffing is enabled")
-	}
 	if controller.EnableDNS || controller.EnableProxyProtocol || controller.EnableFallback || controller.DisableIVCheck {
 		return LegacyRequired("DNS, PROXY protocol, fallback or DisableIVCheck is enabled")
 	}

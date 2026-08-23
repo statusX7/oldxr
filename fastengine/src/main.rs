@@ -2,6 +2,7 @@ mod accounting;
 mod codec;
 mod diagnostics;
 mod netaddr;
+mod sniff;
 mod ss;
 mod timeout;
 
@@ -14,6 +15,7 @@ use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use netaddr::{peer_ip, socket_domain, RawSocketAddress, ResolvedTarget};
 use regex::RegexSet;
 use serde::{Deserialize, Serialize};
+use sniff::{Decision as SniffDecision, State as SniffState};
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::env;
@@ -51,6 +53,7 @@ const DOWNLOAD_PAYLOAD_SIZE: usize = 8192;
 const DOWNLOAD_BUFFER_SIZE: usize = DOWNLOAD_HEADROOM + DOWNLOAD_PAYLOAD_SIZE + 16 + 63;
 const LIMITER_RESERVATION: usize = 64 * 1024;
 const MULTISHOT_SAFE_RATE: f64 = 64.0 * 1024.0 * 1024.0;
+const SNIFF_BUFFER_MAX: usize = 32 * 1024;
 
 const OP_ACCEPT: u8 = 1;
 const OP_RECV_CLIENT: u8 = 2;
@@ -79,6 +82,8 @@ struct Protocol {
     #[serde(rename = "type")]
     kind: String,
     user_ids: Vec<String>,
+    #[serde(default)]
+    sniffing: bool,
 }
 
 #[derive(Deserialize)]
@@ -146,6 +151,7 @@ struct ListenerState {
     rules: Option<RegexSet>,
     device_rejects: u64,
     rule_rejects: u64,
+    sniffing: bool,
 }
 
 #[derive(Deserialize)]
@@ -308,6 +314,7 @@ impl ListenerState {
         user_ids: Vec<String>,
         speed_bytes_per_second: u64,
         device_limit: usize,
+        sniffing: bool,
     ) -> io::Result<Self> {
         let mut state = Self {
             socket,
@@ -321,6 +328,7 @@ impl ListenerState {
             rules: None,
             device_rejects: 0,
             rule_rejects: 0,
+            sniffing,
         };
         state.replace_users(
             user_ids
@@ -668,6 +676,10 @@ struct Connection {
     peer_ip: IpAddr,
     target_endpoint: Option<SocketAddr>,
     target_address: Option<Box<RawSocketAddress>>,
+    pending_target: Option<ResolvedTarget>,
+    tcp_target: Option<ResolvedTarget>,
+    sniff: SniffState,
+    sniff_buffer: Vec<u8>,
     target_udp: bool,
     xudp: bool,
     xudp_session_id: u16,
@@ -686,6 +698,7 @@ struct Connection {
     upload_length: usize,
     upload_offset: usize,
     upload_resume: usize,
+    upload_from_sniff: bool,
     upload_budget: usize,
     download_buffer: Option<u16>,
     download_queue: VecDeque<(u16, usize)>,
@@ -1279,10 +1292,17 @@ fn ensure_target_connect(
         return Ok(());
     }
     if !state.rule_checked {
-        let target = state.xudp_target.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "missing VMess UDP target")
-        })?;
-        let destination = format!("udp:{}:{}", target.host, target.address.port());
+        let target = if state.target_udp {
+            state.xudp_target.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing VMess UDP target")
+            })?
+        } else {
+            state.tcp_target.as_ref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing VMess TCP target")
+            })?
+        };
+        let network = if state.target_udp { "udp" } else { "tcp" };
+        let destination = format!("{network}:{}:{}", target.host, target.address.port());
         if features.rule
             && site
                 .rules
@@ -1311,15 +1331,36 @@ fn ensure_target_connect(
     Ok(())
 }
 
+fn set_vmess_tcp_target(state: &mut Connection, decision: SniffDecision) -> io::Result<bool> {
+    let Some(original) = state.pending_target.as_ref() else {
+        return Ok(false);
+    };
+    let target = match decision {
+        SniffDecision::NeedMore => return Ok(false),
+        SniffDecision::Original => original.clone(),
+        SniffDecision::Override(host) => ResolvedTarget::resolve(&host, original.address.port())?,
+    };
+    state.pending_target = None;
+    state.target_endpoint = Some(target.address);
+    state.target_address = Some(Box::new(RawSocketAddress::new(target.address)));
+    state.tcp_target = Some(target);
+    state.rule_checked = false;
+    Ok(true)
+}
+
 fn send_target_entry(
     identifier: usize,
     state: &Connection,
     uploads: &UploadBufferRing,
 ) -> squeue::Entry {
     let remaining = state.upload_length - state.upload_offset;
-    let source = match state.upload_buffer {
-        Some(buffer_id) => uploads.bytes(buffer_id).as_ptr(),
-        None => state.client_input.as_ptr(),
+    let source = if state.upload_from_sniff {
+        state.sniff_buffer.as_ptr()
+    } else {
+        match state.upload_buffer {
+            Some(buffer_id) => uploads.bytes(buffer_id).as_ptr(),
+            None => state.client_input.as_ptr(),
+        }
     };
     opcode::Send::new(
         types::Fixed(state.target_slot),
@@ -1799,6 +1840,51 @@ fn next_upload_entry(
                 } else {
                     (start, length)
                 };
+                if !state.xudp && state.pending_target.is_some() {
+                    if state.sniff_buffer.len().saturating_add(length) > SNIFF_BUFFER_MAX {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "VMess sniff buffer exceeded bound",
+                        ));
+                    }
+                    match state.upload_buffer {
+                        Some(buffer_id) => state
+                            .sniff_buffer
+                            .extend_from_slice(&uploads.bytes(buffer_id)[start..start + length]),
+                        None => state
+                            .sniff_buffer
+                            .extend_from_slice(&state.client_input[start..start + length]),
+                    }
+                    if let Some(buffer_id) = state.upload_buffer {
+                        state.upload_buffer_start = resume;
+                        if state.upload_buffer_start == state.upload_buffer_end {
+                            state.upload_buffer = None;
+                            state.upload_buffer_start = 0;
+                            state.upload_buffer_end = 0;
+                            uploads.release(buffer_id);
+                        }
+                    } else {
+                        state.client_start = resume;
+                    }
+                    let decision = state.sniff.inspect(&state.sniff_buffer);
+                    if decision == SniffDecision::NeedMore {
+                        continue;
+                    }
+                    set_vmess_tcp_target(state, decision)?;
+                    let length = state.sniff_buffer.len();
+                    let wait =
+                        reserve_budget(user, &mut state.upload_budget, length, features.limiter);
+                    extend_deadline(&mut state.upload_ready_at, wait);
+                    state.upload_start = 0;
+                    state.upload_length = length;
+                    state.upload_offset = 0;
+                    state.upload_resume = 0;
+                    state.upload_from_sniff = true;
+                    if state.connected && state.upload_ready_at.is_none() {
+                        return Ok(Some(send_target_entry(identifier, state, uploads)));
+                    }
+                    return Ok(None);
+                }
                 let wait = reserve_budget(user, &mut state.upload_budget, length, features.limiter);
                 extend_deadline(&mut state.upload_ready_at, wait);
                 state.upload_start = start;
@@ -2166,6 +2252,31 @@ fn numeric_argument(name: &str, default: usize) -> io::Result<usize> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
 }
 
+fn boolean_list_argument(name: &str, count: usize) -> io::Result<Vec<bool>> {
+    let value = argument(name, "");
+    if value.trim().is_empty() {
+        return Ok(vec![false; count]);
+    }
+    let values = value
+        .split(',')
+        .map(|value| match value.trim() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid boolean {other:?} in {name}"),
+            )),
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    if values.len() != count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} contains {} entries, want {count}", values.len()),
+        ));
+    }
+    Ok(values)
+}
+
 fn has_argument(name: &str) -> bool {
     env::args().skip(1).any(|argument| argument == name)
 }
@@ -2312,6 +2423,7 @@ fn main() -> io::Result<()> {
             config.protocol.user_ids,
             speed_bytes_per_second,
             device_limit,
+            config.protocol.sniffing,
         )?);
     }
 
@@ -2326,8 +2438,10 @@ fn main() -> io::Result<()> {
         numeric_argument("--ss-listen-base", 22000)?,
         numeric_argument("--ss-sites", 10)?,
     )?;
+    let ss_sniffing = boolean_list_argument("--ss-sniffing", ss_addresses.len())?;
     let mut ss_engine = ss::Engine::new_with_addresses(
         &ss_addresses,
+        &ss_sniffing,
         numeric_argument("--ss-users", 1000)?,
         numeric_argument("--ss-revision", 0)?,
         &feature_name,
@@ -2502,6 +2616,10 @@ fn main() -> io::Result<()> {
                     peer_ip,
                     target_endpoint: None,
                     target_address: None,
+                    pending_target: None,
+                    tcp_target: None,
+                    sniff: SniffState::new(listeners[identifier].sniffing),
+                    sniff_buffer: Vec::new(),
                     target_udp: false,
                     xudp: false,
                     xudp_session_id: 0,
@@ -2520,6 +2638,7 @@ fn main() -> io::Result<()> {
                     upload_length: 0,
                     upload_offset: 0,
                     upload_resume: 0,
+                    upload_from_sniff: false,
                     upload_budget: 0,
                     download_buffer: None,
                     download_queue: VecDeque::new(),
@@ -2665,6 +2784,26 @@ fn main() -> io::Result<()> {
                         if state.session.is_none() {
                             begin_close(state);
                         } else {
+                            if state.pending_target.is_some() {
+                                if let Err(error) =
+                                    set_vmess_tcp_target(state, SniffDecision::Original)
+                                {
+                                    fail_io(state, error);
+                                    continue;
+                                }
+                                let site = state.listener;
+                                if let Err(error) = ensure_target_connect(
+                                    identifier,
+                                    state,
+                                    &mut listeners[site],
+                                    features,
+                                    &mut ring,
+                                    &mut pending,
+                                ) {
+                                    fail_io(state, error);
+                                    continue;
+                                }
+                            }
                             state.client_read_eof = true;
                             finish_upload_direction(
                                 identifier,
@@ -2699,28 +2838,19 @@ fn main() -> io::Result<()> {
                                 let target_udp = command != VmessCommand::Tcp;
                                 let xudp = command == VmessCommand::Mux;
                                 if let Some(target) = target {
-                                    let destination = if target_udp {
-                                        format!("udp:{}:{}", target.host, target.address.port())
-                                    } else {
-                                        format!("tcp:{}:{}", target.host, target.address.port())
-                                    };
-                                    if features.rule
-                                        && site
-                                            .rules
-                                            .as_ref()
-                                            .is_some_and(|rules| rules.is_match(&destination))
-                                    {
-                                        site.rule_rejects = site.rule_rejects.saturating_add(1);
-                                        fail(state, "VMess rule rejected target");
-                                        continue;
-                                    }
-                                    state.target_endpoint = Some(target.address);
-                                    state.target_address =
-                                        Some(Box::new(RawSocketAddress::new(target.address)));
                                     if target_udp {
+                                        state.target_endpoint = Some(target.address);
+                                        state.target_address =
+                                            Some(Box::new(RawSocketAddress::new(target.address)));
                                         state.xudp_target = Some(target);
+                                    } else if site.sniffing {
+                                        state.pending_target = Some(target);
+                                    } else {
+                                        state.target_endpoint = Some(target.address);
+                                        state.target_address =
+                                            Some(Box::new(RawSocketAddress::new(target.address)));
+                                        state.tcp_target = Some(target);
                                     }
-                                    state.rule_checked = true;
                                 }
                                 if features.device {
                                     let devices = &mut site.users[user_index].device_ips;
@@ -2911,7 +3041,10 @@ fn main() -> io::Result<()> {
                             send_target_entry(identifier, state, &upload_buffers)
                         );
                     } else {
-                        if let Some(buffer_id) = state.upload_buffer {
+                        if state.upload_from_sniff {
+                            state.upload_from_sniff = false;
+                            state.sniff_buffer.clear();
+                        } else if let Some(buffer_id) = state.upload_buffer {
                             state.upload_buffer_start = state.upload_resume;
                             if state.upload_buffer_start == state.upload_buffer_end {
                                 state.upload_buffer = None;
@@ -3336,6 +3469,7 @@ mod runtime_tests {
             ],
             1_000_000,
             5,
+            false,
         )
         .unwrap()
     }

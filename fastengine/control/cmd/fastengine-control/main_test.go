@@ -33,6 +33,41 @@ func TestConnectionPolicyArgumentsReachFastEngine(t *testing.T) {
 	}
 }
 
+func TestEngineInputsPreservePerNodeSniffing(t *testing.T) {
+	nodes := []*managedNode{
+		{
+			protocol: v2board.VMess,
+			config: config.Node{Controller: config.ControllerConfig{
+				ListenIP:        "127.0.0.1",
+				DisableSniffing: false,
+			}},
+			users: []v2board.User{{
+				UID:  1,
+				UUID: "00000001-0001-4000-8000-000100000001",
+			}},
+			port: 21001,
+		},
+		{
+			protocol: v2board.Shadowsocks,
+			config: config.Node{Controller: config.ControllerConfig{
+				ListenIP:        "127.0.0.1",
+				DisableSniffing: true,
+			}},
+			port: 22001,
+		},
+	}
+	vmess, ssAddress, ssPorts, ssSniffing, err := engineInputs(nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vmess) != 1 || !vmess[0].Protocol.Sniffing {
+		t.Fatalf("VMess inputs = %#v", vmess)
+	}
+	if ssAddress != "127.0.0.1" || !reflect.DeepEqual(ssPorts, []string{"22001"}) || !reflect.DeepEqual(ssSniffing, []string{"false"}) {
+		t.Fatalf("SS address=%q ports=%#v sniffing=%#v", ssAddress, ssPorts, ssSniffing)
+	}
+}
+
 func TestNormalizeShadowsocksRequiresOnePortAndCipher(t *testing.T) {
 	users := []v2board.User{
 		{UID: 1, Port: 22001, Cipher: "aes-128-gcm", Password: "one"},

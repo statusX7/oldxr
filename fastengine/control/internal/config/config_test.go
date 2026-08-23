@@ -46,7 +46,7 @@ func TestLoadFastEnginePreservesNodeOrder(t *testing.T) {
 	}
 }
 
-func TestLoadFastEngineFallsBackWhenSniffingIsEnabled(t *testing.T) {
+func TestLoadFastEnginePreservesEnabledSniffing(t *testing.T) {
 	contents, err := os.ReadFile(fixturePath)
 	if err != nil {
 		t.Fatal(err)
@@ -56,9 +56,14 @@ func TestLoadFastEngineFallsBackWhenSniffingIsEnabled(t *testing.T) {
 	if err := os.WriteFile(path, contents, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err = LoadFastEngine(path)
-	if !errors.Is(err, ErrLegacyRequired) {
-		t.Fatalf("sniffing-enabled config error = %v", err)
+	loaded, err := LoadFastEngine(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index, node := range loaded.Nodes {
+		if node.Controller.DisableSniffing {
+			t.Fatalf("node %d unexpectedly disabled sniffing", index)
+		}
 	}
 }
 

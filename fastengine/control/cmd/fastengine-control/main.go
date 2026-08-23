@@ -29,8 +29,9 @@ import (
 )
 
 type engineProtocolConfig struct {
-	Type    string   `json:"type"`
-	UserIDs []string `json:"user_ids"`
+	Type     string   `json:"type"`
+	UserIDs  []string `json:"user_ids"`
+	Sniffing bool     `json:"sniffing"`
 }
 
 type engineListenerConfig struct {
@@ -318,40 +319,46 @@ func (node *managedNode) flushTraffic(ctx context.Context) error {
 	}
 }
 
-func engineInputs(nodes []*managedNode) ([]engineListenerConfig, string, []string, error) {
+func engineInputs(nodes []*managedNode) ([]engineListenerConfig, string, []string, []string, error) {
 	var vmess []engineListenerConfig
 	var ssAddress string
 	var ssPorts []string
+	var ssSniffing []string
 	for _, node := range nodes {
 		if node.config.API.SpeedLimit < 0 || node.config.API.DeviceLimit < 0 {
-			return nil, "", nil, errors.New("negative SpeedLimit or DeviceLimit is invalid")
+			return nil, "", nil, nil, errors.New("negative SpeedLimit or DeviceLimit is invalid")
 		}
 		if node.protocol == v2board.VMess {
 			users, err := normalizeVMessUsers(node.users)
 			if err != nil {
-				return nil, "", nil, err
+				return nil, "", nil, nil, err
 			}
 			ids := make([]string, 0, len(users))
 			for _, user := range users {
 				ids = append(ids, user.ID)
 			}
 			vmess = append(vmess, engineListenerConfig{
-				Address:  net.JoinHostPort(node.config.Controller.ListenIP, strconv.Itoa(node.port)),
-				Protocol: engineProtocolConfig{Type: "vmess", UserIDs: ids},
+				Address: net.JoinHostPort(node.config.Controller.ListenIP, strconv.Itoa(node.port)),
+				Protocol: engineProtocolConfig{
+					Type:     "vmess",
+					UserIDs:  ids,
+					Sniffing: !node.config.Controller.DisableSniffing,
+				},
 			})
 			continue
 		}
 		if ssAddress == "" {
 			ssAddress = node.config.Controller.ListenIP
 		} else if ssAddress != node.config.Controller.ListenIP {
-			return nil, "", nil, config.LegacyRequired("multiple Shadowsocks ListenIP values are not supported by FastEngine")
+			return nil, "", nil, nil, config.LegacyRequired("multiple Shadowsocks ListenIP values are not supported by FastEngine")
 		}
 		ssPorts = append(ssPorts, strconv.Itoa(node.port))
+		ssSniffing = append(ssSniffing, strconv.FormatBool(!node.config.Controller.DisableSniffing))
 	}
 	if ssAddress == "" {
 		ssAddress = "127.0.0.1"
 	}
-	return vmess, ssAddress, ssPorts, nil
+	return vmess, ssAddress, ssPorts, ssSniffing, nil
 }
 
 func writeEngineConfig(configs []engineListenerConfig) (string, error) {
@@ -531,7 +538,7 @@ func main() {
 		}
 		log.Fatal(err)
 	}
-	vmessConfigs, ssAddress, ssPorts, err := engineInputs(managed)
+	vmessConfigs, ssAddress, ssPorts, ssSniffing, err := engineInputs(managed)
 	if err != nil {
 		if errors.Is(err, config.ErrLegacyRequired) {
 			execLegacy(*legacyBinary, *configPath, err)
@@ -552,6 +559,7 @@ func main() {
 		"--device-limit", "0",
 		"--ss-listen-address", ssAddress,
 		"--ss-ports", strings.Join(ssPorts, ","),
+		"--ss-sniffing", strings.Join(ssSniffing, ","),
 		"--ss-sites", strconv.Itoa(len(ssPorts)),
 		"--ss-users", "1",
 		"--ss-revision", "0",

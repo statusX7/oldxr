@@ -1,6 +1,9 @@
 use crate::accounting::complete_record_write;
 use crate::diagnostics::{connection_error, ErrorScope};
-use crate::netaddr::{peer_ip, resolve_target, socket_address, socket_domain, RawSocketAddress};
+use crate::netaddr::{
+    peer_ip, resolve_target, socket_address, socket_domain, RawSocketAddress, ResolvedTarget,
+};
+use crate::sniff::{Decision as SniffDecision, State as SniffState};
 use crate::timeout::{TcpTimeoutState, TcpTimeouts};
 use io_uring::{opcode, squeue, types, IoUring};
 use regex::RegexSet;
@@ -29,7 +32,9 @@ const MAX_PAYLOAD_LEN: usize = 0x3fff;
 // partially received following record. Keeping this connection-local working
 // set small matters with thousands of idle credentials/connections.
 const INPUT_CAPACITY: usize = 20 * 1024;
-const UPLOAD_CAPACITY: usize = 20 * 1024;
+// Sniffing follows the legacy dispatcher contract and may retain two maximum
+// AEAD records before deciding whether HTTP Host/TLS SNI overrides the target.
+const UPLOAD_CAPACITY: usize = 36 * 1024;
 const DOWNLOAD_PLAINTEXT_CAPACITY: usize = 8 * 1024;
 const DOWNLOAD_CIPHERTEXT_CAPACITY: usize =
     SALT_LEN + LENGTH_PACKET_LEN + DOWNLOAD_PLAINTEXT_CAPACITY + TAG_LEN;
@@ -275,6 +280,7 @@ struct SiteState {
     replay_rejects: u64,
     device_rejects: u64,
     rule_rejects: u64,
+    sniffing: bool,
 }
 
 struct Connection {
@@ -283,6 +289,8 @@ struct Connection {
     inbound_slot: u32,
     outbound_slot: u32,
     target: Option<Box<RawSocketAddress>>,
+    pending_target: Option<ResolvedTarget>,
+    sniff: SniffState,
     site: usize,
     peer_ip: IpAddr,
     input: Box<[u8; INPUT_CAPACITY]>,
@@ -649,6 +657,23 @@ fn connect_entry(connection: usize, state: &Connection) -> squeue::Entry {
     .user_data(tag(connection, OP_CONNECT))
 }
 
+fn start_target_connect(
+    connection: usize,
+    state: &mut Connection,
+    target: SocketAddr,
+    tcp_nodelay: bool,
+    ring: &mut IoUring,
+    pending: &mut Vec<squeue::Entry>,
+) -> io::Result<()> {
+    let outbound = tcp_socket(tcp_nodelay, target)?;
+    register_file(ring, state.outbound_slot, outbound.as_raw_fd())?;
+    state.target = Some(Box::new(RawSocketAddress::new(target)));
+    state.outbound = Some(outbound);
+    state.connecting = true;
+    queue_connection!(state, pending, connect_entry(connection, state));
+    Ok(())
+}
+
 fn recv_inbound_entry(connection: usize, state: &mut Connection) -> io::Result<squeue::Entry> {
     state.compact_input();
     let remaining = INPUT_CAPACITY.saturating_sub(state.input_length);
@@ -854,7 +879,12 @@ fn user_runtime(uid: u64, key: [u8; 16], speed_bytes_per_second: u64) -> UserRun
 }
 
 impl SiteState {
-    fn new(speed_bytes_per_second: u64, blocked_host: &str, device_limit: usize) -> Self {
+    fn new(
+        speed_bytes_per_second: u64,
+        blocked_host: &str,
+        device_limit: usize,
+        sniffing: bool,
+    ) -> Self {
         let mut blocked_hosts = HashSet::new();
         if !blocked_host.is_empty() {
             blocked_hosts.insert(blocked_host.to_ascii_lowercase());
@@ -872,6 +902,7 @@ impl SiteState {
             replay_rejects: 0,
             device_rejects: 0,
             rule_rejects: 0,
+            sniffing,
         }
     }
 
@@ -1046,6 +1077,7 @@ impl SiteState {
 
 fn build_sites(
     sites: usize,
+    sniffing: &[bool],
     users: usize,
     revision: usize,
     speed_bytes_per_second: u64,
@@ -1060,7 +1092,12 @@ fn build_sites(
                     password: format!("ss-site-{site:02}-user-{uid:06}-r{revision}-phase4-secret"),
                 })
                 .collect();
-            let mut state = SiteState::new(speed_bytes_per_second, blocked_host, device_limit);
+            let mut state = SiteState::new(
+                speed_bytes_per_second,
+                blocked_host,
+                device_limit,
+                sniffing[site - 1],
+            );
             state
                 .replace_users(users)
                 .expect("generated SS users must be valid");
@@ -1310,6 +1347,57 @@ fn append_upload_from_input(
     Ok(())
 }
 
+fn finalize_pending_target(
+    connection: &mut Connection,
+    site: &mut SiteState,
+    features: Features,
+    force_original: bool,
+) -> io::Result<Option<SocketAddr>> {
+    let Some(original) = connection.pending_target.as_ref() else {
+        return Ok(None);
+    };
+    let decision = if force_original {
+        SniffDecision::Original
+    } else if let Some(start) = connection.upload_direct_start {
+        connection
+            .sniff
+            .inspect(&connection.input[start..start + connection.upload_length])
+    } else {
+        connection
+            .sniff
+            .inspect(&connection.upload[..connection.upload_length])
+    };
+    let target = match decision {
+        SniffDecision::NeedMore => {
+            if let Some(start) = connection.upload_direct_start.take() {
+                connection.upload[..connection.upload_length]
+                    .copy_from_slice(&connection.input[start..start + connection.upload_length]);
+            }
+            return Ok(None);
+        }
+        SniffDecision::Original => original.clone(),
+        SniffDecision::Override(host) => ResolvedTarget::resolve(&host, original.address.port())?,
+    };
+    connection.pending_target = None;
+    let destination = format!("tcp:{}:{}", target.host, target.address.port());
+    if features.rule
+        && (site
+            .blocked_hosts
+            .contains(&target.host.to_ascii_lowercase())
+            || site
+                .rules
+                .as_ref()
+                .is_some_and(|rules| rules.is_match(&destination)))
+    {
+        site.rule_rejects = site.rule_rejects.saturating_add(1);
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "SS rule rejected target",
+        ));
+    }
+    Ok(Some(target.address))
+}
+
 fn decrypt_length(connection: &mut Connection) -> io::Result<bool> {
     if connection.input_length - connection.input_start < LENGTH_PACKET_LEN {
         return Ok(false);
@@ -1382,7 +1470,6 @@ fn process_encrypted(
         connection.input_start += SALT_LEN + LENGTH_PACKET_LEN;
     }
 
-    let mut target = None;
     loop {
         if connection.expected_payload.is_none() && !decrypt_length(connection)? {
             break;
@@ -1418,20 +1505,6 @@ fn process_encrypted(
             }
             let (address, host, header_length) =
                 parse_target(&connection.input[start..start + length])?;
-            let destination = format!("tcp:{host}:{}", address.port());
-            if features.rule
-                && (site.blocked_hosts.contains(&host.to_ascii_lowercase())
-                    || site
-                        .rules
-                        .as_ref()
-                        .is_some_and(|rules| rules.is_match(&destination)))
-            {
-                site.rule_rejects += 1;
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "SS rule rejected target",
-                ));
-            }
             if features.device {
                 let devices = &mut site.users[user_index].device_ips;
                 if site.device_limit != 0
@@ -1458,9 +1531,9 @@ fn process_encrypted(
             );
             extend_deadline(&mut connection.upload_ready_at, wait);
             append_upload_from_input(connection, payload_start, payload_length)?;
+            connection.pending_target = Some(ResolvedTarget { address, host });
             connection.header_complete = true;
             connection.timeout.authenticated(Instant::now());
-            target = Some(address);
         } else {
             let wait = reserve_budget(
                 &mut site.users[user_index],
@@ -1477,7 +1550,7 @@ fn process_encrypted(
     if connection.upload_direct_start.is_none() {
         connection.compact_input();
     }
-    Ok(target)
+    finalize_pending_target(connection, site, features, false)
 }
 
 fn prepare_download(
@@ -1585,6 +1658,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_addresses(
         listen_addresses: &[String],
+        sniffing: &[bool],
         user_count: usize,
         revision: usize,
         features: &str,
@@ -1596,9 +1670,16 @@ impl Engine {
         udp_idle_timeout: Duration,
         tcp_timeouts: TcpTimeouts,
     ) -> io::Result<Self> {
+        if sniffing.len() != listen_addresses.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SS sniffing flags must match listen addresses",
+            ));
+        }
         let speed_bytes_per_second = speed_mbps.saturating_mul(1_000_000) / 8;
         let sites = build_sites(
             listen_addresses.len(),
+            sniffing,
             user_count,
             revision,
             speed_bytes_per_second,
@@ -2397,6 +2478,8 @@ impl Engine {
                 inbound_slot,
                 outbound_slot,
                 target: None,
+                pending_target: None,
+                sniff: SniffState::new(self.sites[site].sniffing),
                 site,
                 peer_ip,
                 input: Box::new([0; INPUT_CAPACITY]),
@@ -2485,6 +2568,21 @@ impl Engine {
                         if !state.header_complete {
                             return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
                         }
+                        if state.pending_target.is_some() {
+                            let site = &mut sites[state.site];
+                            if let Some(target) =
+                                finalize_pending_target(state, site, features, true)?
+                            {
+                                start_target_connect(
+                                    id,
+                                    state,
+                                    target,
+                                    tcp_nodelay,
+                                    ring,
+                                    pending,
+                                )?;
+                            }
+                        }
                         state.inbound_read_eof = true;
                         if state.timeout.upload_closed(Instant::now(), tcp_timeouts) {
                             begin_close(state);
@@ -2499,12 +2597,7 @@ impl Engine {
                     let site = &mut sites[state.site];
                     let target = process_encrypted(state, site, features)?;
                     if let Some(target) = target {
-                        let outbound = tcp_socket(tcp_nodelay, target)?;
-                        register_file(ring, state.outbound_slot, outbound.as_raw_fd())?;
-                        state.target = Some(Box::new(RawSocketAddress::new(target)));
-                        state.outbound = Some(outbound);
-                        state.connecting = true;
-                        queue_connection!(state, pending, connect_entry(id, state));
+                        start_target_connect(id, state, target, tcp_nodelay, ring, pending)?;
                     } else if state.connected
                         && state.upload_length != 0
                         && state.upload_ready_at.is_none()
@@ -2889,7 +2982,7 @@ mod tests {
     }
 
     fn test_site() -> SiteState {
-        let mut site = SiteState::new(1_000_000, "", 5);
+        let mut site = SiteState::new(1_000_000, "", 5, false);
         site.replace_users(vec![
             NormalizedUser {
                 uid: 1,
