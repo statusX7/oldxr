@@ -103,6 +103,51 @@ func TestCompileRoutingFallsBackForUnsupportedSemanticFields(t *testing.T) {
 	}
 }
 
+func TestCompileRoutingRejectsInvalidFilesAndEmptyRules(t *testing.T) {
+	t.Run("missing route", func(t *testing.T) {
+		_, err := compileRouting(filepath.Join(t.TempDir(), "missing-route.json"), "")
+		if err == nil || !strings.Contains(err.Error(), "open") {
+			t.Fatalf("missing route error = %v", err)
+		}
+	})
+	t.Run("missing outbound", func(t *testing.T) {
+		_, err := compileRouting("", filepath.Join(t.TempDir(), "missing-outbound.json"))
+		if err == nil || !strings.Contains(err.Error(), "open") {
+			t.Fatalf("missing outbound error = %v", err)
+		}
+	})
+	t.Run("invalid route JSON", func(t *testing.T) {
+		route := writeRoutingFixture(t, "route.json", `{"rules":[`)
+		if _, err := compileRouting(route, ""); err == nil || !strings.Contains(err.Error(), "parse") {
+			t.Fatalf("invalid route error = %v", err)
+		}
+	})
+	t.Run("empty outbound array", func(t *testing.T) {
+		outbounds := writeRoutingFixture(t, "outbounds.json", `[]`)
+		if _, err := compileRouting("", outbounds); err == nil || !strings.Contains(err.Error(), "contains no outbounds") {
+			t.Fatalf("empty outbounds error = %v", err)
+		}
+	})
+	t.Run("unknown outbound protocol", func(t *testing.T) {
+		outbounds := writeRoutingFixture(t, "outbounds.json", `[{"tag":"proxy","protocol":"socks"}]`)
+		if _, err := compileRouting("", outbounds); !errors.Is(err, ErrLegacyRequired) {
+			t.Fatalf("unknown outbound protocol error = %v", err)
+		}
+	})
+	t.Run("unknown outbound field", func(t *testing.T) {
+		outbounds := writeRoutingFixture(t, "outbounds.json", `[{"tag":"direct","protocol":"freedom","unexpected":true}]`)
+		if _, err := compileRouting("", outbounds); !errors.Is(err, ErrLegacyRequired) {
+			t.Fatalf("unknown outbound field error = %v", err)
+		}
+	})
+	t.Run("rule without match condition", func(t *testing.T) {
+		route := writeRoutingFixture(t, "route.json", `{"rules":[{"outboundTag":"__fastengine_direct"}]}`)
+		if _, err := compileRouting(route, ""); err == nil || !strings.Contains(err.Error(), "no match condition") {
+			t.Fatalf("empty routing rule error = %v", err)
+		}
+	})
+}
+
 func TestCompilePortsMergesOnlyEquivalentIntervals(t *testing.T) {
 	ranges, err := compilePorts([]byte(`"22,23-25,24,100-200"`))
 	if err != nil {

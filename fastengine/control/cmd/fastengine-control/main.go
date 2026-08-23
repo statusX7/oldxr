@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -403,6 +404,19 @@ func appendConnectionArguments(arguments []string, connection config.ConnectionC
 	)
 }
 
+func validateRoutingReload(current, replacement config.FastEngineFile) error {
+	if !reflect.DeepEqual(current.Nodes, replacement.Nodes) {
+		return errors.New("node configuration changed; a service restart is required")
+	}
+	if current.Connection != replacement.Connection {
+		return errors.New("connection configuration changed; a service restart is required")
+	}
+	if current.DNSConfigPath != replacement.DNSConfigPath || current.InboundConfigPath != replacement.InboundConfigPath {
+		return errors.New("DNS or inbound configuration changed; a service restart is required")
+	}
+	return nil
+}
+
 func waitForEngine(ctx context.Context, client *fastengine.Client, exited <-chan error) error {
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -655,6 +669,9 @@ func main() {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	reloadSignal := make(chan os.Signal, 1)
+	signal.Notify(reloadSignal, syscall.SIGHUP)
+	defer signal.Stop(reloadSignal)
 	engine := fastengine.New(*adminSocket)
 	managed, err := discover(ctx, loaded.Nodes, engine)
 	if err != nil {
@@ -753,31 +770,51 @@ func main() {
 	}
 
 	log.Printf("oldxr Phase 7 normalized dual control plane ready: nodes=%d VMess=%d Shadowsocks=%d", len(managed), len(vmessConfigs), len(ssPorts))
-	select {
-	case <-ctx.Done():
-		ready.Store(false)
-		flushContext, flushCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		for _, node := range managed {
-			if !node.config.Controller.DisableUploadTraffic {
-				if err := node.flushTraffic(flushContext); err != nil {
-					log.Printf("%s site %d final traffic flush: %v", node.protocol, node.engineSite, err)
+	for {
+		select {
+		case <-reloadSignal:
+			replacement, reloadErr := config.LoadFastEngine(*configPath)
+			if reloadErr == nil {
+				reloadErr = validateRoutingReload(loaded, replacement)
+			}
+			if reloadErr == nil {
+				reloadContext, reloadCancel := context.WithTimeout(ctx, 5*time.Second)
+				reloadErr = engine.ReplaceRouting(reloadContext, replacement.Routing)
+				reloadCancel()
+			}
+			if reloadErr != nil {
+				log.Printf("FastEngine route/outbound reload rejected; previous routing remains active: %v", reloadErr)
+				continue
+			}
+			loaded = replacement
+			log.Printf("FastEngine route/outbound reload applied: outbounds=%d rules=%d", len(loaded.Routing.Outbounds), len(loaded.Routing.Rules))
+		case <-ctx.Done():
+			ready.Store(false)
+			flushContext, flushCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			for _, node := range managed {
+				if !node.config.Controller.DisableUploadTraffic {
+					if err := node.flushTraffic(flushContext); err != nil {
+						log.Printf("%s site %d final traffic flush: %v", node.protocol, node.engineSite, err)
+					}
 				}
 			}
-		}
-		flushCancel()
-		shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
-		_ = metrics.Shutdown(shutdownContext)
-		shutdownCancel()
-		stopEngine()
-		select {
-		case <-exited:
-		case <-time.After(3 * time.Second):
-			_ = command.Process.Kill()
-		}
-	case err := <-exited:
-		ready.Store(false)
-		if ctx.Err() == nil {
-			log.Fatalf("FastEngine exited: %v", err)
+			flushCancel()
+			shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
+			_ = metrics.Shutdown(shutdownContext)
+			shutdownCancel()
+			stopEngine()
+			select {
+			case <-exited:
+			case <-time.After(3 * time.Second):
+				_ = command.Process.Kill()
+			}
+			return
+		case err := <-exited:
+			ready.Store(false)
+			if ctx.Err() == nil {
+				log.Fatalf("FastEngine exited: %v", err)
+			}
+			return
 		}
 	}
 }

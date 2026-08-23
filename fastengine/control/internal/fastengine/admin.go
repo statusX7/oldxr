@@ -9,6 +9,8 @@ import (
 	"io"
 	"net"
 	"time"
+
+	"github.com/statusX7/oldxr/fastengine/control/internal/config"
 )
 
 const maxAdminResponse = 8 << 20
@@ -99,6 +101,10 @@ func (c *Client) Ping(ctx context.Context) error {
 		return errors.New("FastEngine ping response has no pong")
 	}
 	return nil
+}
+
+func (c *Client) ReplaceRouting(ctx context.Context, routing config.RoutingPlan) error {
+	return c.call(ctx, map[string]any{"operation": "replace_routing", "routing": routing}, nil)
 }
 
 func (c *Client) ReplaceVMessUsers(ctx context.Context, site int, users []VMessUser) error {

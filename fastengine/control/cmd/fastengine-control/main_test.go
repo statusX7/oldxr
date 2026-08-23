@@ -33,6 +33,41 @@ func TestConnectionPolicyArgumentsReachFastEngine(t *testing.T) {
 	}
 }
 
+func TestRoutingReloadOnlyAcceptsRoutingChanges(t *testing.T) {
+	current := config.FastEngineFile{
+		Nodes: []config.Node{{
+			PanelType: "V2board",
+			API:       config.APIConfig{APIHost: "https://panel.test", APIKey: "secret", NodeID: 1, NodeType: "V2ray"},
+		}},
+		Connection: config.ConnectionConfig{Handshake: 4, ConnIdle: 10, BufferSize: 16},
+		Routing: config.RoutingPlan{Outbounds: []config.OutboundPlan{{
+			Tag: "direct", Action: "direct", DomainStrategy: "as_is",
+		}}},
+	}
+	replacement := current
+	replacement.RouteConfigPath = "/etc/XrayR/route.json"
+	replacement.OutboundConfigPath = "/etc/XrayR/custom_outbound.json"
+	replacement.Routing = config.RoutingPlan{Outbounds: []config.OutboundPlan{{
+		Tag: "block", Action: "blackhole", DomainStrategy: "as_is",
+	}}}
+	if err := validateRoutingReload(current, replacement); err != nil {
+		t.Fatalf("routing-only reload rejected: %v", err)
+	}
+
+	changedNode := replacement
+	changedNode.Nodes = append([]config.Node(nil), replacement.Nodes...)
+	changedNode.Nodes[0].API.NodeID = 2
+	if err := validateRoutingReload(current, changedNode); err == nil {
+		t.Fatal("node mutation was accepted as a routing-only reload")
+	}
+
+	changedConnection := replacement
+	changedConnection.Connection.ConnIdle++
+	if err := validateRoutingReload(current, changedConnection); err == nil {
+		t.Fatal("connection mutation was accepted as a routing-only reload")
+	}
+}
+
 func TestEngineInputsPreservePerNodeSniffing(t *testing.T) {
 	nodes := []*managedNode{
 		{

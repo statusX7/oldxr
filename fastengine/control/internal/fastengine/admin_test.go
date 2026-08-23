@@ -7,6 +7,8 @@ import (
 	"net"
 	"path/filepath"
 	"testing"
+
+	"github.com/statusX7/oldxr/fastengine/control/internal/config"
 )
 
 func TestUnixAdminProtocol(t *testing.T) {
@@ -16,7 +18,7 @@ func TestUnixAdminProtocol(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	requests := make(chan map[string]any, 4)
+	requests := make(chan map[string]any, 5)
 	go func() {
 		for {
 			connection, acceptErr := listener.Accept()
@@ -41,6 +43,16 @@ func TestUnixAdminProtocol(t *testing.T) {
 	if err := client.Ping(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if err := client.ReplaceRouting(context.Background(), config.RoutingPlan{
+		DomainStrategy: "as_is",
+		Outbounds: []config.OutboundPlan{{
+			Tag:            "direct",
+			Action:         "direct",
+			DomainStrategy: "as_is",
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	traffic, err := client.TakeVMessTraffic(context.Background(), 3)
 	if err != nil {
 		t.Fatal(err)
@@ -58,14 +70,21 @@ func TestUnixAdminProtocol(t *testing.T) {
 	second := <-requests
 	third := <-requests
 	fourth := <-requests
-	if first["operation"] != "ping" || second["operation"] != "take_vmess_traffic" || second["site"] != float64(3) {
+	fifth := <-requests
+	if first["operation"] != "ping" || second["operation"] != "replace_routing" {
 		t.Fatalf("requests = %#v %#v", first, second)
 	}
-	if third["operation"] != "update_vmess_policy" || third["site"] != float64(4) || third["speed_bytes_per_second"] != float64(125_000) || third["device_limit"] != float64(3) {
-		t.Fatalf("VMess policy request = %#v", third)
+	if routing, ok := second["routing"].(map[string]any); !ok || routing["domain_strategy"] != "as_is" {
+		t.Fatalf("routing request = %#v", second)
 	}
-	if fourth["operation"] != "update_ss_policy" || fourth["site"] != float64(5) || fourth["speed_bytes_per_second"] != float64(250_000) || fourth["device_limit"] != float64(4) {
-		t.Fatalf("Shadowsocks policy request = %#v", fourth)
+	if third["operation"] != "take_vmess_traffic" || third["site"] != float64(3) {
+		t.Fatalf("traffic request = %#v", third)
+	}
+	if fourth["operation"] != "update_vmess_policy" || fourth["site"] != float64(4) || fourth["speed_bytes_per_second"] != float64(125_000) || fourth["device_limit"] != float64(3) {
+		t.Fatalf("VMess policy request = %#v", fourth)
+	}
+	if fifth["operation"] != "update_ss_policy" || fifth["site"] != float64(5) || fifth["speed_bytes_per_second"] != float64(250_000) || fifth["device_limit"] != float64(4) {
+		t.Fatalf("Shadowsocks policy request = %#v", fifth)
 	}
 }
 

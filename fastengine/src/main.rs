@@ -187,6 +187,9 @@ struct Protocol {
 #[serde(tag = "operation", rename_all = "snake_case")]
 enum AdminRequest {
     Ping,
+    ReplaceRouting {
+        routing: routing::PlanConfig,
+    },
     VmessStatus,
     ReplaceVmessUsers {
         site: usize,
@@ -1632,9 +1635,18 @@ fn process_admin_command(
     command: AdminCommand,
     ss_engine: &mut ss::Engine,
     listeners: &mut [ListenerState],
+    router: &mut Arc<routing::Router>,
 ) -> Result<(), mpsc::SendError<Result<serde_json::Value, String>>> {
     let response = match command.request {
         AdminRequest::Ping => Ok(serde_json::json!({"pong": true})),
+        AdminRequest::ReplaceRouting { routing } => routing::Router::compile(routing)
+            .map(Arc::new)
+            .map(|replacement| {
+                ss_engine.replace_router(Arc::clone(&replacement));
+                *router = replacement;
+                serde_json::json!({"updated": true})
+            })
+            .map_err(|error| error.to_string()),
         AdminRequest::VmessStatus => {
             let live_users: usize = listeners.iter().map(|site| site.live_users.len()).sum();
             let retired_users: usize = listeners.iter().map(ListenerState::retired_users).sum();
@@ -3348,7 +3360,7 @@ fn main() -> io::Result<()> {
         numeric_argument("--uplink-only-seconds", 0)?,
         numeric_argument("--downlink-only-seconds", 0)?,
     );
-    let (configs, router) = match serde_json::from_slice(&fs::read(config_path()?)?)? {
+    let (configs, mut router) = match serde_json::from_slice(&fs::read(config_path()?)?)? {
         EngineConfigFile::Normalized { listeners, routing } => {
             (listeners, Arc::new(routing::Router::compile(routing)?))
         }
@@ -3490,7 +3502,8 @@ fn main() -> io::Result<()> {
                     drain_admin_event(control)?;
                 }
                 while let Ok(command) = control.receiver.try_recv() {
-                    let _ = process_admin_command(command, &mut ss_engine, &mut listeners);
+                    let _ =
+                        process_admin_command(command, &mut ss_engine, &mut listeners, &mut router);
                 }
                 pending.push(admin_event_entry(control, !io_backend.fixed_files()));
                 continue;

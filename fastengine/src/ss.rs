@@ -1926,6 +1926,10 @@ pub struct Engine {
 }
 
 impl Engine {
+    pub fn replace_router(&mut self, router: Arc<Router>) {
+        self.router = router;
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_addresses(
         listen_addresses: &[String],
