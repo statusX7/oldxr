@@ -859,10 +859,14 @@ impl EpollReactor {
                 "epoll request must contain exactly one readiness direction",
             ));
         }
-        if self.tags.contains_key(&user_data) {
+        if let Some((armed_descriptor, armed_read)) = self.tags.get(&user_data) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "epoll user_data is already armed",
+                format!(
+                    "epoll user_data {user_data:#x} is already armed on fd {armed_descriptor} ({}) while adding fd {descriptor} ({})",
+                    if *armed_read { "read" } else { "write" },
+                    if read { "read" } else { "write" },
+                ),
             ));
         }
         let add = !self.interests.contains_key(&descriptor);
@@ -875,7 +879,11 @@ impl EpollReactor {
         if slot.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                "epoll descriptor direction is already armed",
+                format!(
+                    "epoll fd {descriptor} {} direction is already armed with tag {:#x} while adding {user_data:#x}",
+                    if read { "read" } else { "write" },
+                    slot.expect("occupied readiness slot"),
+                ),
             ));
         }
         *slot = Some(user_data);
@@ -2545,11 +2553,11 @@ fn next_upload_entry(
                 if state.client_read_eof {
                     return Ok(None);
                 }
-                if state.client_one_shot {
-                    return Ok(Some(recv_client_entry(identifier, state)?));
-                }
                 if state.client_multishot_armed {
                     return Ok(None);
+                }
+                if state.client_one_shot {
+                    return Ok(Some(recv_client_entry(identifier, state)?));
                 }
                 state.client_multishot_armed = true;
                 return Ok(Some(recv_client_multi_entry(identifier, state)));
@@ -2610,11 +2618,11 @@ fn next_upload_entry(
                     uploads.release(buffer_id);
                     continue;
                 }
-                if state.client_one_shot {
-                    return Ok(Some(recv_client_entry(identifier, state)?));
-                }
                 if state.client_multishot_armed {
                     return Ok(None);
+                }
+                if state.client_one_shot {
+                    return Ok(Some(recv_client_entry(identifier, state)?));
                 }
                 state.client_multishot_armed = true;
                 return Ok(Some(recv_client_multi_entry(identifier, state)));
