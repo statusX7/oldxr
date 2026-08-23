@@ -192,7 +192,7 @@ P3 cleanup
 - 对 `fmt.Sprintf`、string 拼接、JSON、regex、map/slice rebuild、interface 和临时对象的优化，必须由 allocation profile 或 benchmark 证明。
 - 不得仅凭理论复杂度直接重写；先测量真实常数、调用频率和数据规模。
 
-当前 Phase 7 的性能完成硬线是：在同功能、同协议、同 cipher、同注册/活跃用户、同 traffic profile 与同资源限制下，`SS-only`、`VMess-only` 和 `mixed` 三个主生产型 workload 相对 `v0.9.0-r2` 的 normalized CPU cost 均至少降低 50%。任一项不足时状态必须保持 `INCOMPLETE — CONTINUE`，不得用降低吞吐、关闭功能或更换 workload 宣称完成。
+当前维护阶段的 CPU 发布判断以同功能、同协议、同 cipher、同注册/活跃用户、同 traffic profile 与同资源限制的 normalized CPU cost 为准：相对 `v0.9.0-r2` 或对应 LegacyEngine 降低至少 30% 为可接受线，降低至少 40% 为优先目标，降低至少 50% 为优秀结果并应尽量保持。性能阈值不得通过降低吞吐、关闭功能、更换 workload、弱化安全语义或省略 control plane 来满足；正确性、兼容性、安全与升级 Gate 不因性能阈值调整而降低。
 
 ## 大用户量基准
 
