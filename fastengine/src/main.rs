@@ -77,6 +77,7 @@ static VMESS_DOWNLOAD_BUFFER_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 enum IoBackend {
     UringAdvanced,
     UringCompat,
+    Epoll,
 }
 
 impl IoBackend {
@@ -84,11 +85,76 @@ impl IoBackend {
         match self {
             Self::UringAdvanced => "io_uring-advanced",
             Self::UringCompat => "io_uring-compat",
+            Self::Epoll => "epoll",
         }
     }
 
     fn fixed_files(self) -> bool {
         self == Self::UringAdvanced
+    }
+}
+
+enum IoEntry {
+    Uring(squeue::Entry),
+    Poll {
+        descriptor: RawFd,
+        events: i16,
+        user_data: u64,
+    },
+    CancelPoll {
+        target: u64,
+        user_data: u64,
+    },
+    Immediate {
+        result: i32,
+        user_data: u64,
+    },
+}
+
+impl IoEntry {
+    fn uring(entry: squeue::Entry) -> Self {
+        Self::Uring(entry)
+    }
+
+    fn poll(descriptor: RawFd, events: i16) -> Self {
+        Self::Poll {
+            descriptor,
+            events,
+            user_data: 0,
+        }
+    }
+
+    fn cancel_poll(target: u64) -> Self {
+        Self::CancelPoll {
+            target,
+            user_data: 0,
+        }
+    }
+
+    fn immediate(result: i32) -> Self {
+        Self::Immediate {
+            result,
+            user_data: 0,
+        }
+    }
+
+    fn user_data(mut self, value: u64) -> Self {
+        match &mut self {
+            Self::Uring(entry) => *entry = entry.clone().user_data(value),
+            Self::Poll { user_data, .. }
+            | Self::CancelPoll { user_data, .. }
+            | Self::Immediate { user_data, .. } => *user_data = value,
+        }
+        self
+    }
+
+    fn get_user_data(&self) -> u64 {
+        match self {
+            Self::Uring(entry) => entry.get_user_data(),
+            Self::Poll { user_data, .. }
+            | Self::CancelPoll { user_data, .. }
+            | Self::Immediate { user_data, .. } => *user_data,
+        }
     }
 }
 
@@ -723,7 +789,389 @@ impl UploadBufferRing {
     }
 }
 
-fn advanced_io_backend() -> io::Result<(IoUring, IoBackend, UploadBufferRing, DownloadBufferRing)> {
+#[derive(Default)]
+struct EpollInterest {
+    read: Option<u64>,
+    write: Option<u64>,
+}
+
+struct EpollReactor {
+    descriptor: OwnedFd,
+    interests: HashMap<RawFd, EpollInterest>,
+    tags: HashMap<u64, (RawFd, bool)>,
+}
+
+impl EpollReactor {
+    fn new() -> io::Result<Self> {
+        let descriptor = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            descriptor: unsafe { OwnedFd::from_raw_fd(descriptor) },
+            interests: HashMap::new(),
+            tags: HashMap::new(),
+        })
+    }
+
+    fn update_registration(&self, descriptor: RawFd, add: bool) -> io::Result<()> {
+        let interest = self
+            .interests
+            .get(&descriptor)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "epoll interest disappeared"))?;
+        let mut events = (libc::EPOLLONESHOT | libc::EPOLLERR | libc::EPOLLHUP) as u32;
+        if interest.read.is_some() {
+            events |= (libc::EPOLLIN | libc::EPOLLRDHUP) as u32;
+        }
+        if interest.write.is_some() {
+            events |= libc::EPOLLOUT as u32;
+        }
+        let mut event = libc::epoll_event {
+            events,
+            u64: descriptor as u64,
+        };
+        let operation = if add {
+            libc::EPOLL_CTL_ADD
+        } else {
+            libc::EPOLL_CTL_MOD
+        };
+        let result = unsafe {
+            libc::epoll_ctl(
+                self.descriptor.as_raw_fd(),
+                operation,
+                descriptor,
+                &mut event,
+            )
+        };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn add(&mut self, descriptor: RawFd, events: i16, user_data: u64) -> io::Result<()> {
+        let read = events & libc::POLLIN != 0;
+        let write = events & libc::POLLOUT != 0;
+        if read == write {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "epoll request must contain exactly one readiness direction",
+            ));
+        }
+        if self.tags.contains_key(&user_data) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "epoll user_data is already armed",
+            ));
+        }
+        let add = !self.interests.contains_key(&descriptor);
+        let interest = self.interests.entry(descriptor).or_default();
+        let slot = if read {
+            &mut interest.read
+        } else {
+            &mut interest.write
+        };
+        if slot.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "epoll descriptor direction is already armed",
+            ));
+        }
+        *slot = Some(user_data);
+        self.tags.insert(user_data, (descriptor, read));
+        if let Err(error) = self.update_registration(descriptor, add) {
+            self.tags.remove(&user_data);
+            if let Some(interest) = self.interests.get_mut(&descriptor) {
+                if read {
+                    interest.read = None;
+                } else {
+                    interest.write = None;
+                }
+                if interest.read.is_none() && interest.write.is_none() {
+                    self.interests.remove(&descriptor);
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn cancel(&mut self, target: u64) -> io::Result<bool> {
+        let Some((descriptor, read)) = self.tags.remove(&target) else {
+            return Ok(false);
+        };
+        let Some(interest) = self.interests.get_mut(&descriptor) else {
+            return Ok(false);
+        };
+        if read {
+            interest.read = None;
+        } else {
+            interest.write = None;
+        }
+        if interest.read.is_none() && interest.write.is_none() {
+            self.interests.remove(&descriptor);
+            unsafe {
+                libc::epoll_ctl(
+                    self.descriptor.as_raw_fd(),
+                    libc::EPOLL_CTL_DEL,
+                    descriptor,
+                    ptr::null_mut(),
+                );
+            }
+        } else {
+            self.update_registration(descriptor, false)?;
+        }
+        Ok(true)
+    }
+
+    fn wait(
+        &mut self,
+        deadline: Option<Instant>,
+        completions: &mut VecDeque<(u64, i32, u32)>,
+    ) -> io::Result<()> {
+        let timeout = deadline.map_or(-1, |deadline| {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                0
+            } else {
+                remaining.as_millis().clamp(1, i32::MAX as u128) as i32
+            }
+        });
+        let mut events: [libc::epoll_event; 256] = unsafe { mem::zeroed() };
+        let count = loop {
+            let result = unsafe {
+                libc::epoll_wait(
+                    self.descriptor.as_raw_fd(),
+                    events.as_mut_ptr(),
+                    events.len() as libc::c_int,
+                    timeout,
+                )
+            };
+            if result >= 0 {
+                break result as usize;
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        };
+        for event in &events[..count] {
+            let descriptor = event.u64 as RawFd;
+            let flags = event.events;
+            let terminal = flags & (libc::EPOLLERR | libc::EPOLLHUP) as u32 != 0;
+            let readable = terminal || flags & (libc::EPOLLIN | libc::EPOLLRDHUP) as u32 != 0;
+            let writable = terminal || flags & libc::EPOLLOUT as u32 != 0;
+            let Some(interest) = self.interests.get_mut(&descriptor) else {
+                continue;
+            };
+            let read = readable.then(|| interest.read.take()).flatten();
+            let write = writable.then(|| interest.write.take()).flatten();
+            let empty = interest.read.is_none() && interest.write.is_none();
+            for user_data in [read, write].into_iter().flatten() {
+                self.tags.remove(&user_data);
+                completions.push_back((user_data, flags as i32, 0));
+            }
+            if empty {
+                self.interests.remove(&descriptor);
+                unsafe {
+                    libc::epoll_ctl(
+                        self.descriptor.as_raw_fd(),
+                        libc::EPOLL_CTL_DEL,
+                        descriptor,
+                        ptr::null_mut(),
+                    );
+                }
+            } else {
+                self.update_registration(descriptor, false)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+enum IoDriverKind {
+    Uring(IoUring),
+    Epoll(EpollReactor),
+}
+
+struct IoDriver {
+    backend: IoBackend,
+    kind: IoDriverKind,
+    ready: VecDeque<(u64, i32, u32)>,
+}
+
+impl IoDriver {
+    fn uring(ring: IoUring, backend: IoBackend) -> Self {
+        Self {
+            backend,
+            kind: IoDriverKind::Uring(ring),
+            ready: VecDeque::new(),
+        }
+    }
+
+    fn epoll() -> io::Result<Self> {
+        Ok(Self {
+            backend: IoBackend::Epoll,
+            kind: IoDriverKind::Epoll(EpollReactor::new()?),
+            ready: VecDeque::new(),
+        })
+    }
+
+    fn push(&mut self, entry: IoEntry) -> io::Result<()> {
+        match (&mut self.kind, entry) {
+            (IoDriverKind::Uring(ring), IoEntry::Uring(entry)) => loop {
+                if unsafe { ring.submission().push(&entry) }.is_ok() {
+                    return Ok(());
+                }
+                ring.submit()?;
+            },
+            (
+                IoDriverKind::Uring(ring),
+                IoEntry::Poll {
+                    descriptor,
+                    events,
+                    user_data,
+                },
+            ) => {
+                let entry = opcode::PollAdd::new(types::Fd(descriptor), events as _)
+                    .build()
+                    .user_data(user_data);
+                loop {
+                    if unsafe { ring.submission().push(&entry) }.is_ok() {
+                        return Ok(());
+                    }
+                    ring.submit()?;
+                }
+            }
+            (IoDriverKind::Uring(ring), IoEntry::CancelPoll { target, user_data }) => {
+                let entry = opcode::PollRemove::new(target).build().user_data(user_data);
+                loop {
+                    if unsafe { ring.submission().push(&entry) }.is_ok() {
+                        return Ok(());
+                    }
+                    ring.submit()?;
+                }
+            }
+            (
+                IoDriverKind::Epoll(reactor),
+                IoEntry::Poll {
+                    descriptor,
+                    events,
+                    user_data,
+                },
+            ) => reactor.add(descriptor, events, user_data),
+            (IoDriverKind::Epoll(reactor), IoEntry::CancelPoll { target, user_data }) => {
+                let result = if reactor.cancel(target)? {
+                    0
+                } else {
+                    -libc::ENOENT
+                };
+                self.ready.push_back((user_data, result, 0));
+                Ok(())
+            }
+            (_, IoEntry::Immediate { result, user_data }) => {
+                self.ready.push_back((user_data, result, 0));
+                Ok(())
+            }
+            (IoDriverKind::Epoll(_), IoEntry::Uring(_)) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "advanced io_uring request reached epoll backend",
+            )),
+        }
+    }
+
+    fn submit(&mut self) -> io::Result<()> {
+        if let IoDriverKind::Uring(ring) = &mut self.kind {
+            ring.submit()?;
+        }
+        Ok(())
+    }
+
+    fn wait(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+        if !self.ready.is_empty() {
+            return Ok(());
+        }
+        match &mut self.kind {
+            IoDriverKind::Uring(ring) if self.backend.fixed_files() => {
+                if let Some(deadline) = deadline {
+                    let wait = deadline
+                        .saturating_duration_since(Instant::now())
+                        .max(Duration::from_nanos(1));
+                    let timespec = types::Timespec::from(wait);
+                    let arguments = types::SubmitArgs::new().timespec(&timespec);
+                    if let Err(error) = ring.submitter().submit_with_args(1, &arguments) {
+                        if error.raw_os_error() != Some(libc::ETIME) {
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    ring.submit_and_wait(1)?;
+                }
+                Ok(())
+            }
+            IoDriverKind::Uring(ring) => {
+                ring.submit()?;
+                loop {
+                    if !ring.completion().is_empty() {
+                        return Ok(());
+                    }
+                    let timeout = deadline.map_or(-1, |deadline| {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            0
+                        } else {
+                            remaining.as_millis().clamp(1, i32::MAX as u128) as i32
+                        }
+                    });
+                    let mut descriptor = libc::pollfd {
+                        fd: ring.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+                    if result >= 0 {
+                        return Ok(());
+                    }
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+            }
+            IoDriverKind::Epoll(reactor) => reactor.wait(deadline, &mut self.ready),
+        }
+    }
+
+    fn drain_completions(&mut self, completions: &mut Vec<(u64, i32, u32)>) {
+        completions.extend(self.ready.drain(..));
+        if let IoDriverKind::Uring(ring) = &mut self.kind {
+            completions.extend(ring.completion().map(|completion| {
+                (
+                    completion.user_data(),
+                    completion.result(),
+                    completion.flags(),
+                )
+            }));
+        }
+    }
+
+    fn register_file(&mut self, slot: u32, descriptor: RawFd) -> io::Result<()> {
+        match &mut self.kind {
+            IoDriverKind::Uring(ring) => ring
+                .submitter()
+                .register_files_update(slot, &[descriptor])
+                .map(|_| ()),
+            IoDriverKind::Epoll(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fixed file registration reached epoll backend",
+            )),
+        }
+    }
+}
+
+fn advanced_io_backend() -> io::Result<(IoDriver, IoBackend, UploadBufferRing, DownloadBufferRing)>
+{
     let ring = IoUring::builder()
         .setup_single_issuer()
         .setup_defer_taskrun()
@@ -731,13 +1179,27 @@ fn advanced_io_backend() -> io::Result<(IoUring, IoBackend, UploadBufferRing, Do
     ring.submitter().register_files_sparse(FIXED_FILE_SLOTS)?;
     let upload = UploadBufferRing::new(&ring)?;
     let download = DownloadBufferRing::new(&ring)?;
-    Ok((ring, IoBackend::UringAdvanced, upload, download))
+    Ok((
+        IoDriver::uring(ring, IoBackend::UringAdvanced),
+        IoBackend::UringAdvanced,
+        upload,
+        download,
+    ))
 }
 
-fn compat_io_backend() -> io::Result<(IoUring, IoBackend, UploadBufferRing, DownloadBufferRing)> {
+fn compat_io_backend() -> io::Result<(IoDriver, IoBackend, UploadBufferRing, DownloadBufferRing)> {
     Ok((
-        IoUring::new(RING_ENTRIES)?,
+        IoDriver::uring(IoUring::new(RING_ENTRIES)?, IoBackend::UringCompat),
         IoBackend::UringCompat,
+        UploadBufferRing::compat(),
+        DownloadBufferRing::compat(),
+    ))
+}
+
+fn epoll_io_backend() -> io::Result<(IoDriver, IoBackend, UploadBufferRing, DownloadBufferRing)> {
+    Ok((
+        IoDriver::epoll()?,
+        IoBackend::Epoll,
         UploadBufferRing::compat(),
         DownloadBufferRing::compat(),
     ))
@@ -765,7 +1227,7 @@ fn raise_nofile_soft_limit() -> io::Result<()> {
 fn io_backend(
     requested: &str,
 ) -> io::Result<(
-    IoUring,
+    IoDriver,
     IoBackend,
     UploadBufferRing,
     DownloadBufferRing,
@@ -790,21 +1252,28 @@ fn io_backend(
                     "FastEngine advanced io_uring probe failed ({advanced_error}); selecting compatibility backend"
                 );
                 match compat_io_backend() {
-                    Ok((ring, backend, upload, download)) => Ok((
-                        ring,
+                    Ok((driver, backend, upload, download)) => Ok((
+                        driver,
                         backend,
                         upload,
                         download,
                         format!(
-                            "advanced probe failed: {advanced_error}; one-shot compatibility probe passed"
+                            "advanced probe failed: {advanced_error}; readiness compatibility probe passed"
                         ),
                     )),
-                    Err(compat_error) => Err(io::Error::new(
-                        compat_error.kind(),
-                        format!(
-                            "advanced io_uring probe failed: {advanced_error}; compatibility probe failed: {compat_error}"
-                        ),
-                    )),
+                    Err(compat_error) => epoll_io_backend().map(
+                        |(driver, backend, upload, download)| {
+                            (
+                                driver,
+                                backend,
+                                upload,
+                                download,
+                                format!(
+                                    "advanced probe failed: {advanced_error}; compatibility probe failed: {compat_error}; epoll probe passed"
+                                ),
+                            )
+                        },
+                    ),
                 }
             }
         },
@@ -826,9 +1295,18 @@ fn io_backend(
                 "compatibility backend forced by diagnostic override".to_owned(),
             )
         }),
+        "epoll" => epoll_io_backend().map(|(driver, backend, upload, download)| {
+            (
+                driver,
+                backend,
+                upload,
+                download,
+                "epoll backend forced by diagnostic override".to_owned(),
+            )
+        }),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "--io-backend must be auto, uring-advanced, or uring-compat",
+            "--io-backend must be auto, uring-advanced, uring-compat, or epoll",
         )),
     }
 }
@@ -1044,16 +1522,18 @@ fn start_admin(path: &str) -> io::Result<AdminControl> {
     })
 }
 
-fn admin_event_entry(control: &mut AdminControl, poll_only: bool) -> squeue::Entry {
+fn admin_event_entry(control: &mut AdminControl, poll_only: bool) -> IoEntry {
     let entry = if poll_only {
-        opcode::PollAdd::new(types::Fd(control.eventfd.as_raw_fd()), libc::POLLIN as _).build()
+        IoEntry::poll(control.eventfd.as_raw_fd(), libc::POLLIN)
     } else {
-        opcode::Read::new(
-            types::Fd(control.eventfd.as_raw_fd()),
-            (&mut *control.event_value as *mut u64).cast(),
-            mem::size_of::<u64>() as u32,
+        IoEntry::uring(
+            opcode::Read::new(
+                types::Fd(control.eventfd.as_raw_fd()),
+                (&mut *control.event_value as *mut u64).cast(),
+                mem::size_of::<u64>() as u32,
+            )
+            .build(),
         )
-        .build()
     };
     entry.user_data(tag(0, OP_ADMIN))
 }
@@ -1256,22 +1736,15 @@ fn udp_socket(address: SocketAddr) -> io::Result<OwnedFd> {
     }
 }
 
-fn push(ring: &mut IoUring, entry: squeue::Entry) -> io::Result<()> {
-    loop {
-        if unsafe { ring.submission().push(&entry) }.is_ok() {
-            return Ok(());
-        }
-        ring.submit()?;
-    }
-}
-
-fn accept_entry(listener: usize, descriptor: RawFd, fixed_files: bool) -> squeue::Entry {
+fn accept_entry(listener: usize, descriptor: RawFd, fixed_files: bool) -> IoEntry {
     let entry = if fixed_files {
-        opcode::Accept::new(types::Fd(descriptor), ptr::null_mut(), ptr::null_mut())
-            .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
-            .build()
+        IoEntry::uring(
+            opcode::Accept::new(types::Fd(descriptor), ptr::null_mut(), ptr::null_mut())
+                .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
+                .build(),
+        )
     } else {
-        opcode::PollAdd::new(types::Fd(descriptor), libc::POLLIN as _).build()
+        IoEntry::poll(descriptor, libc::POLLIN)
     };
     entry.user_data(tag(listener, OP_ACCEPT))
 }
@@ -1283,7 +1756,7 @@ fn arm_accepts(
     accept_cursor: &mut usize,
     active_connections: usize,
     fixed_files: bool,
-    pending: &mut Vec<squeue::Entry>,
+    pending: &mut Vec<IoEntry>,
 ) {
     if listeners.is_empty() {
         return;
@@ -1388,7 +1861,7 @@ fn resume_due(
     connections: &mut [Option<Connection>],
     upload_buffers: &UploadBufferRing,
     download_buffers: &DownloadBufferRing,
-    pending: &mut Vec<squeue::Entry>,
+    pending: &mut Vec<IoEntry>,
 ) {
     loop {
         let Some(Reverse(entry @ (deadline, _, _, _))) = timers.peek().copied() else {
@@ -1436,7 +1909,7 @@ fn resume_due(
     }
 }
 
-fn recv_client_entry(identifier: usize, state: &mut Connection) -> io::Result<squeue::Entry> {
+fn recv_client_entry(identifier: usize, state: &mut Connection) -> io::Result<IoEntry> {
     if state.client_start > 0 {
         state
             .client_input
@@ -1454,35 +1927,40 @@ fn recv_client_entry(identifier: usize, state: &mut Connection) -> io::Result<sq
     state.client_multishot_armed = true;
     let buffer = unsafe { state.client_input.as_mut_ptr().add(state.client_end) };
     let entry = if state.fixed_files {
-        opcode::Recv::new(types::Fixed(state.client_slot), buffer, remaining as u32)
-            .ioprio(1)
-            .build()
+        IoEntry::uring(
+            opcode::Recv::new(types::Fixed(state.client_slot), buffer, remaining as u32)
+                .ioprio(1)
+                .build(),
+        )
     } else {
-        opcode::PollAdd::new(types::Fd(state._client.as_raw_fd()), libc::POLLIN as _).build()
+        IoEntry::poll(state._client.as_raw_fd(), libc::POLLIN)
     };
     Ok(entry.user_data(tag(identifier, OP_RECV_CLIENT)))
 }
 
-fn recv_client_multi_entry(identifier: usize, state: &Connection) -> squeue::Entry {
-    opcode::RecvMulti::new(types::Fixed(state.client_slot), UPLOAD_BUFFER_GROUP)
-        .build()
-        .user_data(tag(identifier, OP_RECV_CLIENT))
+fn recv_client_multi_entry(identifier: usize, state: &Connection) -> IoEntry {
+    IoEntry::uring(
+        opcode::RecvMulti::new(types::Fixed(state.client_slot), UPLOAD_BUFFER_GROUP).build(),
+    )
+    .user_data(tag(identifier, OP_RECV_CLIENT))
 }
 
-fn connect_target_entry(identifier: usize, state: &Connection) -> io::Result<squeue::Entry> {
+fn connect_target_entry(identifier: usize, state: &Connection) -> io::Result<IoEntry> {
     let address = state.target_address.as_ref().expect("target address");
     let entry = if state.fixed_files {
-        opcode::Connect::new(
-            types::Fixed(state.target_slot),
-            address.as_ptr(),
-            address.len(),
+        IoEntry::uring(
+            opcode::Connect::new(
+                types::Fixed(state.target_slot),
+                address.as_ptr(),
+                address.len(),
+            )
+            .build(),
         )
-        .build()
     } else {
         let descriptor = state.target.as_ref().expect("target socket").as_raw_fd();
         let result = unsafe { libc::connect(descriptor, address.as_ptr(), address.len()) };
         if result == 0 {
-            opcode::Nop::new().build()
+            IoEntry::immediate(0)
         } else {
             let error = io::Error::last_os_error();
             if !matches!(
@@ -1491,7 +1969,7 @@ fn connect_target_entry(identifier: usize, state: &Connection) -> io::Result<squ
             ) {
                 return Err(error);
             }
-            opcode::PollAdd::new(types::Fd(descriptor), libc::POLLOUT as _).build()
+            IoEntry::poll(descriptor, libc::POLLOUT)
         }
     };
     Ok(entry.user_data(tag(identifier, OP_CONNECT_TARGET)))
@@ -1503,8 +1981,8 @@ fn ensure_target_connect(
     site: &mut ListenerState,
     features: Features,
     router: &routing::Router,
-    ring: &mut IoUring,
-    pending: &mut Vec<squeue::Entry>,
+    driver: &mut IoDriver,
+    pending: &mut Vec<IoEntry>,
 ) -> io::Result<()> {
     if state.target.is_some() || state.target_address.is_none() {
         return Ok(());
@@ -1560,7 +2038,7 @@ fn ensure_target_connect(
         tcp_socket(address)?
     };
     if state.fixed_files {
-        register_file(ring, state.target_slot, target_socket.as_raw_fd())?;
+        driver.register_file(state.target_slot, target_socket.as_raw_fd())?;
     }
     state.target = Some(target_socket);
     queue_connection!(state, pending, connect_target_entry(identifier, state)?);
@@ -1584,11 +2062,7 @@ fn set_vmess_tcp_target(state: &mut Connection, decision: SniffDecision) -> io::
     Ok(true)
 }
 
-fn send_target_entry(
-    identifier: usize,
-    state: &Connection,
-    uploads: &UploadBufferRing,
-) -> squeue::Entry {
+fn send_target_entry(identifier: usize, state: &Connection, uploads: &UploadBufferRing) -> IoEntry {
     let remaining = state.upload_length - state.upload_offset;
     let source = if state.upload_from_sniff {
         state.sniff_buffer.as_ptr()
@@ -1600,27 +2074,29 @@ fn send_target_entry(
     };
     let source = unsafe { source.add(state.upload_start + state.upload_offset) };
     let entry = if state.fixed_files {
-        opcode::Send::new(types::Fixed(state.target_slot), source, remaining as u32)
-            .ioprio(1)
-            .build()
-    } else {
-        opcode::PollAdd::new(
-            types::Fd(state.target.as_ref().expect("target socket").as_raw_fd()),
-            libc::POLLOUT as _,
+        IoEntry::uring(
+            opcode::Send::new(types::Fixed(state.target_slot), source, remaining as u32)
+                .ioprio(1)
+                .build(),
         )
-        .build()
+    } else {
+        IoEntry::poll(
+            state.target.as_ref().expect("target socket").as_raw_fd(),
+            libc::POLLOUT,
+        )
     };
     entry.user_data(tag(identifier, OP_SEND_TARGET))
 }
 
-fn recv_target_entry(identifier: usize, state: &mut Connection) -> squeue::Entry {
+fn recv_target_entry(identifier: usize, state: &mut Connection) -> IoEntry {
     state.target_multishot_armed = true;
-    opcode::RecvMulti::new(types::Fixed(state.target_slot), DOWNLOAD_BUFFER_GROUP)
-        .build()
-        .user_data(tag(identifier, OP_RECV_TARGET))
+    IoEntry::uring(
+        opcode::RecvMulti::new(types::Fixed(state.target_slot), DOWNLOAD_BUFFER_GROUP).build(),
+    )
+    .user_data(tag(identifier, OP_RECV_TARGET))
 }
 
-fn recv_target_paced_entry(identifier: usize, state: &mut Connection) -> squeue::Entry {
+fn recv_target_paced_entry(identifier: usize, state: &mut Connection) -> IoEntry {
     state.target_multishot_armed = true;
     let buffer = state
         .download_local
@@ -1628,19 +2104,20 @@ fn recv_target_paced_entry(identifier: usize, state: &mut Connection) -> squeue:
         .expect("paced download buffer");
     let buffer = unsafe { buffer.as_mut_ptr().add(DOWNLOAD_HEADROOM) };
     let entry = if state.fixed_files {
-        opcode::Recv::new(
-            types::Fixed(state.target_slot),
-            buffer,
-            DOWNLOAD_PAYLOAD_SIZE as u32,
+        IoEntry::uring(
+            opcode::Recv::new(
+                types::Fixed(state.target_slot),
+                buffer,
+                DOWNLOAD_PAYLOAD_SIZE as u32,
+            )
+            .ioprio(1)
+            .build(),
         )
-        .ioprio(1)
-        .build()
     } else {
-        opcode::PollAdd::new(
-            types::Fd(state.target.as_ref().expect("target socket").as_raw_fd()),
-            libc::POLLIN as _,
+        IoEntry::poll(
+            state.target.as_ref().expect("target socket").as_raw_fd(),
+            libc::POLLIN,
         )
-        .build()
     };
     entry.user_data(tag(identifier, OP_RECV_TARGET))
 }
@@ -1650,11 +2127,11 @@ fn cancel_entry(
     target_operation: u8,
     cancel_operation: u8,
     fixed_files: bool,
-) -> squeue::Entry {
+) -> IoEntry {
     let entry = if fixed_files {
-        opcode::AsyncCancel::new(tag(identifier, target_operation)).build()
+        IoEntry::uring(opcode::AsyncCancel::new(tag(identifier, target_operation)).build())
     } else {
-        opcode::PollRemove::new(tag(identifier, target_operation)).build()
+        IoEntry::cancel_poll(tag(identifier, target_operation))
     };
     entry.user_data(tag(identifier, cancel_operation))
 }
@@ -1663,7 +2140,7 @@ fn send_client_entry(
     identifier: usize,
     state: &Connection,
     downloads: &DownloadBufferRing,
-) -> squeue::Entry {
+) -> IoEntry {
     let buffer: &[u8] = if state.download_local_active {
         state
             .download_local
@@ -1679,11 +2156,13 @@ fn send_client_entry(
             .add(state.client_output_start + state.client_output_offset)
     };
     let entry = if state.fixed_files {
-        opcode::Send::new(types::Fixed(state.client_slot), buffer, remaining as u32)
-            .ioprio(1)
-            .build()
+        IoEntry::uring(
+            opcode::Send::new(types::Fixed(state.client_slot), buffer, remaining as u32)
+                .ioprio(1)
+                .build(),
+        )
     } else {
-        opcode::PollAdd::new(types::Fd(state._client.as_raw_fd()), libc::POLLOUT as _).build()
+        IoEntry::poll(state._client.as_raw_fd(), libc::POLLOUT)
     };
     entry.user_data(tag(identifier, OP_SEND_CLIENT))
 }
@@ -1815,58 +2294,6 @@ fn compat_vmess_result(
             })
         }
         _ => 0,
-    }
-}
-
-fn wait_for_completion(
-    ring: &mut IoUring,
-    io_backend: IoBackend,
-    deadline: Option<Instant>,
-) -> io::Result<()> {
-    if io_backend.fixed_files() {
-        if let Some(deadline) = deadline {
-            let wait = deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_nanos(1));
-            let timespec = types::Timespec::from(wait);
-            let arguments = types::SubmitArgs::new().timespec(&timespec);
-            if let Err(error) = ring.submitter().submit_with_args(1, &arguments) {
-                if error.raw_os_error() != Some(libc::ETIME) {
-                    return Err(error);
-                }
-            }
-        } else {
-            ring.submit_and_wait(1)?;
-        }
-        return Ok(());
-    }
-
-    ring.submit()?;
-    loop {
-        if !ring.completion().is_empty() {
-            return Ok(());
-        }
-        let timeout = deadline.map_or(-1, |deadline| {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                0
-            } else {
-                remaining.as_millis().clamp(1, i32::MAX as u128) as i32
-            }
-        });
-        let mut descriptor = libc::pollfd {
-            fd: ring.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
-        if result >= 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
     }
 }
 
@@ -2099,7 +2526,7 @@ fn next_upload_entry(
     uploads: &mut UploadBufferRing,
     user: &mut UserRuntime,
     features: Features,
-) -> io::Result<Option<squeue::Entry>> {
+) -> io::Result<Option<IoEntry>> {
     if state.upload_length != 0 {
         if state.connected && state.upload_ready_at.is_none() {
             return Ok(Some(send_target_entry(identifier, state, uploads)));
@@ -2352,7 +2779,7 @@ fn prepare_download_entry(
     features: Features,
     received: (u16, usize),
     padding_random: &mut PaddingRandom,
-) -> io::Result<Option<squeue::Entry>> {
+) -> io::Result<Option<IoEntry>> {
     let (buffer_id, length) = received;
     let wait = reserve_budget(user, &mut state.download_budget, length, features.limiter);
     extend_deadline(&mut state.download_ready_at, wait);
@@ -2390,7 +2817,7 @@ fn next_download_entry(
     user: &mut UserRuntime,
     features: Features,
     padding_random: &mut PaddingRandom,
-) -> io::Result<Option<squeue::Entry>> {
+) -> io::Result<Option<IoEntry>> {
     let Some((buffer_id, length)) = state.download_queue.pop_front() else {
         if state.target_read_eof || state.target_multishot_armed {
             return Ok(None);
@@ -2409,16 +2836,6 @@ fn next_download_entry(
         (buffer_id, length),
         padding_random,
     )
-}
-
-fn register_file(ring: &mut IoUring, slot: u32, descriptor: RawFd) -> io::Result<()> {
-    ring.submitter()
-        .register_files_update(slot, &[descriptor])
-        .map(|_| ())
-}
-
-fn unregister_file(ring: &mut IoUring, slot: u32) -> io::Result<()> {
-    register_file(ring, slot, -1)
 }
 
 fn shutdown(descriptor: RawFd) {
@@ -2483,7 +2900,7 @@ fn download_eof_entry(
     state: &mut Connection,
     downloads: &DownloadBufferRing,
     padding_random: &mut PaddingRandom,
-) -> io::Result<squeue::Entry> {
+) -> io::Result<IoEntry> {
     if state.download_local.is_none() {
         state.download_local = Some(Box::new([0; DOWNLOAD_BUFFER_SIZE]));
     }
@@ -2511,7 +2928,7 @@ fn udp_eof_entry_if_ready(
     state: &mut Connection,
     downloads: &DownloadBufferRing,
     padding_random: &mut PaddingRandom,
-) -> io::Result<Option<squeue::Entry>> {
+) -> io::Result<Option<IoEntry>> {
     if state.target_udp
         && state.target_read_eof
         && state.download_queue.is_empty()
@@ -2531,7 +2948,7 @@ fn finish_upload_direction(
     state: &mut Connection,
     downloads: &DownloadBufferRing,
     padding_random: &mut PaddingRandom,
-    pending: &mut Vec<squeue::Entry>,
+    pending: &mut Vec<IoEntry>,
 ) {
     finish_upload_half(state);
     match udp_eof_entry_if_ready(identifier, state, downloads, padding_random) {
@@ -2640,7 +3057,7 @@ fn retire_connection(
     listeners: &mut [ListenerState],
     upload_buffers: &mut UploadBufferRing,
     download_buffers: &mut DownloadBufferRing,
-    ring: &mut IoUring,
+    driver: &mut IoDriver,
 ) -> io::Result<()> {
     let Some(mut state) = connections[identifier].take() else {
         return Ok(());
@@ -2675,8 +3092,8 @@ fn retire_connection(
         listeners[state.listener].prune_retired();
     }
     if state.fixed_files {
-        unregister_file(ring, state.client_slot)?;
-        unregister_file(ring, state.target_slot)?;
+        driver.register_file(state.client_slot, -1)?;
+        driver.register_file(state.target_slot, -1)?;
     }
     free_connections.push(identifier);
     Ok(())
@@ -2897,7 +3314,7 @@ fn main() -> io::Result<()> {
 
     let requested_io_backend = env::var("OLDXR_FASTENGINE_IO_BACKEND")
         .unwrap_or_else(|_| argument("--io-backend", "auto"));
-    let (mut ring, io_backend, mut upload_buffers, mut download_buffers, io_backend_reason) =
+    let (mut driver, io_backend, mut upload_buffers, mut download_buffers, io_backend_reason) =
         io_backend(&requested_io_backend)?;
     eprintln!(
         "FastEngine I/O backend: {} ({io_backend_reason})",
@@ -2958,9 +3375,9 @@ fn main() -> io::Result<()> {
         pending.push(admin_event_entry(control, !io_backend.fixed_files()));
     }
     for entry in pending.drain(..) {
-        push(&mut ring, entry)?;
+        driver.push(entry)?;
     }
-    ring.submit()?;
+    driver.submit()?;
 
     loop {
         let now = Instant::now();
@@ -2980,7 +3397,7 @@ fn main() -> io::Result<()> {
         );
         ss_engine.resume_due(now, &mut pending);
         for entry in pending.drain(..) {
-            push(&mut ring, entry)?;
+            driver.push(entry)?;
         }
         let policy_deadline = (active_connections != 0 || ss_engine.has_tcp_connections())
             .then_some(next_policy_sweep);
@@ -2992,20 +3409,14 @@ fn main() -> io::Result<()> {
         .into_iter()
         .flatten()
         .min();
-        wait_for_completion(&mut ring, io_backend, deadline)?;
+        driver.wait(deadline)?;
         completions.clear();
-        completions.extend(ring.completion().map(|completion| {
-            (
-                completion.user_data(),
-                completion.result(),
-                completion.flags(),
-            )
-        }));
+        driver.drain_completions(&mut completions);
         pending.clear();
 
         for (user_data, mut result, completion_flags) in completions.drain(..) {
             if ss::owns(user_data) {
-                ss_engine.handle_completion(&mut ring, user_data, result, &mut pending)?;
+                ss_engine.handle_completion(&mut driver, user_data, result, &mut pending)?;
                 continue;
             }
             let (identifier, operation) = decode_tag(user_data);
@@ -3074,7 +3485,7 @@ fn main() -> io::Result<()> {
                 let client_slot = (connection_id * 2) as u32;
                 let target_slot = client_slot + 1;
                 if io_backend.fixed_files() {
-                    register_file(&mut ring, client_slot, client.as_raw_fd())?;
+                    driver.register_file(client_slot, client.as_raw_fd())?;
                 }
                 let mut state = Connection {
                     _client: client,
@@ -3290,7 +3701,7 @@ fn main() -> io::Result<()> {
                                     &mut listeners[site],
                                     features,
                                     &router,
-                                    &mut ring,
+                                    &mut driver,
                                     &mut pending,
                                 ) {
                                     fail_io(state, error);
@@ -3394,7 +3805,7 @@ fn main() -> io::Result<()> {
                                     site,
                                     features,
                                     &router,
-                                    &mut ring,
+                                    &mut driver,
                                     &mut pending,
                                 ) {
                                     fail_io(state, error);
@@ -3460,7 +3871,7 @@ fn main() -> io::Result<()> {
                                 &mut listeners[site],
                                 features,
                                 &router,
-                                &mut ring,
+                                &mut driver,
                                 &mut pending,
                             ) {
                                 fail_io(state, error);
@@ -3851,7 +4262,7 @@ fn main() -> io::Result<()> {
                     &mut listeners,
                     &mut upload_buffers,
                     &mut download_buffers,
-                    &mut ring,
+                    &mut driver,
                 )?;
                 active_connections = active_connections.saturating_sub(1);
             }
@@ -3860,7 +4271,7 @@ fn main() -> io::Result<()> {
                 Ordering::Relaxed,
             );
         }
-        ss_engine.finish_batch(&mut ring, &mut pending)?;
+        ss_engine.finish_batch(&mut driver, &mut pending)?;
         arm_accepts(
             &listeners,
             &mut accept_armed,
@@ -3951,17 +4362,61 @@ fn main() -> io::Result<()> {
         }
 
         for entry in pending.drain(..) {
-            push(&mut ring, entry)?;
+            driver.push(entry)?;
         }
-        // The next submit_and_wait submits these SQEs and waits for a CQE in
-        // one io_uring_enter call. Submitting here would add a second syscall
-        // per completion batch without making progress sooner.
+        // The next wait submits queued io_uring requests or arms epoll
+        // interests before blocking, avoiding an extra syscall per batch.
     }
 }
 
 #[cfg(test)]
 mod runtime_tests {
     use super::*;
+
+    #[test]
+    fn epoll_reactor_preserves_duplex_interests_and_cancellation() {
+        let (mut client, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        client.set_nonblocking(true).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let descriptor = client.as_raw_fd();
+        let mut reactor = EpollReactor::new().unwrap();
+        let mut completions = VecDeque::new();
+
+        reactor.add(descriptor, libc::POLLIN, 101).unwrap();
+        reactor.add(descriptor, libc::POLLOUT, 102).unwrap();
+        reactor
+            .wait(
+                Some(Instant::now() + Duration::from_secs(1)),
+                &mut completions,
+            )
+            .unwrap();
+        assert!(completions.iter().any(|completion| completion.0 == 102));
+        assert!(!completions.iter().any(|completion| completion.0 == 101));
+        completions.clear();
+
+        std::io::Write::write_all(&mut peer, b"x").unwrap();
+        reactor
+            .wait(
+                Some(Instant::now() + Duration::from_secs(1)),
+                &mut completions,
+            )
+            .unwrap();
+        assert!(completions.iter().any(|completion| completion.0 == 101));
+        let mut byte = [0u8; 1];
+        std::io::Read::read_exact(&mut client, &mut byte).unwrap();
+
+        reactor.add(descriptor, libc::POLLIN, 103).unwrap();
+        assert!(reactor.cancel(103).unwrap());
+        assert!(!reactor.cancel(103).unwrap());
+    }
+
+    #[test]
+    fn epoll_reactor_rolls_back_failed_registration() {
+        let mut reactor = EpollReactor::new().unwrap();
+        assert!(reactor.add(-1, libc::POLLIN, 201).is_err());
+        assert!(reactor.interests.is_empty());
+        assert!(reactor.tags.is_empty());
+    }
 
     fn normalized(uid: u64, id: &str) -> VmessNormalizedUser {
         VmessNormalizedUser {

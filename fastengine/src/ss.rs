@@ -6,7 +6,8 @@ use crate::netaddr::{
 use crate::routing::{Router, NETWORK_TCP, NETWORK_UDP};
 use crate::sniff::{Decision as SniffDecision, State as SniffState};
 use crate::timeout::{TcpTimeoutState, TcpTimeouts};
-use io_uring::{opcode, squeue, types, IoUring};
+use crate::{IoDriver, IoEntry};
+use io_uring::{opcode, types};
 use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 use shadowsocks_crypto::{
@@ -583,51 +584,57 @@ fn recv_udp_inbound_entry(
     site: usize,
     listener: &mut UdpListenerState,
     poll_first: bool,
-) -> squeue::Entry {
+) -> IoEntry {
     listener.reset_message();
     listener.armed = true;
     let entry = if poll_first {
-        opcode::RecvMsg::new(
-            types::Fd(listener.socket.as_raw_fd()),
-            &mut *listener.message,
+        IoEntry::uring(
+            opcode::RecvMsg::new(
+                types::Fd(listener.socket.as_raw_fd()),
+                &mut *listener.message,
+            )
+            .ioprio(1)
+            .build(),
         )
-        .ioprio(1)
-        .build()
     } else {
-        opcode::PollAdd::new(types::Fd(listener.socket.as_raw_fd()), libc::POLLIN as _).build()
+        IoEntry::poll(listener.socket.as_raw_fd(), libc::POLLIN)
     };
     entry.user_data(tag(site, OP_RECV_UDP_INBOUND))
 }
 
-fn send_udp_outbound_entry(identifier: usize, state: &mut UdpAssociation) -> squeue::Entry {
+fn send_udp_outbound_entry(identifier: usize, state: &mut UdpAssociation) -> IoEntry {
     let upload = state.current_upload.as_ref().expect("SS UDP upload");
     state.upload_inflight = true;
     let entry = if state.poll_first {
-        opcode::Send::new(
-            types::Fd(state.outbound.as_raw_fd()),
-            upload.as_ptr(),
-            upload.len() as u32,
+        IoEntry::uring(
+            opcode::Send::new(
+                types::Fd(state.outbound.as_raw_fd()),
+                upload.as_ptr(),
+                upload.len() as u32,
+            )
+            .ioprio(1)
+            .build(),
         )
-        .ioprio(1)
-        .build()
     } else {
-        opcode::PollAdd::new(types::Fd(state.outbound.as_raw_fd()), libc::POLLOUT as _).build()
+        IoEntry::poll(state.outbound.as_raw_fd(), libc::POLLOUT)
     };
     entry.user_data(tag(identifier, OP_SEND_UDP_OUTBOUND))
 }
 
-fn recv_udp_outbound_entry(identifier: usize, state: &mut UdpAssociation) -> squeue::Entry {
+fn recv_udp_outbound_entry(identifier: usize, state: &mut UdpAssociation) -> IoEntry {
     state.recv_inflight = true;
     let entry = if state.poll_first {
-        opcode::Recv::new(
-            types::Fd(state.outbound.as_raw_fd()),
-            unsafe { state.response.as_mut_ptr().add(UDP_RESPONSE_HEADROOM) },
-            UDP_TARGET_PAYLOAD_CAPACITY as u32,
+        IoEntry::uring(
+            opcode::Recv::new(
+                types::Fd(state.outbound.as_raw_fd()),
+                unsafe { state.response.as_mut_ptr().add(UDP_RESPONSE_HEADROOM) },
+                UDP_TARGET_PAYLOAD_CAPACITY as u32,
+            )
+            .ioprio(1)
+            .build(),
         )
-        .ioprio(1)
-        .build()
     } else {
-        opcode::PollAdd::new(types::Fd(state.outbound.as_raw_fd()), libc::POLLIN as _).build()
+        IoEntry::poll(state.outbound.as_raw_fd(), libc::POLLIN)
     };
     entry.user_data(tag(identifier, OP_RECV_UDP_OUTBOUND))
 }
@@ -636,27 +643,29 @@ fn send_udp_inbound_entry(
     identifier: usize,
     listener: &UdpListenerState,
     state: &mut UdpAssociation,
-) -> squeue::Entry {
+) -> IoEntry {
     state.reset_response_message();
     state.response_inflight = true;
     let entry = if state.poll_first {
-        opcode::SendMsg::new(
-            types::Fd(listener.socket.as_raw_fd()),
-            &*state.response_message,
+        IoEntry::uring(
+            opcode::SendMsg::new(
+                types::Fd(listener.socket.as_raw_fd()),
+                &*state.response_message,
+            )
+            .ioprio(1)
+            .build(),
         )
-        .ioprio(1)
-        .build()
     } else {
-        opcode::PollAdd::new(types::Fd(listener.socket.as_raw_fd()), libc::POLLOUT as _).build()
+        IoEntry::poll(listener.socket.as_raw_fd(), libc::POLLOUT)
     };
     entry.user_data(tag(identifier, OP_SEND_UDP_INBOUND))
 }
 
-fn cancel_udp_recv_entry(identifier: usize, poll_first: bool) -> squeue::Entry {
+fn cancel_udp_recv_entry(identifier: usize, poll_first: bool) -> IoEntry {
     let entry = if poll_first {
-        opcode::AsyncCancel::new(tag(identifier, OP_RECV_UDP_OUTBOUND)).build()
+        IoEntry::uring(opcode::AsyncCancel::new(tag(identifier, OP_RECV_UDP_OUTBOUND)).build())
     } else {
-        opcode::PollRemove::new(tag(identifier, OP_RECV_UDP_OUTBOUND)).build()
+        IoEntry::cancel_poll(tag(identifier, OP_RECV_UDP_OUTBOUND))
     };
     entry.user_data(tag(identifier, OP_CANCEL_UDP_RECV))
 }
@@ -668,26 +677,30 @@ fn begin_udp_close(state: &mut UdpAssociation) {
     }
 }
 
-fn accept_entry(listener: RawFd, site: usize, fixed_files: bool) -> squeue::Entry {
+fn accept_entry(listener: RawFd, site: usize, fixed_files: bool) -> IoEntry {
     let entry = if fixed_files {
-        opcode::Accept::new(types::Fd(listener), ptr::null_mut(), ptr::null_mut())
-            .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
-            .build()
+        IoEntry::uring(
+            opcode::Accept::new(types::Fd(listener), ptr::null_mut(), ptr::null_mut())
+                .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
+                .build(),
+        )
     } else {
-        opcode::PollAdd::new(types::Fd(listener), libc::POLLIN as _).build()
+        IoEntry::poll(listener, libc::POLLIN)
     };
     entry.user_data(tag(site, OP_ACCEPT))
 }
 
-fn connect_entry(connection: usize, state: &Connection) -> io::Result<squeue::Entry> {
+fn connect_entry(connection: usize, state: &Connection) -> io::Result<IoEntry> {
     let target = state.target.as_ref().expect("connect target");
     let entry = if state.fixed_files {
-        opcode::Connect::new(
-            types::Fixed(state.outbound_slot),
-            target.as_ptr(),
-            target.len(),
+        IoEntry::uring(
+            opcode::Connect::new(
+                types::Fixed(state.outbound_slot),
+                target.as_ptr(),
+                target.len(),
+            )
+            .build(),
         )
-        .build()
     } else {
         let descriptor = state
             .outbound
@@ -696,7 +709,7 @@ fn connect_entry(connection: usize, state: &Connection) -> io::Result<squeue::En
             .as_raw_fd();
         let result = unsafe { libc::connect(descriptor, target.as_ptr(), target.len()) };
         if result == 0 {
-            opcode::Nop::new().build()
+            IoEntry::immediate(0)
         } else {
             let error = io::Error::last_os_error();
             if !matches!(
@@ -705,7 +718,7 @@ fn connect_entry(connection: usize, state: &Connection) -> io::Result<squeue::En
             ) {
                 return Err(error);
             }
-            opcode::PollAdd::new(types::Fd(descriptor), libc::POLLOUT as _).build()
+            IoEntry::poll(descriptor, libc::POLLOUT)
         }
     };
     Ok(entry.user_data(tag(connection, OP_CONNECT)))
@@ -716,12 +729,12 @@ fn start_target_connect(
     state: &mut Connection,
     target: SocketAddr,
     tcp_nodelay: bool,
-    ring: &mut IoUring,
-    pending: &mut Vec<squeue::Entry>,
+    driver: &mut IoDriver,
+    pending: &mut Vec<IoEntry>,
 ) -> io::Result<()> {
     let outbound = tcp_socket(tcp_nodelay, target)?;
     if state.fixed_files {
-        register_file(ring, state.outbound_slot, outbound.as_raw_fd())?;
+        driver.register_file(state.outbound_slot, outbound.as_raw_fd())?;
     }
     state.target = Some(Box::new(RawSocketAddress::new(target)));
     state.outbound = Some(outbound);
@@ -730,7 +743,7 @@ fn start_target_connect(
     Ok(())
 }
 
-fn recv_inbound_entry(connection: usize, state: &mut Connection) -> io::Result<squeue::Entry> {
+fn recv_inbound_entry(connection: usize, state: &mut Connection) -> io::Result<IoEntry> {
     state.compact_input();
     let remaining = INPUT_CAPACITY.saturating_sub(state.input_length);
     if remaining == 0 {
@@ -738,16 +751,18 @@ fn recv_inbound_entry(connection: usize, state: &mut Connection) -> io::Result<s
     }
     let buffer = unsafe { state.input.as_mut_ptr().add(state.input_length) };
     let entry = if state.fixed_files {
-        opcode::Recv::new(types::Fixed(state.inbound_slot), buffer, remaining as u32)
-            .ioprio(1)
-            .build()
+        IoEntry::uring(
+            opcode::Recv::new(types::Fixed(state.inbound_slot), buffer, remaining as u32)
+                .ioprio(1)
+                .build(),
+        )
     } else {
-        opcode::PollAdd::new(types::Fd(state._inbound.as_raw_fd()), libc::POLLIN as _).build()
+        IoEntry::poll(state._inbound.as_raw_fd(), libc::POLLIN)
     };
     Ok(entry.user_data(tag(connection, OP_RECV_INBOUND)))
 }
 
-fn send_outbound_entry(connection: usize, state: &Connection) -> squeue::Entry {
+fn send_outbound_entry(connection: usize, state: &Connection) -> IoEntry {
     let address = if let Some(start) = state.upload_direct_start {
         unsafe { state.input.as_ptr().add(start + state.upload_offset) }
     } else {
@@ -755,26 +770,25 @@ fn send_outbound_entry(connection: usize, state: &Connection) -> squeue::Entry {
     };
     let length = (state.upload_length - state.upload_offset) as u32;
     let entry = if state.fixed_files {
-        opcode::Send::new(types::Fixed(state.outbound_slot), address, length)
-            .ioprio(1)
-            .build()
-    } else {
-        opcode::PollAdd::new(
-            types::Fd(
-                state
-                    .outbound
-                    .as_ref()
-                    .expect("outbound socket")
-                    .as_raw_fd(),
-            ),
-            libc::POLLOUT as _,
+        IoEntry::uring(
+            opcode::Send::new(types::Fixed(state.outbound_slot), address, length)
+                .ioprio(1)
+                .build(),
         )
-        .build()
+    } else {
+        IoEntry::poll(
+            state
+                .outbound
+                .as_ref()
+                .expect("outbound socket")
+                .as_raw_fd(),
+            libc::POLLOUT,
+        )
     };
     entry.user_data(tag(connection, OP_SEND_OUTBOUND))
 }
 
-fn recv_outbound_entry(connection: usize, state: &mut Connection) -> squeue::Entry {
+fn recv_outbound_entry(connection: usize, state: &mut Connection) -> IoEntry {
     state.download_payload_offset = if state.encryptor.is_none() {
         SALT_LEN + LENGTH_PACKET_LEN
     } else {
@@ -787,30 +801,29 @@ fn recv_outbound_entry(connection: usize, state: &mut Connection) -> squeue::Ent
             .add(state.download_payload_offset)
     };
     let entry = if state.fixed_files {
-        opcode::Recv::new(
-            types::Fixed(state.outbound_slot),
-            buffer,
-            DOWNLOAD_PLAINTEXT_CAPACITY as u32,
+        IoEntry::uring(
+            opcode::Recv::new(
+                types::Fixed(state.outbound_slot),
+                buffer,
+                DOWNLOAD_PLAINTEXT_CAPACITY as u32,
+            )
+            .ioprio(1)
+            .build(),
         )
-        .ioprio(1)
-        .build()
     } else {
-        opcode::PollAdd::new(
-            types::Fd(
-                state
-                    .outbound
-                    .as_ref()
-                    .expect("outbound socket")
-                    .as_raw_fd(),
-            ),
-            libc::POLLIN as _,
+        IoEntry::poll(
+            state
+                .outbound
+                .as_ref()
+                .expect("outbound socket")
+                .as_raw_fd(),
+            libc::POLLIN,
         )
-        .build()
     };
     entry.user_data(tag(connection, OP_RECV_OUTBOUND))
 }
 
-fn send_inbound_entry(connection: usize, state: &Connection) -> squeue::Entry {
+fn send_inbound_entry(connection: usize, state: &Connection) -> IoEntry {
     let buffer = unsafe {
         state
             .download_ciphertext
@@ -819,11 +832,13 @@ fn send_inbound_entry(connection: usize, state: &Connection) -> squeue::Entry {
     };
     let length = (state.download_length - state.download_offset) as u32;
     let entry = if state.fixed_files {
-        opcode::Send::new(types::Fixed(state.inbound_slot), buffer, length)
-            .ioprio(1)
-            .build()
+        IoEntry::uring(
+            opcode::Send::new(types::Fixed(state.inbound_slot), buffer, length)
+                .ioprio(1)
+                .build(),
+        )
     } else {
-        opcode::PollAdd::new(types::Fd(state._inbound.as_raw_fd()), libc::POLLOUT as _).build()
+        IoEntry::poll(state._inbound.as_raw_fd(), libc::POLLOUT)
     };
     entry.user_data(tag(connection, OP_SEND_INBOUND))
 }
@@ -995,16 +1010,6 @@ fn compat_tcp_result(operation: u8, state: &mut Connection) -> i32 {
         }),
         _ => 0,
     }
-}
-
-fn register_file(ring: &mut IoUring, slot: u32, descriptor: RawFd) -> io::Result<()> {
-    ring.submitter()
-        .register_files_update(slot, &[descriptor])
-        .map(|_| ())
-}
-
-fn unregister_file(ring: &mut IoUring, slot: u32) -> io::Result<()> {
-    register_file(ring, slot, -1)
 }
 
 fn shutdown(descriptor: RawFd) {
@@ -2001,7 +2006,7 @@ impl Engine {
         })
     }
 
-    fn arm_accepts(&mut self, pending: &mut Vec<squeue::Entry>) {
+    fn arm_accepts(&mut self, pending: &mut Vec<IoEntry>) {
         if self.listeners.is_empty() {
             return;
         }
@@ -2030,7 +2035,7 @@ impl Engine {
         }
     }
 
-    fn arm_udp_listeners(&mut self, pending: &mut Vec<squeue::Entry>) {
+    fn arm_udp_listeners(&mut self, pending: &mut Vec<IoEntry>) {
         for (site, listener) in self.udp_listeners.iter_mut().enumerate() {
             if !listener.armed {
                 pending.push(recv_udp_inbound_entry(site, listener, self.fixed_files));
@@ -2038,7 +2043,7 @@ impl Engine {
         }
     }
 
-    pub fn arm(&mut self, pending: &mut Vec<squeue::Entry>) {
+    pub fn arm(&mut self, pending: &mut Vec<IoEntry>) {
         self.arm_accepts(pending);
         self.arm_udp_listeners(pending);
     }
@@ -2288,7 +2293,7 @@ impl Engine {
         }
     }
 
-    pub fn resume_due(&mut self, now: Instant, pending: &mut Vec<squeue::Entry>) {
+    pub fn resume_due(&mut self, now: Instant, pending: &mut Vec<IoEntry>) {
         while let Some(Reverse(entry @ (deadline, _, _, _))) = self.timers.peek().copied() {
             if deadline > now {
                 break;
@@ -2387,7 +2392,7 @@ impl Engine {
         &mut self,
         identifier: usize,
         state: &mut UdpAssociation,
-        pending: &mut Vec<squeue::Entry>,
+        pending: &mut Vec<IoEntry>,
     ) {
         if state.current_upload.is_none() {
             if let Some(upload) = state.upload_queue.pop_front() {
@@ -2418,7 +2423,7 @@ impl Engine {
         site_index: usize,
         client: SocketAddr,
         packet: &[u8],
-        pending: &mut Vec<squeue::Entry>,
+        pending: &mut Vec<IoEntry>,
     ) -> io::Result<()> {
         let cached_user = self.udp_user_cache.get(&(site_index, client)).copied();
         let mut decoded = decrypt_udp_packet(packet, &mut self.sites[site_index], cached_user)?;
@@ -2578,10 +2583,10 @@ impl Engine {
 
     pub fn handle_completion(
         &mut self,
-        ring: &mut IoUring,
+        driver: &mut IoDriver,
         user_data: u64,
         mut result: i32,
-        pending: &mut Vec<squeue::Entry>,
+        pending: &mut Vec<IoEntry>,
     ) -> io::Result<()> {
         let (id_or_site, operation) = decode_tag(user_data);
         if operation == OP_RECV_UDP_INBOUND {
@@ -2803,7 +2808,7 @@ impl Engine {
             let inbound_slot = self.fixed_file_base + (id * 2) as u32;
             let outbound_slot = inbound_slot + 1;
             if self.fixed_files {
-                register_file(ring, inbound_slot, inbound.as_raw_fd())?;
+                driver.register_file(inbound_slot, inbound.as_raw_fd())?;
             }
             let mut state = Connection {
                 _inbound: inbound,
@@ -2933,7 +2938,7 @@ impl Engine {
                                     state,
                                     target,
                                     tcp_nodelay,
-                                    ring,
+                                    driver,
                                     pending,
                                 )?;
                             }
@@ -2952,7 +2957,7 @@ impl Engine {
                     let site = &mut sites[state.site];
                     let target = process_encrypted(state, site, features, router)?;
                     if let Some(target) = target {
-                        start_target_connect(id, state, target, tcp_nodelay, ring, pending)?;
+                        start_target_connect(id, state, target, tcp_nodelay, driver, pending)?;
                     } else if state.connected
                         && state.upload_length != 0
                         && state.upload_ready_at.is_none()
@@ -3049,8 +3054,8 @@ impl Engine {
 
     pub fn finish_batch(
         &mut self,
-        ring: &mut IoUring,
-        pending: &mut Vec<squeue::Entry>,
+        driver: &mut IoDriver,
+        pending: &mut Vec<IoEntry>,
     ) -> io::Result<()> {
         let cleanup_pending = self.connections.iter().flatten().any(|state| state.closing)
             || self
@@ -3207,8 +3212,8 @@ impl Engine {
                     self.sites[state.site].prune_retired();
                 }
                 if state.fixed_files {
-                    unregister_file(ring, state.inbound_slot)?;
-                    unregister_file(ring, state.outbound_slot)?;
+                    driver.register_file(state.inbound_slot, -1)?;
+                    driver.register_file(state.outbound_slot, -1)?;
                 }
                 self.free_connections.push(identifier);
                 self.active_connections = self.active_connections.saturating_sub(1);
