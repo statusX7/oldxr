@@ -34,7 +34,7 @@ if [[ ! "${release_version}" =~ ^v?0\.9\.0-r[0-9]+$ ]]; then
     exit 2
 fi
 
-for tool in "${legacy_go_bin}" "${control_go_bin}" "${cargo_bin}" zip sha256sum; do
+for tool in "${legacy_go_bin}" "${control_go_bin}" "${cargo_bin}" file readelf zip sha256sum; do
     command -v "${tool}" >/dev/null 2>&1 || {
         echo "错误：构建工具不存在：${tool}" >&2
         exit 1
@@ -50,22 +50,49 @@ trap 'rm -rf "${stage_root}"' EXIT
 stage_dir="${stage_root}/build_assets"
 cargo_target_dir="${CARGO_TARGET_DIR:-${stage_root}/cargo-target}"
 mkdir -p "${stage_dir}" "${cargo_target_dir}"
+host_arch="$(uname -m)"
 
 case "${target_arch}" in
     amd64)
-        rust_target="x86_64-unknown-linux-gnu"
-        rust_binary_dir="${cargo_target_dir}/release"
+        rust_target="x86_64-unknown-linux-musl"
+        if [[ "${host_arch}" == "x86_64" ]]; then
+            default_musl_cc="musl-gcc"
+        else
+            default_musl_cc="x86_64-linux-musl-gcc"
+        fi
+        musl_cc="${X86_64_MUSL_CC:-${default_musl_cc}}"
+        musl_linker="${X86_64_MUSL_LINKER:-${musl_cc}}"
+        native_host=0
+        [[ "${host_arch}" == "x86_64" ]] && native_host=1
+        rust_cc_variable="CC_x86_64_unknown_linux_musl"
+        rust_linker_variable="CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER"
         ;;
     arm64)
-        rust_target="aarch64-unknown-linux-gnu"
-        rust_binary_dir="${cargo_target_dir}/${rust_target}/release"
-        cross_cc="${AARCH64_CC:-aarch64-linux-gnu-gcc}"
-        command -v "${cross_cc}" >/dev/null 2>&1 || {
-            echo "错误：arm64 FastEngine 交叉编译器不存在：${cross_cc}" >&2
-            exit 1
-        }
+        rust_target="aarch64-unknown-linux-musl"
+        if [[ "${host_arch}" =~ ^(aarch64|arm64)$ ]]; then
+            default_musl_cc="musl-gcc"
+        else
+            default_musl_cc="aarch64-linux-musl-gcc"
+        fi
+        musl_cc="${AARCH64_MUSL_CC:-${default_musl_cc}}"
+        musl_linker="${AARCH64_MUSL_LINKER:-${musl_cc}}"
+        native_host=0
+        [[ "${host_arch}" =~ ^(aarch64|arm64)$ ]] && native_host=1
+        rust_cc_variable="CC_aarch64_unknown_linux_musl"
+        rust_linker_variable="CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER"
         ;;
 esac
+rust_binary_dir="${cargo_target_dir}/${rust_target}/release"
+command -v "${musl_cc}" >/dev/null 2>&1 || {
+    echo "错误：${target_arch} FastEngine musl 编译器不存在：${musl_cc}" >&2
+    exit 1
+}
+if ((native_host == 0)); then
+    command -v "${musl_linker}" >/dev/null 2>&1 || {
+        echo "错误：${target_arch} FastEngine musl 链接器不存在：${musl_linker}" >&2
+        exit 1
+    }
+fi
 
 version_value="${release_version#v}"
 # Keep the legacy binary's Go symbol metadata so govulncheck can distinguish
@@ -94,19 +121,29 @@ echo "构建 ${target_os}/${target_arch} -> XrayR-${asset_name}.zip"
 )
 (
     cd "${repo_root}/fastengine"
-    if [[ "${target_arch}" == "arm64" ]]; then
-        env \
-            CARGO_TARGET_DIR="${cargo_target_dir}" \
-            CC_aarch64_unknown_linux_gnu="${cross_cc}" \
-            CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="${cross_cc}" \
-            "${cargo_bin}" build --release --locked --target "${rust_target}"
-    else
-        env CARGO_TARGET_DIR="${cargo_target_dir}" \
-            "${cargo_bin}" build --release --locked
+    rust_build_env=(
+        "CARGO_TARGET_DIR=${cargo_target_dir}"
+        "${rust_cc_variable}=${musl_cc}"
+        "RUSTFLAGS=-C target-feature=+crt-static"
+    )
+    if ((native_host == 0)); then
+        rust_build_env+=("${rust_linker_variable}=${musl_linker}")
     fi
+    env -u CARGO_ENCODED_RUSTFLAGS "${rust_build_env[@]}" \
+        "${cargo_bin}" build --release --locked --target "${rust_target}"
 )
 cp "${rust_binary_dir}/oldxr-phase7-fastvmess-uring" \
     "${stage_dir}/XrayR-fastengine"
+
+if readelf -l "${stage_dir}/XrayR-fastengine" | grep -q 'INTERP'; then
+    echo "错误：FastEngine Release 不应依赖动态 ELF interpreter。" >&2
+    exit 1
+fi
+if readelf -d "${stage_dir}/XrayR-fastengine" 2>/dev/null | grep -q '(NEEDED)'; then
+    echo "错误：FastEngine Release 仍包含动态 shared-library 依赖。" >&2
+    exit 1
+fi
+echo "FastEngine ELF：$(file -b "${stage_dir}/XrayR-fastengine")"
 
 for source in \
     README.md \
