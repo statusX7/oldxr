@@ -18,17 +18,17 @@ manager_file="${OLDXR_MANAGER_FILE:-/usr/bin/XrayR}"
 # check os
 if [[ -f /etc/redhat-release ]]; then
     release="centos"
-elif cat /etc/issue | grep -Eqi "debian"; then
+elif grep -Eqi "debian" /etc/issue; then
     release="debian"
-elif cat /etc/issue | grep -Eqi "ubuntu"; then
+elif grep -Eqi "ubuntu" /etc/issue; then
     release="ubuntu"
-elif cat /etc/issue | grep -Eqi "centos|red hat|redhat"; then
+elif grep -Eqi "centos|red hat|redhat" /etc/issue; then
     release="centos"
-elif cat /proc/version | grep -Eqi "debian"; then
+elif grep -Eqi "debian" /proc/version; then
     release="debian"
-elif cat /proc/version | grep -Eqi "ubuntu"; then
+elif grep -Eqi "ubuntu" /proc/version; then
     release="ubuntu"
-elif cat /proc/version | grep -Eqi "centos|red hat|redhat"; then
+elif grep -Eqi "centos|red hat|redhat" /proc/version; then
     release="centos"
 else
     echo -e "${red}未检测到系统版本，请联系脚本作者！${plain}\n" && exit 1
@@ -45,31 +45,31 @@ if [[ -z "$os_version" && -f /etc/lsb-release ]]; then
     os_version=$(awk -F'[= ."]+' '/DISTRIB_RELEASE/{print $2}' /etc/lsb-release)
 fi
 
-if [[ x"${release}" == x"centos" ]]; then
+if [[ "${release}" == "centos" ]]; then
     if [[ ${os_version} -le 6 ]]; then
         echo -e "${red}请使用 CentOS 7 或更高版本的系统！${plain}\n" && exit 1
     fi
-elif [[ x"${release}" == x"ubuntu" ]]; then
+elif [[ "${release}" == "ubuntu" ]]; then
     if [[ ${os_version} -lt 16 ]]; then
         echo -e "${red}请使用 Ubuntu 16 或更高版本的系统！${plain}\n" && exit 1
     fi
-elif [[ x"${release}" == x"debian" ]]; then
+elif [[ "${release}" == "debian" ]]; then
     if [[ ${os_version} -lt 8 ]]; then
         echo -e "${red}请使用 Debian 8 或更高版本的系统！${plain}\n" && exit 1
     fi
 fi
 
 confirm() {
-    if [[ $# > 1 ]]; then
-        echo && read -p "$1 [默认$2]: " temp
-        if [[ x"${temp}" == x"" ]]; then
+    if [[ $# -gt 1 ]]; then
+        echo && read -r -p "$1 [默认$2]: " temp
+        if [[ -z "${temp}" ]]; then
             temp=$2
         fi
     else
-        read -p "$1 [y/n]: " temp
+        read -r -p "$1 [y/n]: " temp
     fi
 
-    if [[ x"${temp}" == x"y" || x"${temp}" == x"Y" ]]; then
+    if [[ "${temp}" == "y" || "${temp}" == "Y" ]]; then
         return 0
     else
         return 1
@@ -77,8 +77,7 @@ confirm() {
 }
 
 confirm_restart() {
-    confirm "是否重启XrayR" "y"
-    if [[ $? == 0 ]]; then
+    if confirm "是否重启XrayR" "y"; then
         restart
     else
         show_menu
@@ -86,7 +85,7 @@ confirm_restart() {
 }
 
 before_show_menu() {
-    echo && echo -n -e "${yellow}按回车返回主菜单: ${plain}" && read temp
+    echo && echo -n -e "${yellow}按回车返回主菜单: ${plain}" && read -r temp
     show_menu
 }
 
@@ -105,8 +104,7 @@ run_installer() {
 }
 
 install() {
-    run_installer 0.9.0
-    if [[ $? == 0 ]]; then
+    if run_installer 0.9.0; then
         if [[ $# == 0 ]]; then
             start
         else
@@ -117,7 +115,7 @@ install() {
 
 update() {
     if [[ $# == 0 ]]; then
-        echo && echo -n -e "输入指定版本(默认最新版): " && read version
+        echo && echo -n -e "输入指定版本(默认最新版): " && read -r version
     else
         version=$2
     fi
@@ -131,8 +129,7 @@ update() {
     #     return 0
     # fi
 
-    run_installer "${version:-0.9.0}"
-    if [[ $? == 0 ]]; then
+    if run_installer "${version:-0.9.0}"; then
         echo -e "${green}更新完成，已自动重启 XrayR，请使用 XrayR log 查看运行日志${plain}"
         exit
     fi
@@ -153,7 +150,7 @@ config() {
         ;;
     1)
         echo -e "检测到您未启动XrayR或XrayR自动重启失败，是否查看日志？[Y/n]" && echo
-        read -e -p "(默认: y):" yn
+        read -e -r -p "(默认: y):" yn
         [[ -z ${yn} ]] && yn="y"
         if [[ ${yn} == [Yy] ]]; then
             show_log
@@ -166,8 +163,7 @@ config() {
 }
 
 uninstall() {
-    confirm "确定要卸载 XrayR 吗?" "n"
-    if [[ $? != 0 ]]; then
+    if ! confirm "确定要卸载 XrayR 吗?" "n"; then
         if [[ $# == 0 ]]; then
             show_menu
         fi
@@ -192,15 +188,13 @@ uninstall() {
 }
 
 start() {
-    check_status
-    if [[ $? == 0 ]]; then
+    if check_status; then
         echo ""
         echo -e "${green}XrayR已运行，无需再次启动，如需重启请选择重启${plain}"
     else
         systemctl start XrayR
         sleep 2
-        check_status
-        if [[ $? == 0 ]]; then
+        if check_status; then
             echo -e "${green}XrayR 启动成功，请使用 XrayR log 查看运行日志${plain}"
         else
             echo -e "${red}XrayR可能启动失败，请稍后使用 XrayR log 查看日志信息${plain}"
@@ -215,8 +209,7 @@ start() {
 stop() {
     systemctl stop XrayR
     sleep 2
-    check_status
-    if [[ $? == 1 ]]; then
+    if ! check_status; then
         echo -e "${green}XrayR 停止成功${plain}"
     else
         echo -e "${red}XrayR停止失败，可能是因为停止时间超过了两秒，请稍后查看日志信息${plain}"
@@ -230,8 +223,7 @@ stop() {
 restart() {
     systemctl restart XrayR
     sleep 2
-    check_status
-    if [[ $? == 0 ]]; then
+    if check_status; then
         echo -e "${green}XrayR 重启成功，请使用 XrayR log 查看运行日志${plain}"
     else
         echo -e "${red}XrayR可能启动失败，请稍后使用 XrayR log 查看日志信息${plain}"
@@ -251,8 +243,7 @@ status() {
 }
 
 enable() {
-    systemctl enable XrayR
-    if [[ $? == 0 ]]; then
+    if systemctl enable XrayR; then
         echo -e "${green}XrayR 设置开机自启成功${plain}"
     else
         echo -e "${red}XrayR 设置开机自启失败${plain}"
@@ -264,8 +255,7 @@ enable() {
 }
 
 disable() {
-    systemctl disable XrayR
-    if [[ $? == 0 ]]; then
+    if systemctl disable XrayR; then
         echo -e "${green}XrayR 取消开机自启成功${plain}"
     else
         echo -e "${red}XrayR 取消开机自启失败${plain}"
@@ -297,8 +287,7 @@ install_bbr() {
 }
 
 update_shell() {
-    wget -O "${manager_file}" "${raw_base}/XrayR.sh"
-    if [[ $? != 0 ]]; then
+    if ! wget -O "${manager_file}" "${raw_base}/XrayR.sh"; then
         echo ""
         echo -e "${red}下载脚本失败，请检查本机能否连接 Github${plain}"
         before_show_menu
@@ -314,7 +303,7 @@ check_status() {
         return 2
     fi
     temp=$(systemctl status XrayR | grep Active | awk '{print $3}' | cut -d "(" -f2 | cut -d ")" -f1)
-    if [[ x"${temp}" == x"running" ]]; then
+    if [[ "${temp}" == "running" ]]; then
         return 0
     else
         return 1
@@ -323,7 +312,7 @@ check_status() {
 
 check_enabled() {
     temp=$(systemctl is-enabled XrayR)
-    if [[ x"${temp}" == x"enabled" ]]; then
+    if [[ "${temp}" == "enabled" ]]; then
         return 0
     else
         return 1
@@ -332,7 +321,8 @@ check_enabled() {
 
 check_uninstall() {
     check_status
-    if [[ $? != 2 ]]; then
+    local status_code=$?
+    if [[ ${status_code} -ne 2 ]]; then
         echo ""
         echo -e "${red}XrayR已安装，请不要重复安装${plain}"
         if [[ $# == 0 ]]; then
@@ -349,7 +339,8 @@ check_install() {
         return 0
     fi
     check_status
-    if [[ $? == 2 ]]; then
+    local status_code=$?
+    if [[ ${status_code} -eq 2 ]]; then
         echo ""
         echo -e "${red}请先安装XrayR${plain}"
         if [[ $# == 0 ]]; then
@@ -379,8 +370,7 @@ show_status() {
 }
 
 show_enable_status() {
-    check_enabled
-    if [[ $? == 0 ]]; then
+    if check_enabled; then
         echo -e "是否开机自启: ${green}是${plain}"
     else
         echo -e "是否开机自启: ${red}否${plain}"
@@ -441,7 +431,7 @@ show_menu() {
 "
     #后续更新可加入上方字符串中
     show_status
-    echo && read -p "请输入选择 [0-13]: " num
+    echo && read -r -p "请输入选择 [0-13]: " num
 
     case "${num}" in
     0) config ;;
@@ -462,7 +452,7 @@ show_menu() {
     esac
 }
 
-if [[ $# > 0 ]]; then
+if [[ $# -gt 0 ]]; then
     case $1 in
     "start") check_install 0 && start 0 ;;
     "stop") check_install 0 && stop 0 ;;
@@ -472,7 +462,7 @@ if [[ $# > 0 ]]; then
     "disable") check_install 0 && disable 0 ;;
     "log") check_install 0 && show_log 0 ;;
     "update") check_install 0 && update 0 "${2:-0.9.0}" ;;
-    "config") config $* ;;
+    "config") config "$@" ;;
     "install") check_uninstall 0 && install 0 ;;
     "uninstall") check_install 0 && uninstall 0 ;;
     "version") check_install 0 && show_XrayR_version 0 ;;
