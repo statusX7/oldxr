@@ -11,33 +11,105 @@ pub struct RawSocketAddress {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedTarget {
-    pub address: SocketAddr,
+    pub address: Option<SocketAddr>,
     pub host: String,
+    port: u16,
 }
 
 impl ResolvedTarget {
     pub fn from_ip(address: SocketAddr) -> Self {
         Self {
             host: address.ip().to_string(),
-            address,
+            address: Some(address),
+            port: address.port(),
         }
     }
 
-    pub fn resolve(host: &str, port: u16) -> io::Result<Self> {
+    pub fn from_domain(host: &str, port: u16) -> io::Result<Self> {
+        if host.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "target name is empty",
+            ));
+        }
         Ok(Self {
-            address: resolve_target(host, port)?,
+            address: None,
             host: host.to_owned(),
+            port,
         })
     }
 
-    pub fn resolve_ipv6(&self) -> io::Result<Self> {
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn require_address(&self) -> io::Result<SocketAddr> {
+        self.address.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "target name has not been resolved",
+            )
+        })
+    }
+
+    pub fn resolve_all(&self) -> io::Result<Vec<SocketAddr>> {
+        if let Some(address) = self.address {
+            return Ok(vec![address]);
+        }
+        resolve_targets(&self.host, self.port)
+    }
+
+    pub fn resolve_default_from(&self, addresses: Option<&[SocketAddr]>) -> io::Result<Self> {
+        if self.address.is_some() {
+            return Ok(self.clone());
+        }
+        let owned;
+        let addresses = match addresses {
+            Some(addresses) => addresses,
+            None => {
+                owned = self.resolve_all()?;
+                &owned
+            }
+        };
+        let address = addresses
+            .iter()
+            .copied()
+            .find(SocketAddr::is_ipv4)
+            .or_else(|| addresses.first().copied())
+            .ok_or_else(|| io::Error::other("target name has no address"))?;
+        Ok(Self {
+            address: Some(address),
+            host: self.host.clone(),
+            port: self.port,
+        })
+    }
+
+    pub fn resolve_ipv6_from(&self, addresses: Option<&[SocketAddr]>) -> io::Result<Self> {
         if self.host.parse::<IpAddr>().is_ok() {
             return Ok(self.clone());
         }
+        let owned;
+        let addresses = match addresses {
+            Some(addresses) => addresses,
+            None => {
+                owned = self.resolve_all()?;
+                &owned
+            }
+        };
+        let address = addresses
+            .iter()
+            .copied()
+            .find(SocketAddr::is_ipv6)
+            .ok_or_else(|| io::Error::other("target name has no IPv6 address"))?;
         Ok(Self {
-            address: resolve_target_ipv6(&self.host, self.address.port())?,
+            address: Some(address),
             host: self.host.clone(),
+            port: self.port,
         })
+    }
+
+    pub fn same_destination(&self, other: &Self) -> bool {
+        self.port == other.port && self.host.eq_ignore_ascii_case(&other.host)
     }
 }
 
@@ -145,25 +217,17 @@ pub fn peer_ip(descriptor: RawFd) -> io::Result<IpAddr> {
     Ok(socket_address(&storage)?.ip())
 }
 
-/// Preserve the former IPv4 preference for dual-stack names while accepting
-/// IPv6-only names and literal IPv6 destinations.
-pub fn resolve_target(host: &str, port: u16) -> io::Result<SocketAddr> {
-    let mut ipv6 = None;
+pub fn resolve_targets(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    let mut addresses = Vec::new();
     for address in (host, port).to_socket_addrs()? {
-        match address {
-            SocketAddr::V4(_) => return Ok(address),
-            SocketAddr::V6(_) if ipv6.is_none() => ipv6 = Some(address),
-            SocketAddr::V6(_) => {}
+        if !addresses.contains(&address) {
+            addresses.push(address);
         }
     }
-    ipv6.ok_or_else(|| io::Error::other("target name has no address"))
-}
-
-pub fn resolve_target_ipv6(host: &str, port: u16) -> io::Result<SocketAddr> {
-    (host, port)
-        .to_socket_addrs()?
-        .find(SocketAddr::is_ipv6)
-        .ok_or_else(|| io::Error::other("target name has no IPv6 address"))
+    if addresses.is_empty() {
+        return Err(io::Error::other("target name has no address"));
+    }
+    Ok(addresses)
 }
 
 #[cfg(test)]
@@ -189,7 +253,14 @@ mod tests {
             "[2001:db8::1]:443".parse().unwrap(),
         ] {
             let target = ResolvedTarget::from_ip(address);
-            assert_eq!(target.resolve_ipv6().unwrap(), target);
+            assert_eq!(target.resolve_ipv6_from(None).unwrap(), target);
         }
+    }
+
+    #[test]
+    fn domain_targets_are_not_resolved_during_parsing() {
+        let target = ResolvedTarget::from_domain("does-not-exist.invalid", 443).unwrap();
+        assert_eq!(target.address, None);
+        assert_eq!(target.port(), 443);
     }
 }

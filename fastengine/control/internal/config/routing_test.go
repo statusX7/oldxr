@@ -185,3 +185,39 @@ func TestPrivateCIDRsMatchPackagedPhase8GeoData(t *testing.T) {
 		t.Fatalf("private CIDRs changed: %#v", privateCIDRs)
 	}
 }
+
+func FuzzCompilePortsNeverPanics(f *testing.F) {
+	for _, seed := range [][]byte{
+		[]byte(`"22,23-25,443"`),
+		[]byte(`65535`),
+		[]byte(`"0-65536"`),
+		[]byte(`null`),
+		[]byte(`{"unexpected":true}`),
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		if len(raw) > 4096 {
+			t.Skip()
+		}
+		_, _ = compilePorts(raw)
+	})
+}
+
+func FuzzCompileCIDRsNeverPanics(f *testing.F) {
+	for _, seed := range []string{
+		"geoip:private",
+		"10.0.0.0/8",
+		"2001:db8::/32",
+		"127.0.0.1",
+		"not-a-prefix",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, value string) {
+		if len(value) > 4096 {
+			t.Skip()
+		}
+		_, _ = compileCIDRs([]string{value})
+	})
+}

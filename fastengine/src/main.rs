@@ -2057,7 +2057,12 @@ fn ensure_target_connect(
     driver: &mut IoDriver,
     pending: &mut Vec<IoEntry>,
 ) -> io::Result<()> {
-    if state.target.is_some() || state.target_address.is_none() {
+    let has_logical_target = if state.target_udp {
+        state.xudp_target.is_some()
+    } else {
+        state.tcp_target.is_some()
+    };
+    if state.target.is_some() || !has_logical_target {
         return Ok(());
     }
     if !state.rule_checked {
@@ -2071,7 +2076,7 @@ fn ensure_target_connect(
             })?
         };
         let network = if state.target_udp { "udp" } else { "tcp" };
-        let destination = format!("{network}:{}:{}", target.host, target.address.port());
+        let destination = format!("{network}:{}:{}", target.host, target.port());
         if features.rule
             && site
                 .rules
@@ -2093,8 +2098,9 @@ fn ensure_target_connect(
             target,
             state.sniff.protocols() | state.route_protocols,
         )?;
-        state.target_endpoint = Some(routed.address);
-        state.target_address = Some(Box::new(RawSocketAddress::new(routed.address)));
+        let address = routed.require_address()?;
+        state.target_endpoint = Some(address);
+        state.target_address = Some(Box::new(RawSocketAddress::new(address)));
         if state.target_udp {
             state.xudp_target = Some(routed);
         } else {
@@ -2125,11 +2131,13 @@ fn set_vmess_tcp_target(state: &mut Connection, decision: SniffDecision) -> io::
     let target = match decision {
         SniffDecision::NeedMore => return Ok(false),
         SniffDecision::Original => original.clone(),
-        SniffDecision::Override(host) => ResolvedTarget::resolve(&host, original.address.port())?,
+        SniffDecision::Override(host) => ResolvedTarget::from_domain(&host, original.port())?,
     };
     state.pending_target = None;
-    state.target_endpoint = Some(target.address);
-    state.target_address = Some(Box::new(RawSocketAddress::new(target.address)));
+    state.target_endpoint = target.address;
+    state.target_address = target
+        .address
+        .map(|address| Box::new(RawSocketAddress::new(address)));
     state.tcp_target = Some(target);
     state.rule_checked = false;
     Ok(true)
@@ -2463,7 +2471,7 @@ fn decode_xudp_frame(input: &[u8]) -> io::Result<XudpFrame> {
                     io::Error::new(io::ErrorKind::InvalidData, "invalid XUDP domain")
                 })?;
                 cursor += length;
-                ResolvedTarget::resolve(host, port)?
+                ResolvedTarget::from_domain(host, port)?
             }
             3 => {
                 if cursor + 16 > metadata_end {
@@ -2531,7 +2539,8 @@ fn prepend_xudp_response(
     session_id: u16,
     target: &ResolvedTarget,
 ) -> io::Result<(usize, usize)> {
-    let address_length = match target.address {
+    let target_address = target.require_address()?;
+    let address_length = match target_address {
         SocketAddr::V4(_) => 1 + 4,
         SocketAddr::V6(_) => 1 + 16,
     };
@@ -2548,9 +2557,9 @@ fn prepend_xudp_response(
     output[start + 4] = 2; // Keep
     output[start + 5] = 1; // Data
     output[start + 6] = 2; // UDP
-    output[start + 7..start + 9].copy_from_slice(&target.address.port().to_be_bytes());
+    output[start + 7..start + 9].copy_from_slice(&target_address.port().to_be_bytes());
     let address_start = start + 9;
-    let address_end = match target.address {
+    let address_end = match target_address {
         SocketAddr::V4(address) => {
             output[address_start] = 1;
             output[address_start + 1..address_start + 5].copy_from_slice(&address.ip().octets());
@@ -2764,7 +2773,7 @@ fn next_upload_entry(
                             if state
                                 .xudp_target
                                 .as_ref()
-                                .is_some_and(|current| current.address != target.address)
+                                .is_some_and(|current| !current.same_destination(&target))
                             {
                                 return Err(io::Error::new(
                                     io::ErrorKind::Unsupported,
@@ -2772,10 +2781,11 @@ fn next_upload_entry(
                                 ));
                             }
                             state.xudp_session_id = session_id;
-                            state.target_endpoint = Some(target.address);
+                            state.target_endpoint = target.address;
                             if state.target_address.is_none() {
-                                state.target_address =
-                                    Some(Box::new(RawSocketAddress::new(target.address)));
+                                state.target_address = target
+                                    .address
+                                    .map(|address| Box::new(RawSocketAddress::new(address)));
                             }
                             state.xudp_target = Some(target);
                             (start + payload_start, payload_length)
@@ -3817,16 +3827,18 @@ fn main() -> io::Result<()> {
                                 let xudp = command == VmessCommand::Mux;
                                 if let Some(target) = target {
                                     if target_udp {
-                                        state.target_endpoint = Some(target.address);
-                                        state.target_address =
-                                            Some(Box::new(RawSocketAddress::new(target.address)));
+                                        state.target_endpoint = target.address;
+                                        state.target_address = target.address.map(|address| {
+                                            Box::new(RawSocketAddress::new(address))
+                                        });
                                         state.xudp_target = Some(target);
                                     } else if site.sniffing || router.needs_bittorrent() {
                                         state.pending_target = Some(target);
                                     } else {
-                                        state.target_endpoint = Some(target.address);
-                                        state.target_address =
-                                            Some(Box::new(RawSocketAddress::new(target.address)));
+                                        state.target_endpoint = target.address;
+                                        state.target_address = target.address.map(|address| {
+                                            Box::new(RawSocketAddress::new(address))
+                                        });
                                         state.tcp_target = Some(target);
                                     }
                                 }
@@ -4733,7 +4745,7 @@ mod runtime_tests {
         match decode_xudp_frame(&frame).expect("IPv6 XUDP frame") {
             XudpFrame::Data { target, .. } => assert_eq!(
                 target.expect("target").address,
-                "[2001:db8::7]:5353".parse().unwrap()
+                Some("[2001:db8::7]:5353".parse().unwrap())
             ),
             XudpFrame::End => panic!("expected data frame"),
         }

@@ -330,7 +330,7 @@ fn parse_target(input: &[u8], cursor: &mut usize, port: u16) -> io::Result<Resol
             let host = std::str::from_utf8(&input[*cursor..*cursor + length])
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid VMess domain"))?;
             *cursor += length;
-            ResolvedTarget::resolve(host, port)
+            ResolvedTarget::from_domain(host, port)
         }
         3 => {
             if *cursor + 16 > input.len() {
@@ -857,14 +857,15 @@ mod tests {
         let mut cursor = 0;
         let target = parse_target(&domain, &mut cursor, 443).expect("domain target");
         assert_eq!(target.host, "localhost");
-        assert_eq!(target.address.port(), 443);
+        assert_eq!(target.address, None);
+        assert_eq!(target.port(), 443);
         assert_eq!(cursor, domain.len());
 
         let mut ipv6 = vec![3];
         ipv6.extend_from_slice(&"2001:db8::7".parse::<Ipv6Addr>().unwrap().octets());
         let mut cursor = 0;
         let target = parse_target(&ipv6, &mut cursor, 8443).expect("IPv6 target");
-        assert_eq!(target.address, "[2001:db8::7]:8443".parse().unwrap());
+        assert_eq!(target.address, Some("[2001:db8::7]:8443".parse().unwrap()));
         assert_eq!(target.host, "2001:db8::7");
         assert_eq!(cursor, ipv6.len());
     }

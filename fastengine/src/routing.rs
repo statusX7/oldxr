@@ -160,7 +160,7 @@ struct Rule {
 }
 
 impl Rule {
-    fn matches(&self, input: RouteInput) -> bool {
+    fn matches_without_addresses(&self, input: RouteInput) -> bool {
         if self.networks & input.network == 0 {
             return false;
         }
@@ -172,26 +172,34 @@ impl Rule {
         {
             return false;
         }
-        if !self.prefixes.is_empty()
-            && !input
-                .addresses
-                .iter()
-                .any(|&address| self.prefixes.iter().any(|prefix| prefix.contains(address)))
-        {
-            return false;
-        }
         if self.protocols != 0 && self.protocols & input.protocols == 0 {
             return false;
         }
         true
     }
+
+    #[cfg(test)]
+    fn matches_addresses(&self, addresses: &[IpAddr]) -> bool {
+        self.prefixes.is_empty()
+            || addresses
+                .iter()
+                .any(|&address| self.prefixes.iter().any(|prefix| prefix.contains(address)))
+    }
+
+    fn matches_socket_addresses(&self, addresses: &[std::net::SocketAddr]) -> bool {
+        self.prefixes.is_empty()
+            || addresses.iter().any(|address| {
+                self.prefixes
+                    .iter()
+                    .any(|prefix| prefix.contains(address.ip()))
+            })
+    }
 }
 
 #[derive(Clone, Copy)]
-pub struct RouteInput<'a> {
+pub struct RouteInput {
     pub network: u8,
     pub port: u16,
-    pub addresses: &'a [IpAddr],
     pub protocols: u8,
 }
 
@@ -320,11 +328,12 @@ impl Router {
         })
     }
 
-    pub fn pick(&self, input: RouteInput<'_>) -> &OutboundConfig {
+    #[cfg(test)]
+    fn pick(&self, input: RouteInput, addresses: &[IpAddr]) -> &OutboundConfig {
         let outbound = self
             .rules
             .iter()
-            .find(|rule| rule.matches(input))
+            .find(|rule| rule.matches_without_addresses(input) && rule.matches_addresses(addresses))
             .map_or(self.default_outbound, |rule| rule.outbound);
         &self.outbounds[usize::from(outbound)]
     }
@@ -339,20 +348,40 @@ impl Router {
         target: &ResolvedTarget,
         protocols: u8,
     ) -> io::Result<ResolvedTarget> {
-        let address = target.address.ip();
-        let addresses = if self.domain_strategy == DomainStrategy::IpOnDemand
-            || target.host.parse::<IpAddr>().is_ok()
-        {
-            std::slice::from_ref(&address)
-        } else {
-            &[]
-        };
-        let outbound = self.pick(RouteInput {
-            network,
-            port: target.address.port(),
-            addresses,
-            protocols,
-        });
+        let mut resolved = None;
+        let mut resolution_attempted = target.address.is_some();
+        let mut outbound_index = self.default_outbound;
+        for rule in &self.rules {
+            let input = RouteInput {
+                network,
+                port: target.port(),
+                protocols,
+            };
+            if !rule.matches_without_addresses(input) {
+                continue;
+            }
+            if !rule.prefixes.is_empty() {
+                if !resolution_attempted && self.domain_strategy == DomainStrategy::IpOnDemand {
+                    resolution_attempted = true;
+                    if let Ok(addresses) = target.resolve_all() {
+                        resolved = Some(addresses);
+                    }
+                }
+                let matches = target.address.is_some_and(|address| {
+                    rule.prefixes
+                        .iter()
+                        .any(|prefix| prefix.contains(address.ip()))
+                }) || resolved
+                    .as_deref()
+                    .is_some_and(|addresses| rule.matches_socket_addresses(addresses));
+                if !matches {
+                    continue;
+                }
+            }
+            outbound_index = rule.outbound;
+            break;
+        }
+        let outbound = &self.outbounds[usize::from(outbound_index)];
         if outbound.action == OutboundAction::Blackhole {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -360,8 +389,8 @@ impl Router {
             ));
         }
         match outbound.domain_strategy {
-            OutboundDomainStrategy::AsIs => Ok(target.clone()),
-            OutboundDomainStrategy::UseIpv6 => target.resolve_ipv6(),
+            OutboundDomainStrategy::AsIs => target.resolve_default_from(resolved.as_deref()),
+            OutboundDomainStrategy::UseIpv6 => target.resolve_ipv6_from(resolved.as_deref()),
         }
     }
 }
@@ -428,24 +457,28 @@ mod tests {
         let private = [IpAddr::V4(Ipv4Addr::new(10, 2, 3, 4))];
         assert_eq!(
             router
-                .pick(RouteInput {
-                    network: NETWORK_TCP,
-                    port: 443,
-                    addresses: &private,
-                    protocols: 0,
-                })
+                .pick(
+                    RouteInput {
+                        network: NETWORK_TCP,
+                        port: 443,
+                        protocols: 0,
+                    },
+                    &private
+                )
                 .action,
             OutboundAction::Blackhole
         );
         let public = [IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))];
         assert_eq!(
             router
-                .pick(RouteInput {
-                    network: NETWORK_TCP,
-                    port: 443,
-                    addresses: &public,
-                    protocols: 0,
-                })
+                .pick(
+                    RouteInput {
+                        network: NETWORK_TCP,
+                        port: 443,
+                        protocols: 0,
+                    },
+                    &public
+                )
                 .tag,
             "IPv4_out"
         );
@@ -459,27 +492,30 @@ mod tests {
             RouteInput {
                 network: NETWORK_TCP,
                 port: 443,
-                addresses: &public,
                 protocols: PROTOCOL_BITTORRENT,
             },
             RouteInput {
                 network: NETWORK_UDP,
                 port: 22,
-                addresses: &public,
                 protocols: 0,
             },
         ] {
-            assert_eq!(router.pick(input).action, OutboundAction::Blackhole);
+            assert_eq!(
+                router.pick(input, &public).action,
+                OutboundAction::Blackhole
+            );
         }
         let private = [IpAddr::V6(Ipv6Addr::from_str("fd00::1").unwrap())];
         assert_eq!(
             router
-                .pick(RouteInput {
-                    network: NETWORK_UDP,
-                    port: 53,
-                    addresses: &private,
-                    protocols: 0,
-                })
+                .pick(
+                    RouteInput {
+                        network: NETWORK_UDP,
+                        port: 53,
+                        protocols: 0,
+                    },
+                    &private
+                )
                 .action,
             OutboundAction::Blackhole
         );
@@ -526,5 +562,92 @@ mod tests {
             router.route_target(NETWORK_TCP, &literal, 0).unwrap(),
             literal
         );
+    }
+
+    #[test]
+    fn ip_on_demand_resolves_only_when_an_ip_rule_is_reached() {
+        let router = Router::compile(PlanConfig {
+            domain_strategy: DomainStrategy::IpOnDemand,
+            default_outbound: 0,
+            outbounds: vec![
+                OutboundConfig {
+                    tag: "direct".into(),
+                    action: OutboundAction::Direct,
+                    domain_strategy: OutboundDomainStrategy::AsIs,
+                },
+                OutboundConfig {
+                    tag: "block".into(),
+                    action: OutboundAction::Blackhole,
+                    domain_strategy: OutboundDomainStrategy::AsIs,
+                },
+            ],
+            rules: vec![
+                RuleConfig {
+                    outbound: 1,
+                    networks: NETWORK_TCP,
+                    network_constraint: false,
+                    ports: vec![PortRangeConfig { from: 22, to: 22 }],
+                    cidrs: Vec::new(),
+                    protocols: 0,
+                },
+                RuleConfig {
+                    outbound: 1,
+                    networks: NETWORK_TCP,
+                    network_constraint: false,
+                    ports: Vec::new(),
+                    cidrs: vec!["127.0.0.0/8".into(), "::1/128".into()],
+                    protocols: 0,
+                },
+            ],
+        })
+        .unwrap();
+
+        let unresolvable = ResolvedTarget::from_domain("invalid target name", 22).unwrap();
+        assert_eq!(
+            router
+                .route_target(NETWORK_TCP, &unresolvable, 0)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let private = ResolvedTarget::from_domain("localhost", 443).unwrap();
+        assert_eq!(
+            router
+                .route_target(NETWORK_TCP, &private, 0)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let unresolved_direct = ResolvedTarget::from_domain("invalid target name", 443).unwrap();
+        assert!(router
+            .route_target(NETWORK_TCP, &unresolved_direct, 0)
+            .is_err());
+    }
+
+    #[test]
+    fn use_ipv6_reuses_ip_on_demand_results() {
+        let router = Router::compile(PlanConfig {
+            domain_strategy: DomainStrategy::IpOnDemand,
+            default_outbound: 0,
+            outbounds: vec![OutboundConfig {
+                tag: "IPv6_out".into(),
+                action: OutboundAction::Direct,
+                domain_strategy: OutboundDomainStrategy::UseIpv6,
+            }],
+            rules: vec![RuleConfig {
+                outbound: 0,
+                networks: NETWORK_TCP,
+                network_constraint: false,
+                ports: Vec::new(),
+                cidrs: vec!["0.0.0.0/0".into(), "::/0".into()],
+                protocols: 0,
+            }],
+        })
+        .unwrap();
+        let target = ResolvedTarget::from_domain("localhost", 443).unwrap();
+        let routed = router.route_target(NETWORK_TCP, &target, 0).unwrap();
+        assert!(routed.require_address().unwrap().is_ipv6());
     }
 }

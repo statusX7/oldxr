@@ -1,8 +1,6 @@
 use crate::accounting::complete_record_write;
 use crate::diagnostics::{connection_error, ErrorScope};
-use crate::netaddr::{
-    peer_ip, resolve_target, socket_address, socket_domain, RawSocketAddress, ResolvedTarget,
-};
+use crate::netaddr::{peer_ip, socket_address, socket_domain, RawSocketAddress, ResolvedTarget};
 use crate::routing::{Router, NETWORK_TCP, NETWORK_UDP};
 use crate::sniff::{Decision as SniffDecision, State as SniffState};
 use crate::timeout::{TcpTimeoutState, TcpTimeouts};
@@ -1365,7 +1363,7 @@ fn build_sites(
         .collect()
 }
 
-fn parse_target(payload: &[u8]) -> io::Result<(SocketAddr, String, usize)> {
+fn parse_target(payload: &[u8]) -> io::Result<(ResolvedTarget, usize)> {
     let atyp = *payload
         .first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty SS target"))?;
@@ -1380,8 +1378,7 @@ fn parse_target(payload: &[u8]) -> io::Result<(SocketAddr, String, usize)> {
             let address = Ipv4Addr::new(payload[1], payload[2], payload[3], payload[4]);
             let port = u16::from_be_bytes([payload[5], payload[6]]);
             Ok((
-                SocketAddr::new(IpAddr::V4(address), port),
-                address.to_string(),
+                ResolvedTarget::from_ip(SocketAddr::new(IpAddr::V4(address), port)),
                 7,
             ))
         }
@@ -1399,8 +1396,7 @@ fn parse_target(payload: &[u8]) -> io::Result<(SocketAddr, String, usize)> {
             let host = std::str::from_utf8(&payload[2..2 + length])
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid target name"))?;
             let port = u16::from_be_bytes([payload[2 + length], payload[3 + length]]);
-            let address = resolve_target(host, port)?;
-            Ok((address, host.to_owned(), header_length))
+            Ok((ResolvedTarget::from_domain(host, port)?, header_length))
         }
         4 => {
             if payload.len() < UDP_IPV6_HEADER_LEN {
@@ -1412,8 +1408,7 @@ fn parse_target(payload: &[u8]) -> io::Result<(SocketAddr, String, usize)> {
             let address = Ipv6Addr::from(<[u8; 16]>::try_from(&payload[1..17]).unwrap());
             let port = u16::from_be_bytes([payload[17], payload[18]]);
             Ok((
-                SocketAddr::new(IpAddr::V6(address), port),
-                address.to_string(),
+                ResolvedTarget::from_ip(SocketAddr::new(IpAddr::V6(address), port)),
                 UDP_IPV6_HEADER_LEN,
             ))
         }
@@ -1426,8 +1421,7 @@ fn parse_target(payload: &[u8]) -> io::Result<(SocketAddr, String, usize)> {
 
 struct DecryptedUdpPacket {
     user: usize,
-    target: SocketAddr,
-    host: String,
+    target: ResolvedTarget,
     payload: Box<[u8]>,
 }
 
@@ -1486,11 +1480,10 @@ fn decrypt_udp_packet(
             "SS UDP replay rejected",
         ));
     }
-    let (target, host, header_length) = parse_target(&trial[..plaintext_length])?;
+    let (target, header_length) = parse_target(&trial[..plaintext_length])?;
     Ok(DecryptedUdpPacket {
         user,
         target,
-        host,
         payload: trial[header_length..plaintext_length]
             .to_vec()
             .into_boxed_slice(),
@@ -1636,10 +1629,10 @@ fn finalize_pending_target(
             return Ok(None);
         }
         SniffDecision::Original => original.clone(),
-        SniffDecision::Override(host) => ResolvedTarget::resolve(&host, original.address.port())?,
+        SniffDecision::Override(host) => ResolvedTarget::from_domain(&host, original.port())?,
     };
     connection.pending_target = None;
-    let destination = format!("tcp:{}:{}", target.host, target.address.port());
+    let destination = format!("tcp:{}:{}", target.host, target.port());
     if features.rule
         && (site
             .blocked_hosts
@@ -1656,7 +1649,7 @@ fn finalize_pending_target(
         ));
     }
     match router.route_target(NETWORK_TCP, &target, connection.sniff.protocols()) {
-        Ok(target) => Ok(Some(target.address)),
+        Ok(target) => Ok(Some(target.require_address()?)),
         Err(error) => {
             if error.kind() == io::ErrorKind::PermissionDenied {
                 site.rule_rejects = site.rule_rejects.saturating_add(1);
@@ -1772,8 +1765,7 @@ fn process_encrypted(
                     "SS replay rejected",
                 ));
             }
-            let (address, host, header_length) =
-                parse_target(&connection.input[start..start + length])?;
+            let (target, header_length) = parse_target(&connection.input[start..start + length])?;
             if features.device {
                 let devices = &mut site.users[user_index].device_ips;
                 if site.device_limit != 0
@@ -1800,7 +1792,7 @@ fn process_encrypted(
             );
             extend_deadline(&mut connection.upload_ready_at, wait);
             append_upload_from_input(connection, payload_start, payload_length)?;
-            connection.pending_target = Some(ResolvedTarget { address, host });
+            connection.pending_target = Some(target);
             connection.header_complete = true;
             connection.timeout.authenticated(Instant::now());
         } else {
@@ -2431,11 +2423,11 @@ impl Engine {
     ) -> io::Result<()> {
         let cached_user = self.udp_user_cache.get(&(site_index, client)).copied();
         let mut decoded = decrypt_udp_packet(packet, &mut self.sites[site_index], cached_user)?;
-        let destination = format!("udp:{}:{}", decoded.host, decoded.target.port());
+        let destination = format!("udp:{}:{}", decoded.target.host, decoded.target.port());
         if self.features.rule
             && (self.sites[site_index]
                 .blocked_hosts
-                .contains(&decoded.host.to_ascii_lowercase())
+                .contains(&decoded.target.host.to_ascii_lowercase())
                 || self.sites[site_index]
                     .rules
                     .as_ref()
@@ -2448,13 +2440,9 @@ impl Engine {
                 "SS UDP rule rejected target",
             ));
         }
-        let original = ResolvedTarget {
-            address: decoded.target,
-            host: decoded.host.clone(),
-        };
         let routed = match self.router.route_target(
             NETWORK_UDP,
-            &original,
+            &decoded.target,
             crate::sniff::udp_protocols(&decoded.payload),
         ) {
             Ok(target) => target,
@@ -2466,12 +2454,12 @@ impl Engine {
                 return Err(error);
             }
         };
-        decoded.target = routed.address;
-        decoded.host = routed.host;
+        let routed_address = routed.require_address()?;
+        decoded.target = routed;
         let key = UdpAssociationKey {
             site: site_index,
             client,
-            target: decoded.target,
+            target: routed_address,
         };
         let identifier = match self.udp_association_index.get(&key).copied() {
             Some(identifier)
@@ -3272,7 +3260,7 @@ mod tests {
         let packet = encrypted_udp_packet(site.users[first].key, salt, target, b"payload");
         let decoded = decrypt_udp_packet(&packet, &mut site, None).expect("first UDP packet");
         assert_eq!(decoded.user, first);
-        assert_eq!(decoded.target, target);
+        assert_eq!(decoded.target.address, Some(target));
         assert_eq!(&*decoded.payload, b"payload");
         assert!(decrypt_udp_packet(&packet, &mut site, Some(first)).is_err());
 
@@ -3490,9 +3478,9 @@ mod tests {
     #[test]
     fn parses_ipv4_target() {
         let payload = [1, 127, 0, 0, 1, 0x4a, 0x92];
-        let (target, host, consumed) = parse_target(&payload).expect("target");
-        assert_eq!(target, "127.0.0.1:19090".parse().unwrap());
-        assert_eq!(host, "127.0.0.1");
+        let (target, consumed) = parse_target(&payload).expect("target");
+        assert_eq!(target.address, Some("127.0.0.1:19090".parse().unwrap()));
+        assert_eq!(target.host, "127.0.0.1");
         assert_eq!(consumed, payload.len());
     }
 
@@ -3501,17 +3489,18 @@ mod tests {
         let mut domain = vec![3, 9];
         domain.extend_from_slice(b"localhost");
         domain.extend_from_slice(&19090u16.to_be_bytes());
-        let (target, host, consumed) = parse_target(&domain).expect("domain target");
-        assert_eq!(host, "localhost");
+        let (target, consumed) = parse_target(&domain).expect("domain target");
+        assert_eq!(target.host, "localhost");
+        assert_eq!(target.address, None);
         assert_eq!(target.port(), 19090);
         assert_eq!(consumed, domain.len());
 
         let mut ipv6 = vec![4];
         ipv6.extend_from_slice(&"2001:db8::7".parse::<Ipv6Addr>().unwrap().octets());
         ipv6.extend_from_slice(&19091u16.to_be_bytes());
-        let (target, host, consumed) = parse_target(&ipv6).expect("IPv6 target");
-        assert_eq!(target, "[2001:db8::7]:19091".parse().unwrap());
-        assert_eq!(host, "2001:db8::7");
+        let (target, consumed) = parse_target(&ipv6).expect("IPv6 target");
+        assert_eq!(target.address, Some("[2001:db8::7]:19091".parse().unwrap()));
+        assert_eq!(target.host, "2001:db8::7");
         assert_eq!(consumed, ipv6.len());
     }
 
