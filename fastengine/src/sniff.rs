@@ -1,5 +1,6 @@
 const MAX_ATTEMPTS: u8 = 2;
 const MAX_SNIFF_BYTES: usize = 32 * 1024;
+pub const PROTOCOL_BITTORRENT: u8 = 1;
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Decision {
@@ -11,21 +12,34 @@ pub enum Decision {
 #[derive(Debug)]
 pub struct State {
     enabled: bool,
+    detect_bittorrent: bool,
+    protocols: u8,
     attempts: u8,
     observed: usize,
 }
 
 impl State {
+    #[cfg(test)]
     pub fn new(enabled: bool) -> Self {
+        Self::with_bittorrent(enabled, false)
+    }
+
+    pub fn with_bittorrent(enabled: bool, detect_bittorrent: bool) -> Self {
         Self {
             enabled,
+            detect_bittorrent,
+            protocols: 0,
             attempts: 0,
             observed: 0,
         }
     }
 
+    pub fn protocols(&self) -> u8 {
+        self.protocols
+    }
+
     pub fn inspect(&mut self, payload: &[u8]) -> Decision {
-        if !self.enabled {
+        if !self.enabled && !self.detect_bittorrent {
             return Decision::Original;
         }
         if payload.is_empty() || payload.len() == self.observed {
@@ -33,15 +47,85 @@ impl State {
         }
         self.observed = payload.len();
         self.attempts = self.attempts.saturating_add(1);
-        match sniff_http_tls(payload) {
+        let bittorrent = if self.detect_bittorrent {
+            sniff_bittorrent(payload)
+        } else {
+            ProtocolProbe::NoMatch
+        };
+        if bittorrent == ProtocolProbe::Found {
+            self.protocols |= PROTOCOL_BITTORRENT;
+        }
+        let host = if self.enabled {
+            sniff_http_tls(payload)
+        } else {
+            Probe::NoMatch
+        };
+        match host {
             Probe::Found(host) => Decision::Override(host),
-            Probe::NoMatch => Decision::Original,
             Probe::NeedMore if self.attempts < MAX_ATTEMPTS && payload.len() < MAX_SNIFF_BYTES => {
                 Decision::NeedMore
             }
-            Probe::NeedMore => Decision::Original,
+            Probe::NeedMore | Probe::NoMatch => match bittorrent {
+                ProtocolProbe::NeedMore if payload.len() < 20 => Decision::NeedMore,
+                ProtocolProbe::Found | ProtocolProbe::NeedMore | ProtocolProbe::NoMatch => {
+                    Decision::Original
+                }
+            },
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProtocolProbe {
+    Found,
+    NeedMore,
+    NoMatch,
+}
+
+fn sniff_bittorrent(input: &[u8]) -> ProtocolProbe {
+    const HEADER: &[u8; 20] = b"\x13BitTorrent protocol";
+    if input.len() < HEADER.len() {
+        return if HEADER.starts_with(input) {
+            ProtocolProbe::NeedMore
+        } else {
+            ProtocolProbe::NoMatch
+        };
+    }
+    if input.starts_with(HEADER) {
+        ProtocolProbe::Found
+    } else {
+        ProtocolProbe::NoMatch
+    }
+}
+
+pub fn udp_protocols(input: &[u8]) -> u8 {
+    if sniff_utp(input) {
+        PROTOCOL_BITTORRENT
+    } else {
+        0
+    }
+}
+
+fn sniff_utp(input: &[u8]) -> bool {
+    const HEADER_LEN: usize = 20;
+    if input.len() < HEADER_LEN || input[0] & 0x0f != 1 || input[0] >> 4 > 4 {
+        return false;
+    }
+    let mut extension = input[1];
+    let mut offset = HEADER_LEN;
+    while extension != 0 {
+        if extension != 1 || input.len().saturating_sub(offset) < 2 {
+            return false;
+        }
+        extension = input[offset];
+        let length = usize::from(input[offset + 1]);
+        offset += 2;
+        if input.len().saturating_sub(offset) < length {
+            return false;
+        }
+        offset += length;
+    }
+    true
 }
 
 enum Probe {
@@ -263,6 +347,39 @@ mod tests {
             State::new(false).inspect(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"),
             Decision::Original
         );
+    }
+
+    #[test]
+    fn detects_fragmented_bittorrent_without_destination_sniffing() {
+        let mut state = State::with_bittorrent(false, true);
+        assert_eq!(state.inspect(b"\x13BitTor"), Decision::NeedMore);
+        assert_eq!(
+            state.inspect(b"\x13BitTorrent protocolpayload"),
+            Decision::Original
+        );
+        assert_eq!(state.protocols(), PROTOCOL_BITTORRENT);
+    }
+
+    #[test]
+    fn non_bittorrent_payload_does_not_set_protocol() {
+        let mut state = State::with_bittorrent(false, true);
+        assert_eq!(state.inspect(b"GET / HTTP/1.1\r\n"), Decision::Original);
+        assert_eq!(state.protocols(), 0);
+    }
+
+    #[test]
+    fn detects_valid_utp_header_without_accepting_truncation() {
+        let mut header = [0u8; 20];
+        header[0] = 0x11;
+        assert_eq!(udp_protocols(&header), PROTOCOL_BITTORRENT);
+        assert_eq!(udp_protocols(&header[..19]), 0);
+        header[0] = 0x15;
+        assert_eq!(udp_protocols(&header), 0);
+
+        let mut extended = vec![0x11, 1];
+        extended.resize(20, 0);
+        extended.extend_from_slice(&[0, 2, 7, 8]);
+        assert_eq!(udp_protocols(&extended), PROTOCOL_BITTORRENT);
     }
 
     #[test]

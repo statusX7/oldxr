@@ -3,6 +3,7 @@ use crate::diagnostics::{connection_error, ErrorScope};
 use crate::netaddr::{
     peer_ip, resolve_target, socket_address, socket_domain, RawSocketAddress, ResolvedTarget,
 };
+use crate::routing::{Router, NETWORK_TCP, NETWORK_UDP};
 use crate::sniff::{Decision as SniffDecision, State as SniffState};
 use crate::timeout::{TcpTimeoutState, TcpTimeouts};
 use io_uring::{opcode, squeue, types, IoUring};
@@ -20,6 +21,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     ptr,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -288,6 +290,7 @@ struct Connection {
     outbound: Option<OwnedFd>,
     inbound_slot: u32,
     outbound_slot: u32,
+    fixed_files: bool,
     target: Option<Box<RawSocketAddress>>,
     pending_target: Option<ResolvedTarget>,
     sniff: SniffState,
@@ -373,6 +376,7 @@ struct UdpAssociation {
     cancel_queued: bool,
     expires_at: Instant,
     generation: u64,
+    poll_first: bool,
 }
 
 macro_rules! queue_connection {
@@ -527,6 +531,7 @@ impl UdpAssociation {
         device_admitted: bool,
         generation: u64,
         idle_timeout: Duration,
+        poll_first: bool,
     ) -> io::Result<Self> {
         let outbound = connected_udp_socket(key.target)?;
         let mut state = Self {
@@ -555,6 +560,7 @@ impl UdpAssociation {
             cancel_queued: false,
             expires_at: Instant::now() + idle_timeout,
             generation,
+            poll_first,
         };
         state.reset_response_message();
         Ok(state)
@@ -573,41 +579,57 @@ impl UdpAssociation {
     }
 }
 
-fn recv_udp_inbound_entry(site: usize, listener: &mut UdpListenerState) -> squeue::Entry {
+fn recv_udp_inbound_entry(
+    site: usize,
+    listener: &mut UdpListenerState,
+    poll_first: bool,
+) -> squeue::Entry {
     listener.reset_message();
     listener.armed = true;
-    opcode::RecvMsg::new(
-        types::Fd(listener.socket.as_raw_fd()),
-        &mut *listener.message,
-    )
-    .ioprio(1)
-    .build()
-    .user_data(tag(site, OP_RECV_UDP_INBOUND))
+    let entry = if poll_first {
+        opcode::RecvMsg::new(
+            types::Fd(listener.socket.as_raw_fd()),
+            &mut *listener.message,
+        )
+        .ioprio(1)
+        .build()
+    } else {
+        opcode::PollAdd::new(types::Fd(listener.socket.as_raw_fd()), libc::POLLIN as _).build()
+    };
+    entry.user_data(tag(site, OP_RECV_UDP_INBOUND))
 }
 
 fn send_udp_outbound_entry(identifier: usize, state: &mut UdpAssociation) -> squeue::Entry {
     let upload = state.current_upload.as_ref().expect("SS UDP upload");
     state.upload_inflight = true;
-    opcode::Send::new(
-        types::Fd(state.outbound.as_raw_fd()),
-        upload.as_ptr(),
-        upload.len() as u32,
-    )
-    .ioprio(1)
-    .build()
-    .user_data(tag(identifier, OP_SEND_UDP_OUTBOUND))
+    let entry = if state.poll_first {
+        opcode::Send::new(
+            types::Fd(state.outbound.as_raw_fd()),
+            upload.as_ptr(),
+            upload.len() as u32,
+        )
+        .ioprio(1)
+        .build()
+    } else {
+        opcode::PollAdd::new(types::Fd(state.outbound.as_raw_fd()), libc::POLLOUT as _).build()
+    };
+    entry.user_data(tag(identifier, OP_SEND_UDP_OUTBOUND))
 }
 
 fn recv_udp_outbound_entry(identifier: usize, state: &mut UdpAssociation) -> squeue::Entry {
     state.recv_inflight = true;
-    opcode::Recv::new(
-        types::Fd(state.outbound.as_raw_fd()),
-        unsafe { state.response.as_mut_ptr().add(UDP_RESPONSE_HEADROOM) },
-        UDP_TARGET_PAYLOAD_CAPACITY as u32,
-    )
-    .ioprio(1)
-    .build()
-    .user_data(tag(identifier, OP_RECV_UDP_OUTBOUND))
+    let entry = if state.poll_first {
+        opcode::Recv::new(
+            types::Fd(state.outbound.as_raw_fd()),
+            unsafe { state.response.as_mut_ptr().add(UDP_RESPONSE_HEADROOM) },
+            UDP_TARGET_PAYLOAD_CAPACITY as u32,
+        )
+        .ioprio(1)
+        .build()
+    } else {
+        opcode::PollAdd::new(types::Fd(state.outbound.as_raw_fd()), libc::POLLIN as _).build()
+    };
+    entry.user_data(tag(identifier, OP_RECV_UDP_OUTBOUND))
 }
 
 fn send_udp_inbound_entry(
@@ -617,19 +639,26 @@ fn send_udp_inbound_entry(
 ) -> squeue::Entry {
     state.reset_response_message();
     state.response_inflight = true;
-    opcode::SendMsg::new(
-        types::Fd(listener.socket.as_raw_fd()),
-        &*state.response_message,
-    )
-    .ioprio(1)
-    .build()
-    .user_data(tag(identifier, OP_SEND_UDP_INBOUND))
+    let entry = if state.poll_first {
+        opcode::SendMsg::new(
+            types::Fd(listener.socket.as_raw_fd()),
+            &*state.response_message,
+        )
+        .ioprio(1)
+        .build()
+    } else {
+        opcode::PollAdd::new(types::Fd(listener.socket.as_raw_fd()), libc::POLLOUT as _).build()
+    };
+    entry.user_data(tag(identifier, OP_SEND_UDP_INBOUND))
 }
 
-fn cancel_udp_recv_entry(identifier: usize) -> squeue::Entry {
-    opcode::AsyncCancel::new(tag(identifier, OP_RECV_UDP_OUTBOUND))
-        .build()
-        .user_data(tag(identifier, OP_CANCEL_UDP_RECV))
+fn cancel_udp_recv_entry(identifier: usize, poll_first: bool) -> squeue::Entry {
+    let entry = if poll_first {
+        opcode::AsyncCancel::new(tag(identifier, OP_RECV_UDP_OUTBOUND)).build()
+    } else {
+        opcode::PollRemove::new(tag(identifier, OP_RECV_UDP_OUTBOUND)).build()
+    };
+    entry.user_data(tag(identifier, OP_CANCEL_UDP_RECV))
 }
 
 fn begin_udp_close(state: &mut UdpAssociation) {
@@ -639,22 +668,47 @@ fn begin_udp_close(state: &mut UdpAssociation) {
     }
 }
 
-fn accept_entry(listener: RawFd, site: usize) -> squeue::Entry {
-    opcode::Accept::new(types::Fd(listener), ptr::null_mut(), ptr::null_mut())
-        .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
-        .build()
-        .user_data(tag(site, OP_ACCEPT))
+fn accept_entry(listener: RawFd, site: usize, fixed_files: bool) -> squeue::Entry {
+    let entry = if fixed_files {
+        opcode::Accept::new(types::Fd(listener), ptr::null_mut(), ptr::null_mut())
+            .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
+            .build()
+    } else {
+        opcode::PollAdd::new(types::Fd(listener), libc::POLLIN as _).build()
+    };
+    entry.user_data(tag(site, OP_ACCEPT))
 }
 
-fn connect_entry(connection: usize, state: &Connection) -> squeue::Entry {
+fn connect_entry(connection: usize, state: &Connection) -> io::Result<squeue::Entry> {
     let target = state.target.as_ref().expect("connect target");
-    opcode::Connect::new(
-        types::Fixed(state.outbound_slot),
-        target.as_ptr(),
-        target.len(),
-    )
-    .build()
-    .user_data(tag(connection, OP_CONNECT))
+    let entry = if state.fixed_files {
+        opcode::Connect::new(
+            types::Fixed(state.outbound_slot),
+            target.as_ptr(),
+            target.len(),
+        )
+        .build()
+    } else {
+        let descriptor = state
+            .outbound
+            .as_ref()
+            .expect("outbound socket")
+            .as_raw_fd();
+        let result = unsafe { libc::connect(descriptor, target.as_ptr(), target.len()) };
+        if result == 0 {
+            opcode::Nop::new().build()
+        } else {
+            let error = io::Error::last_os_error();
+            if !matches!(
+                error.raw_os_error(),
+                Some(libc::EINPROGRESS) | Some(libc::EALREADY) | Some(libc::EINTR)
+            ) {
+                return Err(error);
+            }
+            opcode::PollAdd::new(types::Fd(descriptor), libc::POLLOUT as _).build()
+        }
+    };
+    Ok(entry.user_data(tag(connection, OP_CONNECT)))
 }
 
 fn start_target_connect(
@@ -666,11 +720,13 @@ fn start_target_connect(
     pending: &mut Vec<squeue::Entry>,
 ) -> io::Result<()> {
     let outbound = tcp_socket(tcp_nodelay, target)?;
-    register_file(ring, state.outbound_slot, outbound.as_raw_fd())?;
+    if state.fixed_files {
+        register_file(ring, state.outbound_slot, outbound.as_raw_fd())?;
+    }
     state.target = Some(Box::new(RawSocketAddress::new(target)));
     state.outbound = Some(outbound);
     state.connecting = true;
-    queue_connection!(state, pending, connect_entry(connection, state));
+    queue_connection!(state, pending, connect_entry(connection, state)?);
     Ok(())
 }
 
@@ -680,14 +736,15 @@ fn recv_inbound_entry(connection: usize, state: &mut Connection) -> io::Result<s
     if remaining == 0 {
         return Err(io::Error::other("encrypted input buffer is full"));
     }
-    Ok(opcode::Recv::new(
-        types::Fixed(state.inbound_slot),
-        unsafe { state.input.as_mut_ptr().add(state.input_length) },
-        remaining as u32,
-    )
-    .ioprio(1)
-    .build()
-    .user_data(tag(connection, OP_RECV_INBOUND)))
+    let buffer = unsafe { state.input.as_mut_ptr().add(state.input_length) };
+    let entry = if state.fixed_files {
+        opcode::Recv::new(types::Fixed(state.inbound_slot), buffer, remaining as u32)
+            .ioprio(1)
+            .build()
+    } else {
+        opcode::PollAdd::new(types::Fd(state._inbound.as_raw_fd()), libc::POLLIN as _).build()
+    };
+    Ok(entry.user_data(tag(connection, OP_RECV_INBOUND)))
 }
 
 fn send_outbound_entry(connection: usize, state: &Connection) -> squeue::Entry {
@@ -696,14 +753,25 @@ fn send_outbound_entry(connection: usize, state: &Connection) -> squeue::Entry {
     } else {
         unsafe { state.upload.as_ptr().add(state.upload_offset) }
     };
-    opcode::Send::new(
-        types::Fixed(state.outbound_slot),
-        address,
-        (state.upload_length - state.upload_offset) as u32,
-    )
-    .ioprio(1)
-    .build()
-    .user_data(tag(connection, OP_SEND_OUTBOUND))
+    let length = (state.upload_length - state.upload_offset) as u32;
+    let entry = if state.fixed_files {
+        opcode::Send::new(types::Fixed(state.outbound_slot), address, length)
+            .ioprio(1)
+            .build()
+    } else {
+        opcode::PollAdd::new(
+            types::Fd(
+                state
+                    .outbound
+                    .as_ref()
+                    .expect("outbound socket")
+                    .as_raw_fd(),
+            ),
+            libc::POLLOUT as _,
+        )
+        .build()
+    };
+    entry.user_data(tag(connection, OP_SEND_OUTBOUND))
 }
 
 fn recv_outbound_entry(connection: usize, state: &mut Connection) -> squeue::Entry {
@@ -712,35 +780,221 @@ fn recv_outbound_entry(connection: usize, state: &mut Connection) -> squeue::Ent
     } else {
         LENGTH_PACKET_LEN
     };
-    opcode::Recv::new(
-        types::Fixed(state.outbound_slot),
-        unsafe {
-            state
-                .download_ciphertext
-                .as_mut_ptr()
-                .add(state.download_payload_offset)
-        },
-        DOWNLOAD_PLAINTEXT_CAPACITY as u32,
-    )
-    .ioprio(1)
-    .build()
-    .user_data(tag(connection, OP_RECV_OUTBOUND))
+    let buffer = unsafe {
+        state
+            .download_ciphertext
+            .as_mut_ptr()
+            .add(state.download_payload_offset)
+    };
+    let entry = if state.fixed_files {
+        opcode::Recv::new(
+            types::Fixed(state.outbound_slot),
+            buffer,
+            DOWNLOAD_PLAINTEXT_CAPACITY as u32,
+        )
+        .ioprio(1)
+        .build()
+    } else {
+        opcode::PollAdd::new(
+            types::Fd(
+                state
+                    .outbound
+                    .as_ref()
+                    .expect("outbound socket")
+                    .as_raw_fd(),
+            ),
+            libc::POLLIN as _,
+        )
+        .build()
+    };
+    entry.user_data(tag(connection, OP_RECV_OUTBOUND))
 }
 
 fn send_inbound_entry(connection: usize, state: &Connection) -> squeue::Entry {
-    opcode::Send::new(
-        types::Fixed(state.inbound_slot),
-        unsafe {
+    let buffer = unsafe {
+        state
+            .download_ciphertext
+            .as_ptr()
+            .add(state.download_offset)
+    };
+    let length = (state.download_length - state.download_offset) as u32;
+    let entry = if state.fixed_files {
+        opcode::Send::new(types::Fixed(state.inbound_slot), buffer, length)
+            .ioprio(1)
+            .build()
+    } else {
+        opcode::PollAdd::new(types::Fd(state._inbound.as_raw_fd()), libc::POLLOUT as _).build()
+    };
+    entry.user_data(tag(connection, OP_SEND_INBOUND))
+}
+
+fn negative_errno() -> i32 {
+    -io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO)
+}
+
+fn syscall_result(result: isize) -> i32 {
+    if result < 0 {
+        negative_errno()
+    } else {
+        result as i32
+    }
+}
+
+fn accept_ready(descriptor: RawFd) -> i32 {
+    let result = unsafe {
+        libc::accept4(
+            descriptor,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+        )
+    };
+    if result < 0 {
+        negative_errno()
+    } else {
+        result
+    }
+}
+
+fn connect_ready(descriptor: RawFd) -> i32 {
+    let mut error = 0;
+    let mut length = mem::size_of_val(&error) as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            descriptor,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            (&mut error as *mut libc::c_int).cast(),
+            &mut length,
+        )
+    };
+    if result < 0 {
+        negative_errno()
+    } else if error == 0 {
+        0
+    } else {
+        -error
+    }
+}
+
+fn compat_udp_listener_result(listener: &mut UdpListenerState) -> i32 {
+    syscall_result(unsafe {
+        libc::recvmsg(
+            listener.socket.as_raw_fd(),
+            (&mut *listener.message as *mut libc::msghdr).cast(),
+            0,
+        )
+    })
+}
+
+fn compat_udp_result(
+    operation: u8,
+    listener: &UdpListenerState,
+    state: &mut UdpAssociation,
+) -> i32 {
+    match operation {
+        OP_SEND_UDP_OUTBOUND => {
+            let upload = state.current_upload.as_ref().expect("SS UDP upload");
+            syscall_result(unsafe {
+                libc::send(
+                    state.outbound.as_raw_fd(),
+                    upload.as_ptr().cast(),
+                    upload.len(),
+                    libc::MSG_NOSIGNAL,
+                )
+            })
+        }
+        OP_RECV_UDP_OUTBOUND => syscall_result(unsafe {
+            libc::recv(
+                state.outbound.as_raw_fd(),
+                state
+                    .response
+                    .as_mut_ptr()
+                    .add(UDP_RESPONSE_HEADROOM)
+                    .cast(),
+                UDP_TARGET_PAYLOAD_CAPACITY,
+                0,
+            )
+        }),
+        OP_SEND_UDP_INBOUND => syscall_result(unsafe {
+            libc::sendmsg(
+                listener.socket.as_raw_fd(),
+                (&*state.response_message as *const libc::msghdr).cast(),
+                libc::MSG_NOSIGNAL,
+            )
+        }),
+        _ => 0,
+    }
+}
+
+fn compat_tcp_result(operation: u8, state: &mut Connection) -> i32 {
+    match operation {
+        OP_CONNECT => connect_ready(
             state
-                .download_ciphertext
-                .as_ptr()
-                .add(state.download_offset)
-        },
-        (state.download_length - state.download_offset) as u32,
-    )
-    .ioprio(1)
-    .build()
-    .user_data(tag(connection, OP_SEND_INBOUND))
+                .outbound
+                .as_ref()
+                .expect("outbound socket")
+                .as_raw_fd(),
+        ),
+        OP_RECV_INBOUND => syscall_result(unsafe {
+            libc::recv(
+                state._inbound.as_raw_fd(),
+                state.input.as_mut_ptr().add(state.input_length).cast(),
+                INPUT_CAPACITY - state.input_length,
+                0,
+            )
+        }),
+        OP_SEND_OUTBOUND => {
+            let address = if let Some(start) = state.upload_direct_start {
+                unsafe { state.input.as_ptr().add(start + state.upload_offset) }
+            } else {
+                unsafe { state.upload.as_ptr().add(state.upload_offset) }
+            };
+            syscall_result(unsafe {
+                libc::send(
+                    state
+                        .outbound
+                        .as_ref()
+                        .expect("outbound socket")
+                        .as_raw_fd(),
+                    address.cast(),
+                    state.upload_length - state.upload_offset,
+                    libc::MSG_NOSIGNAL,
+                )
+            })
+        }
+        OP_RECV_OUTBOUND => syscall_result(unsafe {
+            libc::recv(
+                state
+                    .outbound
+                    .as_ref()
+                    .expect("outbound socket")
+                    .as_raw_fd(),
+                state
+                    .download_ciphertext
+                    .as_mut_ptr()
+                    .add(state.download_payload_offset)
+                    .cast(),
+                DOWNLOAD_PLAINTEXT_CAPACITY,
+                0,
+            )
+        }),
+        OP_SEND_INBOUND => syscall_result(unsafe {
+            libc::send(
+                state._inbound.as_raw_fd(),
+                state
+                    .download_ciphertext
+                    .as_ptr()
+                    .add(state.download_offset)
+                    .cast(),
+                state.download_length - state.download_offset,
+                libc::MSG_NOSIGNAL,
+            )
+        }),
+        _ => 0,
+    }
 }
 
 fn register_file(ring: &mut IoUring, slot: u32, descriptor: RawFd) -> io::Result<()> {
@@ -1352,6 +1606,7 @@ fn finalize_pending_target(
     site: &mut SiteState,
     features: Features,
     force_original: bool,
+    router: &Router,
 ) -> io::Result<Option<SocketAddr>> {
     let Some(original) = connection.pending_target.as_ref() else {
         return Ok(None);
@@ -1395,7 +1650,15 @@ fn finalize_pending_target(
             "SS rule rejected target",
         ));
     }
-    Ok(Some(target.address))
+    match router.route_target(NETWORK_TCP, &target, connection.sniff.protocols()) {
+        Ok(target) => Ok(Some(target.address)),
+        Err(error) => {
+            if error.kind() == io::ErrorKind::PermissionDenied {
+                site.rule_rejects = site.rule_rejects.saturating_add(1);
+            }
+            Err(error)
+        }
+    }
 }
 
 fn decrypt_length(connection: &mut Connection) -> io::Result<bool> {
@@ -1432,6 +1695,7 @@ fn process_encrypted(
     connection: &mut Connection,
     site: &mut SiteState,
     features: Features,
+    router: &Router,
 ) -> io::Result<Option<SocketAddr>> {
     if connection.decryptor.is_none() {
         if connection.input_length - connection.input_start < SALT_LEN + LENGTH_PACKET_LEN {
@@ -1550,7 +1814,7 @@ fn process_encrypted(
     if connection.upload_direct_start.is_none() {
         connection.compact_input();
     }
-    finalize_pending_target(connection, site, features, false)
+    finalize_pending_target(connection, site, features, false, router)
 }
 
 fn prepare_download(
@@ -1652,6 +1916,8 @@ pub struct Engine {
     tcp_nodelay: bool,
     fixed_file_base: u32,
     tcp_timeouts: TcpTimeouts,
+    fixed_files: bool,
+    router: Arc<Router>,
 }
 
 impl Engine {
@@ -1669,6 +1935,8 @@ impl Engine {
         fixed_file_base: u32,
         udp_idle_timeout: Duration,
         tcp_timeouts: TcpTimeouts,
+        fixed_files: bool,
+        router: Arc<Router>,
     ) -> io::Result<Self> {
         if sniffing.len() != listen_addresses.len() {
             return Err(io::Error::new(
@@ -1728,6 +1996,8 @@ impl Engine {
             tcp_nodelay,
             fixed_file_base,
             tcp_timeouts,
+            fixed_files,
+            router,
         })
     }
 
@@ -1752,14 +2022,18 @@ impl Engine {
             }
             self.accept_armed[site] = true;
             self.accept_armed_count += 1;
-            pending.push(accept_entry(self.listeners[site].as_raw_fd(), site));
+            pending.push(accept_entry(
+                self.listeners[site].as_raw_fd(),
+                site,
+                self.fixed_files,
+            ));
         }
     }
 
     fn arm_udp_listeners(&mut self, pending: &mut Vec<squeue::Entry>) {
         for (site, listener) in self.udp_listeners.iter_mut().enumerate() {
             if !listener.armed {
-                pending.push(recv_udp_inbound_entry(site, listener));
+                pending.push(recv_udp_inbound_entry(site, listener, self.fixed_files));
             }
         }
     }
@@ -2097,7 +2371,11 @@ impl Engine {
                     begin_udp_close(state);
                     if state.recv_inflight && !state.cancel_queued {
                         state.cancel_queued = true;
-                        queue_connection!(state, pending, cancel_udp_recv_entry(identifier));
+                        queue_connection!(
+                            state,
+                            pending,
+                            cancel_udp_recv_entry(identifier, state.poll_first)
+                        );
                     }
                 }
                 _ => {}
@@ -2143,7 +2421,7 @@ impl Engine {
         pending: &mut Vec<squeue::Entry>,
     ) -> io::Result<()> {
         let cached_user = self.udp_user_cache.get(&(site_index, client)).copied();
-        let decoded = decrypt_udp_packet(packet, &mut self.sites[site_index], cached_user)?;
+        let mut decoded = decrypt_udp_packet(packet, &mut self.sites[site_index], cached_user)?;
         let destination = format!("udp:{}:{}", decoded.host, decoded.target.port());
         if self.features.rule
             && (self.sites[site_index]
@@ -2161,6 +2439,26 @@ impl Engine {
                 "SS UDP rule rejected target",
             ));
         }
+        let original = ResolvedTarget {
+            address: decoded.target,
+            host: decoded.host.clone(),
+        };
+        let routed = match self.router.route_target(
+            NETWORK_UDP,
+            &original,
+            crate::sniff::udp_protocols(&decoded.payload),
+        ) {
+            Ok(target) => target,
+            Err(error) => {
+                if error.kind() == io::ErrorKind::PermissionDenied {
+                    self.sites[site_index].rule_rejects =
+                        self.sites[site_index].rule_rejects.saturating_add(1);
+                }
+                return Err(error);
+            }
+        };
+        decoded.target = routed.address;
+        decoded.host = routed.host;
         let key = UdpAssociationKey {
             site: site_index,
             client,
@@ -2226,6 +2524,7 @@ impl Engine {
                     false,
                     generation,
                     self.udp_idle_timeout,
+                    self.fixed_files,
                 )?;
                 if self.features.device {
                     *self.sites[site_index].users[decoded.user]
@@ -2281,7 +2580,7 @@ impl Engine {
         &mut self,
         ring: &mut IoUring,
         user_data: u64,
-        result: i32,
+        mut result: i32,
         pending: &mut Vec<squeue::Entry>,
     ) -> io::Result<()> {
         let (id_or_site, operation) = decode_tag(user_data);
@@ -2290,11 +2589,16 @@ impl Engine {
             let datagram = {
                 let listener = &mut self.udp_listeners[site];
                 listener.armed = false;
+                if !self.fixed_files && result >= 0 {
+                    result = compat_udp_listener_result(listener);
+                }
                 if result < 0
                     || result as usize > listener.buffer.len()
                     || listener.message.msg_flags & libc::MSG_TRUNC != 0
                 {
-                    self.udp_listener_errors = self.udp_listener_errors.saturating_add(1);
+                    if result != -libc::EAGAIN {
+                        self.udp_listener_errors = self.udp_listener_errors.saturating_add(1);
+                    }
                     None
                 } else {
                     socket_address(&listener.source)
@@ -2327,6 +2631,10 @@ impl Engine {
             else {
                 return Ok(());
             };
+            if !self.fixed_files && result >= 0 {
+                let site = state.key.site;
+                result = compat_udp_result(operation, &self.udp_listeners[site], &mut state);
+            }
             state.inflight = state.inflight.saturating_sub(1);
             match operation {
                 OP_SEND_UDP_OUTBOUND => state.upload_inflight = false,
@@ -2337,6 +2645,26 @@ impl Engine {
             if state.closing {
                 self.udp_associations[identifier] = Some(state);
                 return Ok(());
+            }
+            if !self.fixed_files && result == -libc::EAGAIN {
+                let retry = match operation {
+                    OP_SEND_UDP_OUTBOUND => Some(send_udp_outbound_entry(identifier, &mut state)),
+                    OP_RECV_UDP_OUTBOUND => Some(recv_udp_outbound_entry(identifier, &mut state)),
+                    OP_SEND_UDP_INBOUND => {
+                        let site = state.key.site;
+                        Some(send_udp_inbound_entry(
+                            identifier,
+                            &self.udp_listeners[site],
+                            &mut state,
+                        ))
+                    }
+                    _ => None,
+                };
+                if let Some(entry) = retry {
+                    queue_connection!(&mut state, pending, entry);
+                    self.udp_associations[identifier] = Some(state);
+                    return Ok(());
+                }
             }
             if result < 0 {
                 match operation {
@@ -2449,6 +2777,9 @@ impl Engine {
             let site = id_or_site;
             self.accept_armed[site] = false;
             self.accept_armed_count = self.accept_armed_count.saturating_sub(1);
+            if !self.fixed_files && result >= 0 {
+                result = accept_ready(self.listeners[site].as_raw_fd());
+            }
             if result < 0 {
                 self.arm_accepts(pending);
                 return Ok(());
@@ -2471,15 +2802,21 @@ impl Engine {
                 .unwrap_or(self.connections.len());
             let inbound_slot = self.fixed_file_base + (id * 2) as u32;
             let outbound_slot = inbound_slot + 1;
-            register_file(ring, inbound_slot, inbound.as_raw_fd())?;
+            if self.fixed_files {
+                register_file(ring, inbound_slot, inbound.as_raw_fd())?;
+            }
             let mut state = Connection {
                 _inbound: inbound,
                 outbound: None,
                 inbound_slot,
                 outbound_slot,
+                fixed_files: self.fixed_files,
                 target: None,
                 pending_target: None,
-                sniff: SniffState::new(self.sites[site].sniffing),
+                sniff: SniffState::with_bittorrent(
+                    self.sites[site].sniffing,
+                    self.router.needs_bittorrent(),
+                ),
                 site,
                 peer_ip,
                 input: Box::new([0; INPUT_CAPACITY]),
@@ -2534,15 +2871,33 @@ impl Engine {
         let features = self.features;
         let tcp_nodelay = self.tcp_nodelay;
         let tcp_timeouts = self.tcp_timeouts;
+        let router = &self.router;
         let sites = &mut self.sites;
         let timers = &mut self.timers;
         let Some(state) = self.connections.get_mut(id).and_then(Option::as_mut) else {
             return Ok(());
         };
+        if !self.fixed_files && result >= 0 {
+            result = compat_tcp_result(operation, state);
+        }
         state.inflight = state.inflight.saturating_sub(1);
         if state.closing {
             complete_while_closing(state, operation, result, sites, features);
             return Ok(());
+        }
+        if !self.fixed_files && result == -libc::EAGAIN {
+            let retry = match operation {
+                OP_CONNECT => Some(connect_entry(id, state)?),
+                OP_RECV_INBOUND => Some(recv_inbound_entry(id, state)?),
+                OP_SEND_OUTBOUND => Some(send_outbound_entry(id, state)),
+                OP_RECV_OUTBOUND => Some(recv_outbound_entry(id, state)),
+                OP_SEND_INBOUND => Some(send_inbound_entry(id, state)),
+                _ => None,
+            };
+            if let Some(entry) = retry {
+                queue_connection!(state, pending, entry);
+                return Ok(());
+            }
         }
         if result < 0 {
             fail_io(state, io::Error::from_raw_os_error(-result));
@@ -2571,7 +2926,7 @@ impl Engine {
                         if state.pending_target.is_some() {
                             let site = &mut sites[state.site];
                             if let Some(target) =
-                                finalize_pending_target(state, site, features, true)?
+                                finalize_pending_target(state, site, features, true, router)?
                             {
                                 start_target_connect(
                                     id,
@@ -2595,7 +2950,7 @@ impl Engine {
                     state.timeout.note_activity();
                     state.input_length += result as usize;
                     let site = &mut sites[state.site];
-                    let target = process_encrypted(state, site, features)?;
+                    let target = process_encrypted(state, site, features, router)?;
                     if let Some(target) = target {
                         start_target_connect(id, state, target, tcp_nodelay, ring, pending)?;
                     } else if state.connected
@@ -2757,7 +3112,11 @@ impl Engine {
                     && !state.cancel_queued
                 {
                     state.cancel_queued = true;
-                    queue_connection!(state, pending, cancel_udp_recv_entry(identifier));
+                    queue_connection!(
+                        state,
+                        pending,
+                        cancel_udp_recv_entry(identifier, state.poll_first)
+                    );
                 }
             }
 
@@ -2847,8 +3206,10 @@ impl Engine {
                     }
                     self.sites[state.site].prune_retired();
                 }
-                unregister_file(ring, state.inbound_slot)?;
-                unregister_file(ring, state.outbound_slot)?;
+                if state.fixed_files {
+                    unregister_file(ring, state.inbound_slot)?;
+                    unregister_file(ring, state.outbound_slot)?;
+                }
                 self.free_connections.push(identifier);
                 self.active_connections = self.active_connections.saturating_sub(1);
             }

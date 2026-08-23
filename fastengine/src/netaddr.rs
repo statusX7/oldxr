@@ -29,6 +29,16 @@ impl ResolvedTarget {
             host: host.to_owned(),
         })
     }
+
+    pub fn resolve_ipv6(&self) -> io::Result<Self> {
+        if self.host.parse::<IpAddr>().is_ok() {
+            return Ok(self.clone());
+        }
+        Ok(Self {
+            address: resolve_target_ipv6(&self.host, self.address.port())?,
+            host: self.host.clone(),
+        })
+    }
 }
 
 impl RawSocketAddress {
@@ -149,6 +159,13 @@ pub fn resolve_target(host: &str, port: u16) -> io::Result<SocketAddr> {
     ipv6.ok_or_else(|| io::Error::other("target name has no address"))
 }
 
+pub fn resolve_target_ipv6(host: &str, port: u16) -> io::Result<SocketAddr> {
+    (host, port)
+        .to_socket_addrs()?
+        .find(SocketAddr::is_ipv6)
+        .ok_or_else(|| io::Error::other("target name has no IPv6 address"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +179,17 @@ mod tests {
             let raw = RawSocketAddress::new(address);
             let storage = unsafe { &*(raw.as_ptr().cast::<libc::sockaddr_storage>()) };
             assert_eq!(socket_address(storage).unwrap(), address);
+        }
+    }
+
+    #[test]
+    fn ipv6_strategy_keeps_literal_addresses() {
+        for address in [
+            "192.0.2.1:443".parse().unwrap(),
+            "[2001:db8::1]:443".parse().unwrap(),
+        ] {
+            let target = ResolvedTarget::from_ip(address);
+            assert_eq!(target.resolve_ipv6().unwrap(), target);
         }
     }
 }

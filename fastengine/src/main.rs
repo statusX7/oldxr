@@ -2,6 +2,7 @@ mod accounting;
 mod codec;
 mod diagnostics;
 mod netaddr;
+mod routing;
 mod sniff;
 mod ss;
 mod timeout;
@@ -29,6 +30,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::ptr;
 use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use timeout::{TcpTimeoutState, TcpTimeouts};
@@ -71,10 +73,39 @@ static VMESS_CLOSE_PENDING: AtomicBool = AtomicBool::new(false);
 static VMESS_UPLOAD_BUFFER_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static VMESS_DOWNLOAD_BUFFER_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IoBackend {
+    UringAdvanced,
+    UringCompat,
+}
+
+impl IoBackend {
+    fn name(self) -> &'static str {
+        match self {
+            Self::UringAdvanced => "io_uring-advanced",
+            Self::UringCompat => "io_uring-compat",
+        }
+    }
+
+    fn fixed_files(self) -> bool {
+        self == Self::UringAdvanced
+    }
+}
+
 #[derive(Deserialize)]
 struct Config {
     address: String,
     protocol: Protocol,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EngineConfigFile {
+    Normalized {
+        listeners: Vec<Config>,
+        routing: routing::PlanConfig,
+    },
+    Legacy(Vec<Config>),
 }
 
 #[derive(Deserialize)]
@@ -555,6 +586,15 @@ impl DownloadBufferRing {
         Ok(provided)
     }
 
+    fn compat() -> Self {
+        Self {
+            entries: ptr::null_mut(),
+            buffers: Vec::new(),
+            tail: 0,
+            mask: 0,
+        }
+    }
+
     fn add_unpublished(&mut self, id: u16) {
         let index = self.tail & self.mask;
         let entry = unsafe { &mut *self.entries.add(index as usize) };
@@ -579,6 +619,10 @@ impl DownloadBufferRing {
     }
 
     fn release(&mut self, id: u16) {
+        if self.entries.is_null() {
+            debug_assert!(false, "compat backend returned a download buffer ID");
+            return;
+        }
         self.add_unpublished(id);
         self.publish();
     }
@@ -633,6 +677,15 @@ impl UploadBufferRing {
         Ok(provided)
     }
 
+    fn compat() -> Self {
+        Self {
+            entries: ptr::null_mut(),
+            buffers: Vec::new(),
+            tail: 0,
+            mask: 0,
+        }
+    }
+
     fn add_unpublished(&mut self, id: u16) {
         let index = self.tail & self.mask;
         let entry = unsafe { &mut *self.entries.add(index as usize) };
@@ -653,6 +706,10 @@ impl UploadBufferRing {
     }
 
     fn release(&mut self, id: u16) {
+        if self.entries.is_null() {
+            debug_assert!(false, "compat backend returned an upload buffer ID");
+            return;
+        }
         self.add_unpublished(id);
         self.publish();
     }
@@ -666,11 +723,122 @@ impl UploadBufferRing {
     }
 }
 
+fn advanced_io_backend() -> io::Result<(IoUring, IoBackend, UploadBufferRing, DownloadBufferRing)> {
+    let ring = IoUring::builder()
+        .setup_single_issuer()
+        .setup_defer_taskrun()
+        .build(RING_ENTRIES)?;
+    ring.submitter().register_files_sparse(FIXED_FILE_SLOTS)?;
+    let upload = UploadBufferRing::new(&ring)?;
+    let download = DownloadBufferRing::new(&ring)?;
+    Ok((ring, IoBackend::UringAdvanced, upload, download))
+}
+
+fn compat_io_backend() -> io::Result<(IoUring, IoBackend, UploadBufferRing, DownloadBufferRing)> {
+    Ok((
+        IoUring::new(RING_ENTRIES)?,
+        IoBackend::UringCompat,
+        UploadBufferRing::compat(),
+        DownloadBufferRing::compat(),
+    ))
+}
+
+fn raise_nofile_soft_limit() -> io::Result<()> {
+    let required = libc::rlim_t::from(FIXED_FILE_SLOTS).saturating_add(64);
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if limit.rlim_cur >= required {
+        return Ok(());
+    }
+    limit.rlim_cur = required.min(limit.rlim_max);
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn io_backend(
+    requested: &str,
+) -> io::Result<(
+    IoUring,
+    IoBackend,
+    UploadBufferRing,
+    DownloadBufferRing,
+    String,
+)> {
+    if requested != "uring-compat" {
+        if let Err(error) = raise_nofile_soft_limit() {
+            eprintln!("FastEngine could not raise RLIMIT_NOFILE for advanced io_uring: {error}");
+        }
+    }
+    match requested {
+        "auto" => match advanced_io_backend() {
+            Ok((ring, backend, upload, download)) => Ok((
+                ring,
+                backend,
+                upload,
+                download,
+                "advanced io_uring capability probe passed".to_owned(),
+            )),
+            Err(advanced_error) => {
+                eprintln!(
+                    "FastEngine advanced io_uring probe failed ({advanced_error}); selecting compatibility backend"
+                );
+                match compat_io_backend() {
+                    Ok((ring, backend, upload, download)) => Ok((
+                        ring,
+                        backend,
+                        upload,
+                        download,
+                        format!(
+                            "advanced probe failed: {advanced_error}; one-shot compatibility probe passed"
+                        ),
+                    )),
+                    Err(compat_error) => Err(io::Error::new(
+                        compat_error.kind(),
+                        format!(
+                            "advanced io_uring probe failed: {advanced_error}; compatibility probe failed: {compat_error}"
+                        ),
+                    )),
+                }
+            }
+        },
+        "uring-advanced" => advanced_io_backend().map(|(ring, backend, upload, download)| {
+            (
+                ring,
+                backend,
+                upload,
+                download,
+                "advanced backend forced by diagnostic override".to_owned(),
+            )
+        }),
+        "uring-compat" => compat_io_backend().map(|(ring, backend, upload, download)| {
+            (
+                ring,
+                backend,
+                upload,
+                download,
+                "compatibility backend forced by diagnostic override".to_owned(),
+            )
+        }),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--io-backend must be auto, uring-advanced, or uring-compat",
+        )),
+    }
+}
+
 struct Connection {
     _client: OwnedFd,
     target: Option<OwnedFd>,
     client_slot: u32,
     target_slot: u32,
+    fixed_files: bool,
     listener: usize,
     user: Option<usize>,
     peer_ip: IpAddr,
@@ -684,6 +852,7 @@ struct Connection {
     xudp: bool,
     xudp_session_id: u16,
     xudp_target: Option<ResolvedTarget>,
+    route_protocols: u8,
     rule_checked: bool,
     session: Option<Session>,
     client_input: Box<[u8; CLIENT_INPUT_SIZE]>,
@@ -875,14 +1044,38 @@ fn start_admin(path: &str) -> io::Result<AdminControl> {
     })
 }
 
-fn admin_event_entry(control: &mut AdminControl) -> squeue::Entry {
-    opcode::Read::new(
-        types::Fd(control.eventfd.as_raw_fd()),
-        (&mut *control.event_value as *mut u64).cast(),
-        mem::size_of::<u64>() as u32,
-    )
-    .build()
-    .user_data(tag(0, OP_ADMIN))
+fn admin_event_entry(control: &mut AdminControl, poll_only: bool) -> squeue::Entry {
+    let entry = if poll_only {
+        opcode::PollAdd::new(types::Fd(control.eventfd.as_raw_fd()), libc::POLLIN as _).build()
+    } else {
+        opcode::Read::new(
+            types::Fd(control.eventfd.as_raw_fd()),
+            (&mut *control.event_value as *mut u64).cast(),
+            mem::size_of::<u64>() as u32,
+        )
+        .build()
+    };
+    entry.user_data(tag(0, OP_ADMIN))
+}
+
+fn drain_admin_event(control: &mut AdminControl) -> io::Result<()> {
+    let result = unsafe {
+        libc::read(
+            control.eventfd.as_raw_fd(),
+            (&mut *control.event_value as *mut u64).cast(),
+            mem::size_of::<u64>(),
+        )
+    };
+    if result == mem::size_of::<u64>() as isize {
+        Ok(())
+    } else if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short eventfd read",
+        ))
+    }
 }
 
 fn vmess_site_mut(listeners: &mut [ListenerState], site: usize) -> io::Result<&mut ListenerState> {
@@ -1072,11 +1265,15 @@ fn push(ring: &mut IoUring, entry: squeue::Entry) -> io::Result<()> {
     }
 }
 
-fn accept_entry(listener: usize, descriptor: RawFd) -> squeue::Entry {
-    opcode::Accept::new(types::Fd(descriptor), ptr::null_mut(), ptr::null_mut())
-        .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
-        .build()
-        .user_data(tag(listener, OP_ACCEPT))
+fn accept_entry(listener: usize, descriptor: RawFd, fixed_files: bool) -> squeue::Entry {
+    let entry = if fixed_files {
+        opcode::Accept::new(types::Fd(descriptor), ptr::null_mut(), ptr::null_mut())
+            .flags(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
+            .build()
+    } else {
+        opcode::PollAdd::new(types::Fd(descriptor), libc::POLLIN as _).build()
+    };
+    entry.user_data(tag(listener, OP_ACCEPT))
 }
 
 fn arm_accepts(
@@ -1085,6 +1282,7 @@ fn arm_accepts(
     accept_armed_count: &mut usize,
     accept_cursor: &mut usize,
     active_connections: usize,
+    fixed_files: bool,
     pending: &mut Vec<squeue::Entry>,
 ) {
     if listeners.is_empty() {
@@ -1110,6 +1308,7 @@ fn arm_accepts(
         pending.push(accept_entry(
             listener,
             listeners[listener].socket.as_raw_fd(),
+            fixed_files,
         ));
     }
 }
@@ -1253,14 +1452,15 @@ fn recv_client_entry(identifier: usize, state: &mut Connection) -> io::Result<sq
     }
     let remaining = state.client_input.len() - state.client_end;
     state.client_multishot_armed = true;
-    Ok(opcode::Recv::new(
-        types::Fixed(state.client_slot),
-        unsafe { state.client_input.as_mut_ptr().add(state.client_end) },
-        remaining as u32,
-    )
-    .ioprio(1)
-    .build()
-    .user_data(tag(identifier, OP_RECV_CLIENT)))
+    let buffer = unsafe { state.client_input.as_mut_ptr().add(state.client_end) };
+    let entry = if state.fixed_files {
+        opcode::Recv::new(types::Fixed(state.client_slot), buffer, remaining as u32)
+            .ioprio(1)
+            .build()
+    } else {
+        opcode::PollAdd::new(types::Fd(state._client.as_raw_fd()), libc::POLLIN as _).build()
+    };
+    Ok(entry.user_data(tag(identifier, OP_RECV_CLIENT)))
 }
 
 fn recv_client_multi_entry(identifier: usize, state: &Connection) -> squeue::Entry {
@@ -1269,15 +1469,32 @@ fn recv_client_multi_entry(identifier: usize, state: &Connection) -> squeue::Ent
         .user_data(tag(identifier, OP_RECV_CLIENT))
 }
 
-fn connect_target_entry(identifier: usize, state: &Connection) -> squeue::Entry {
+fn connect_target_entry(identifier: usize, state: &Connection) -> io::Result<squeue::Entry> {
     let address = state.target_address.as_ref().expect("target address");
-    opcode::Connect::new(
-        types::Fixed(state.target_slot),
-        address.as_ptr(),
-        address.len(),
-    )
-    .build()
-    .user_data(tag(identifier, OP_CONNECT_TARGET))
+    let entry = if state.fixed_files {
+        opcode::Connect::new(
+            types::Fixed(state.target_slot),
+            address.as_ptr(),
+            address.len(),
+        )
+        .build()
+    } else {
+        let descriptor = state.target.as_ref().expect("target socket").as_raw_fd();
+        let result = unsafe { libc::connect(descriptor, address.as_ptr(), address.len()) };
+        if result == 0 {
+            opcode::Nop::new().build()
+        } else {
+            let error = io::Error::last_os_error();
+            if !matches!(
+                error.raw_os_error(),
+                Some(libc::EINPROGRESS) | Some(libc::EALREADY) | Some(libc::EINTR)
+            ) {
+                return Err(error);
+            }
+            opcode::PollAdd::new(types::Fd(descriptor), libc::POLLOUT as _).build()
+        }
+    };
+    Ok(entry.user_data(tag(identifier, OP_CONNECT_TARGET)))
 }
 
 fn ensure_target_connect(
@@ -1285,6 +1502,7 @@ fn ensure_target_connect(
     state: &mut Connection,
     site: &mut ListenerState,
     features: Features,
+    router: &routing::Router,
     ring: &mut IoUring,
     pending: &mut Vec<squeue::Entry>,
 ) -> io::Result<()> {
@@ -1315,6 +1533,22 @@ fn ensure_target_connect(
                 "VMess rule rejected target",
             ));
         }
+        let routed = router.route_target(
+            if state.target_udp {
+                routing::NETWORK_UDP
+            } else {
+                routing::NETWORK_TCP
+            },
+            target,
+            state.sniff.protocols() | state.route_protocols,
+        )?;
+        state.target_endpoint = Some(routed.address);
+        state.target_address = Some(Box::new(RawSocketAddress::new(routed.address)));
+        if state.target_udp {
+            state.xudp_target = Some(routed);
+        } else {
+            state.tcp_target = Some(routed);
+        }
         state.rule_checked = true;
     }
     let address = state
@@ -1325,9 +1559,11 @@ fn ensure_target_connect(
     } else {
         tcp_socket(address)?
     };
-    register_file(ring, state.target_slot, target_socket.as_raw_fd())?;
+    if state.fixed_files {
+        register_file(ring, state.target_slot, target_socket.as_raw_fd())?;
+    }
     state.target = Some(target_socket);
-    queue_connection!(state, pending, connect_target_entry(identifier, state));
+    queue_connection!(state, pending, connect_target_entry(identifier, state)?);
     Ok(())
 }
 
@@ -1362,14 +1598,19 @@ fn send_target_entry(
             None => state.client_input.as_ptr(),
         }
     };
-    opcode::Send::new(
-        types::Fixed(state.target_slot),
-        unsafe { source.add(state.upload_start + state.upload_offset) },
-        remaining as u32,
-    )
-    .ioprio(1)
-    .build()
-    .user_data(tag(identifier, OP_SEND_TARGET))
+    let source = unsafe { source.add(state.upload_start + state.upload_offset) };
+    let entry = if state.fixed_files {
+        opcode::Send::new(types::Fixed(state.target_slot), source, remaining as u32)
+            .ioprio(1)
+            .build()
+    } else {
+        opcode::PollAdd::new(
+            types::Fd(state.target.as_ref().expect("target socket").as_raw_fd()),
+            libc::POLLOUT as _,
+        )
+        .build()
+    };
+    entry.user_data(tag(identifier, OP_SEND_TARGET))
 }
 
 fn recv_target_entry(identifier: usize, state: &mut Connection) -> squeue::Entry {
@@ -1385,20 +1626,37 @@ fn recv_target_paced_entry(identifier: usize, state: &mut Connection) -> squeue:
         .download_local
         .as_mut()
         .expect("paced download buffer");
-    opcode::Recv::new(
-        types::Fixed(state.target_slot),
-        unsafe { buffer.as_mut_ptr().add(DOWNLOAD_HEADROOM) },
-        DOWNLOAD_PAYLOAD_SIZE as u32,
-    )
-    .ioprio(1)
-    .build()
-    .user_data(tag(identifier, OP_RECV_TARGET))
+    let buffer = unsafe { buffer.as_mut_ptr().add(DOWNLOAD_HEADROOM) };
+    let entry = if state.fixed_files {
+        opcode::Recv::new(
+            types::Fixed(state.target_slot),
+            buffer,
+            DOWNLOAD_PAYLOAD_SIZE as u32,
+        )
+        .ioprio(1)
+        .build()
+    } else {
+        opcode::PollAdd::new(
+            types::Fd(state.target.as_ref().expect("target socket").as_raw_fd()),
+            libc::POLLIN as _,
+        )
+        .build()
+    };
+    entry.user_data(tag(identifier, OP_RECV_TARGET))
 }
 
-fn cancel_entry(identifier: usize, target_operation: u8, cancel_operation: u8) -> squeue::Entry {
-    opcode::AsyncCancel::new(tag(identifier, target_operation))
-        .build()
-        .user_data(tag(identifier, cancel_operation))
+fn cancel_entry(
+    identifier: usize,
+    target_operation: u8,
+    cancel_operation: u8,
+    fixed_files: bool,
+) -> squeue::Entry {
+    let entry = if fixed_files {
+        opcode::AsyncCancel::new(tag(identifier, target_operation)).build()
+    } else {
+        opcode::PollRemove::new(tag(identifier, target_operation)).build()
+    };
+    entry.user_data(tag(identifier, cancel_operation))
 }
 
 fn send_client_entry(
@@ -1415,18 +1673,201 @@ fn send_client_entry(
         downloads.bytes(state.download_buffer.expect("download buffer"))
     };
     let remaining = state.client_output_length - state.client_output_offset;
-    opcode::Send::new(
-        types::Fixed(state.client_slot),
-        unsafe {
-            buffer
-                .as_ptr()
-                .add(state.client_output_start + state.client_output_offset)
-        },
-        remaining as u32,
-    )
-    .ioprio(1)
-    .build()
-    .user_data(tag(identifier, OP_SEND_CLIENT))
+    let buffer = unsafe {
+        buffer
+            .as_ptr()
+            .add(state.client_output_start + state.client_output_offset)
+    };
+    let entry = if state.fixed_files {
+        opcode::Send::new(types::Fixed(state.client_slot), buffer, remaining as u32)
+            .ioprio(1)
+            .build()
+    } else {
+        opcode::PollAdd::new(types::Fd(state._client.as_raw_fd()), libc::POLLOUT as _).build()
+    };
+    entry.user_data(tag(identifier, OP_SEND_CLIENT))
+}
+
+fn negative_errno() -> i32 {
+    -io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO)
+}
+
+fn syscall_result(result: isize) -> i32 {
+    if result < 0 {
+        negative_errno()
+    } else {
+        result as i32
+    }
+}
+
+fn accept_ready(descriptor: RawFd) -> i32 {
+    let result = unsafe {
+        libc::accept4(
+            descriptor,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+        )
+    };
+    if result < 0 {
+        negative_errno()
+    } else {
+        result
+    }
+}
+
+fn connect_ready(descriptor: RawFd) -> i32 {
+    let mut error = 0;
+    let mut length = mem::size_of_val(&error) as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            descriptor,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            (&mut error as *mut libc::c_int).cast(),
+            &mut length,
+        )
+    };
+    if result < 0 {
+        negative_errno()
+    } else if error == 0 {
+        0
+    } else {
+        -error
+    }
+}
+
+fn compat_vmess_result(
+    operation: u8,
+    state: &mut Connection,
+    uploads: &UploadBufferRing,
+    downloads: &DownloadBufferRing,
+) -> i32 {
+    match operation {
+        OP_RECV_CLIENT => {
+            let remaining = state.client_input.len() - state.client_end;
+            syscall_result(unsafe {
+                libc::recv(
+                    state._client.as_raw_fd(),
+                    state.client_input.as_mut_ptr().add(state.client_end).cast(),
+                    remaining,
+                    0,
+                )
+            })
+        }
+        OP_CONNECT_TARGET => {
+            connect_ready(state.target.as_ref().expect("target socket").as_raw_fd())
+        }
+        OP_SEND_TARGET => {
+            let remaining = state.upload_length - state.upload_offset;
+            let source = if state.upload_from_sniff {
+                state.sniff_buffer.as_ptr()
+            } else {
+                match state.upload_buffer {
+                    Some(buffer_id) => uploads.bytes(buffer_id).as_ptr(),
+                    None => state.client_input.as_ptr(),
+                }
+            };
+            syscall_result(unsafe {
+                libc::send(
+                    state.target.as_ref().expect("target socket").as_raw_fd(),
+                    source.add(state.upload_start + state.upload_offset).cast(),
+                    remaining,
+                    libc::MSG_NOSIGNAL,
+                )
+            })
+        }
+        OP_RECV_TARGET => {
+            let buffer = state
+                .download_local
+                .as_mut()
+                .expect("compat download buffer");
+            syscall_result(unsafe {
+                libc::recv(
+                    state.target.as_ref().expect("target socket").as_raw_fd(),
+                    buffer.as_mut_ptr().add(DOWNLOAD_HEADROOM).cast(),
+                    DOWNLOAD_PAYLOAD_SIZE,
+                    0,
+                )
+            })
+        }
+        OP_SEND_CLIENT => {
+            let buffer: &[u8] = if state.download_local_active {
+                state
+                    .download_local
+                    .as_deref()
+                    .expect("compat download buffer")
+            } else {
+                downloads.bytes(state.download_buffer.expect("download buffer"))
+            };
+            syscall_result(unsafe {
+                libc::send(
+                    state._client.as_raw_fd(),
+                    buffer
+                        .as_ptr()
+                        .add(state.client_output_start + state.client_output_offset)
+                        .cast(),
+                    state.client_output_length - state.client_output_offset,
+                    libc::MSG_NOSIGNAL,
+                )
+            })
+        }
+        _ => 0,
+    }
+}
+
+fn wait_for_completion(
+    ring: &mut IoUring,
+    io_backend: IoBackend,
+    deadline: Option<Instant>,
+) -> io::Result<()> {
+    if io_backend.fixed_files() {
+        if let Some(deadline) = deadline {
+            let wait = deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_nanos(1));
+            let timespec = types::Timespec::from(wait);
+            let arguments = types::SubmitArgs::new().timespec(&timespec);
+            if let Err(error) = ring.submitter().submit_with_args(1, &arguments) {
+                if error.raw_os_error() != Some(libc::ETIME) {
+                    return Err(error);
+                }
+            }
+        } else {
+            ring.submit_and_wait(1)?;
+        }
+        return Ok(());
+    }
+
+    ring.submit()?;
+    loop {
+        if !ring.completion().is_empty() {
+            return Ok(());
+        }
+        let timeout = deadline.map_or(-1, |deadline| {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                0
+            } else {
+                remaining.as_millis().clamp(1, i32::MAX as u128) as i32
+            }
+        });
+        let mut descriptor = libc::pollfd {
+            fd: ring.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout) };
+        if result >= 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }
 
 enum XudpFrame {
@@ -1808,6 +2249,9 @@ fn next_upload_entry(
                             payload_start,
                             payload_length,
                         } => {
+                            state.route_protocols |= crate::sniff::udp_protocols(
+                                &plaintext[payload_start..payload_start + payload_length],
+                            );
                             let target =
                                 target
                                     .or_else(|| state.xudp_target.clone())
@@ -2230,8 +2674,10 @@ fn retire_connection(
         }
         listeners[state.listener].prune_retired();
     }
-    unregister_file(ring, state.client_slot)?;
-    unregister_file(ring, state.target_slot)?;
+    if state.fixed_files {
+        unregister_file(ring, state.client_slot)?;
+        unregister_file(ring, state.target_slot)?;
+    }
     free_connections.push(identifier);
     Ok(())
 }
@@ -2386,6 +2832,23 @@ fn config_path() -> io::Result<String> {
 }
 
 fn main() -> io::Result<()> {
+    if has_argument("--probe-io-backend") {
+        let requested = env::var("OLDXR_FASTENGINE_IO_BACKEND")
+            .unwrap_or_else(|_| argument("--io-backend", "auto"));
+        let (_ring, backend, _upload, _download, reason) = io_backend(&requested)?;
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "engine": "FastEngine",
+                "io_backend": backend.name(),
+                "reason": reason,
+                "requested": requested,
+                "target_arch": env::consts::ARCH,
+                "target_env": if cfg!(target_env = "musl") { "musl" } else { "gnu" },
+            }))?
+        );
+        return Ok(());
+    }
     if has_argument("--supervised") {
         // systemd's default KillMode sends SIGTERM to every process in the
         // service cgroup. Keep the data engine alive while its Go supervisor
@@ -2407,7 +2870,12 @@ fn main() -> io::Result<()> {
         numeric_argument("--uplink-only-seconds", 0)?,
         numeric_argument("--downlink-only-seconds", 0)?,
     );
-    let configs: Vec<Config> = serde_json::from_slice(&fs::read(config_path()?)?)?;
+    let (configs, router) = match serde_json::from_slice(&fs::read(config_path()?)?)? {
+        EngineConfigFile::Normalized { listeners, routing } => {
+            (listeners, Arc::new(routing::Router::compile(routing)?))
+        }
+        EngineConfigFile::Legacy(listeners) => (listeners, Arc::new(routing::Router::direct())),
+    };
     let mut listeners = Vec::with_capacity(configs.len());
     for config in configs {
         if config.protocol.kind != "vmess" {
@@ -2427,11 +2895,14 @@ fn main() -> io::Result<()> {
         )?);
     }
 
-    let mut ring = IoUring::builder()
-        .setup_single_issuer()
-        .setup_defer_taskrun()
-        .build(RING_ENTRIES)?;
-    ring.submitter().register_files_sparse(FIXED_FILE_SLOTS)?;
+    let requested_io_backend = env::var("OLDXR_FASTENGINE_IO_BACKEND")
+        .unwrap_or_else(|_| argument("--io-backend", "auto"));
+    let (mut ring, io_backend, mut upload_buffers, mut download_buffers, io_backend_reason) =
+        io_backend(&requested_io_backend)?;
+    eprintln!(
+        "FastEngine I/O backend: {} ({io_backend_reason})",
+        io_backend.name()
+    );
     let ss_addresses = ss_listen_addresses(
         &argument("--ss-listen-address", "127.0.0.1"),
         &argument("--ss-ports", ""),
@@ -2452,14 +2923,14 @@ fn main() -> io::Result<()> {
         VMESS_FIXED_FILE_SLOTS,
         Duration::from_secs(numeric_argument("--ss-udp-idle-seconds", 120)? as u64),
         tcp_timeouts,
+        io_backend.fixed_files(),
+        Arc::clone(&router),
     )?;
     let mut admin_control = if admin_socket_path.is_empty() {
         None
     } else {
         Some(start_admin(&admin_socket_path)?)
     };
-    let mut upload_buffers = UploadBufferRing::new(&ring)?;
-    let mut download_buffers = DownloadBufferRing::new(&ring)?;
     let mut padding_random = PaddingRandom::new();
     let mut connections: Vec<Option<Connection>> = Vec::with_capacity(MAX_CONNECTIONS + 1);
     connections.push(None);
@@ -2479,11 +2950,12 @@ fn main() -> io::Result<()> {
         &mut accept_armed_count,
         &mut accept_cursor,
         active_connections,
+        io_backend.fixed_files(),
         &mut pending,
     );
     ss_engine.arm(&mut pending);
     if let Some(control) = admin_control.as_mut() {
-        pending.push(admin_event_entry(control));
+        pending.push(admin_event_entry(control, !io_backend.fixed_files()));
     }
     for entry in pending.drain(..) {
         push(&mut ring, entry)?;
@@ -2520,20 +2992,7 @@ fn main() -> io::Result<()> {
         .into_iter()
         .flatten()
         .min();
-        if let Some(deadline) = deadline {
-            let wait = deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_nanos(1));
-            let timespec = types::Timespec::from(wait);
-            let arguments = types::SubmitArgs::new().timespec(&timespec);
-            if let Err(error) = ring.submitter().submit_with_args(1, &arguments) {
-                if error.raw_os_error() != Some(libc::ETIME) {
-                    return Err(error);
-                }
-            }
-        } else {
-            ring.submit_and_wait(1)?;
-        }
+        wait_for_completion(&mut ring, io_backend, deadline)?;
         completions.clear();
         completions.extend(ring.completion().map(|completion| {
             (
@@ -2544,7 +3003,7 @@ fn main() -> io::Result<()> {
         }));
         pending.clear();
 
-        for (user_data, result, completion_flags) in completions.drain(..) {
+        for (user_data, mut result, completion_flags) in completions.drain(..) {
             if ss::owns(user_data) {
                 ss_engine.handle_completion(&mut ring, user_data, result, &mut pending)?;
                 continue;
@@ -2555,15 +3014,21 @@ fn main() -> io::Result<()> {
                 if result < 0 && -result != libc::EAGAIN {
                     return Err(io::Error::from_raw_os_error(-result));
                 }
+                if !io_backend.fixed_files() && result >= 0 {
+                    drain_admin_event(control)?;
+                }
                 while let Ok(command) = control.receiver.try_recv() {
                     let _ = process_admin_command(command, &mut ss_engine, &mut listeners);
                 }
-                pending.push(admin_event_entry(control));
+                pending.push(admin_event_entry(control, !io_backend.fixed_files()));
                 continue;
             }
             if operation == OP_ACCEPT {
                 accept_armed[identifier] = false;
                 accept_armed_count = accept_armed_count.saturating_sub(1);
+                if !io_backend.fixed_files() && result >= 0 {
+                    result = accept_ready(listeners[identifier].socket.as_raw_fd());
+                }
                 if result < 0 {
                     arm_accepts(
                         &listeners,
@@ -2571,6 +3036,7 @@ fn main() -> io::Result<()> {
                         &mut accept_armed_count,
                         &mut accept_cursor,
                         active_connections,
+                        io_backend.fixed_files(),
                         &mut pending,
                     );
                     continue;
@@ -2583,6 +3049,7 @@ fn main() -> io::Result<()> {
                         &mut accept_armed_count,
                         &mut accept_cursor,
                         active_connections,
+                        io_backend.fixed_files(),
                         &mut pending,
                     );
                     continue;
@@ -2594,6 +3061,7 @@ fn main() -> io::Result<()> {
                         &mut accept_armed_count,
                         &mut accept_cursor,
                         active_connections,
+                        io_backend.fixed_files(),
                         &mut pending,
                     );
                     continue;
@@ -2605,12 +3073,15 @@ fn main() -> io::Result<()> {
                 let connection_id = free_connections.pop().unwrap_or(connections.len());
                 let client_slot = (connection_id * 2) as u32;
                 let target_slot = client_slot + 1;
-                register_file(&mut ring, client_slot, client.as_raw_fd())?;
+                if io_backend.fixed_files() {
+                    register_file(&mut ring, client_slot, client.as_raw_fd())?;
+                }
                 let mut state = Connection {
                     _client: client,
                     target: None,
                     client_slot,
                     target_slot,
+                    fixed_files: io_backend.fixed_files(),
                     listener: identifier,
                     user: None,
                     peer_ip,
@@ -2618,12 +3089,16 @@ fn main() -> io::Result<()> {
                     target_address: None,
                     pending_target: None,
                     tcp_target: None,
-                    sniff: SniffState::new(listeners[identifier].sniffing),
+                    sniff: SniffState::with_bittorrent(
+                        listeners[identifier].sniffing,
+                        router.needs_bittorrent(),
+                    ),
                     sniff_buffer: Vec::new(),
                     target_udp: false,
                     xudp: false,
                     xudp_session_id: 0,
                     xudp_target: None,
+                    route_protocols: 0,
                     rule_checked: false,
                     session: None,
                     client_input: Box::new([0; CLIENT_INPUT_SIZE]),
@@ -2684,6 +3159,7 @@ fn main() -> io::Result<()> {
                     &mut accept_armed_count,
                     &mut accept_cursor,
                     active_connections,
+                    io_backend.fixed_files(),
                     &mut pending,
                 );
                 continue;
@@ -2692,6 +3168,9 @@ fn main() -> io::Result<()> {
             let Some(state) = connections.get_mut(identifier).and_then(Option::as_mut) else {
                 continue;
             };
+            if !io_backend.fixed_files() && result >= 0 {
+                result = compat_vmess_result(operation, state, &upload_buffers, &download_buffers);
+            }
             complete_request(state, operation, completion_flags);
             if operation == OP_RECV_CLIENT && !cqueue::more(completion_flags) {
                 state.client_multishot_armed = false;
@@ -2710,6 +3189,19 @@ fn main() -> io::Result<()> {
                     features,
                 );
                 continue;
+            }
+            if !io_backend.fixed_files() && result == -libc::EAGAIN {
+                let retry = match operation {
+                    OP_RECV_CLIENT => Some(recv_client_entry(identifier, state)?),
+                    OP_SEND_TARGET => Some(send_target_entry(identifier, state, &upload_buffers)),
+                    OP_RECV_TARGET => Some(recv_target_paced_entry(identifier, state)),
+                    OP_SEND_CLIENT => Some(send_client_entry(identifier, state, &download_buffers)),
+                    _ => None,
+                };
+                if let Some(entry) = retry {
+                    queue_connection!(state, pending, entry);
+                    continue;
+                }
             }
             if result < 0 {
                 if result == -libc::ENOBUFS {
@@ -2797,6 +3289,7 @@ fn main() -> io::Result<()> {
                                     state,
                                     &mut listeners[site],
                                     features,
+                                    &router,
                                     &mut ring,
                                     &mut pending,
                                 ) {
@@ -2843,7 +3336,7 @@ fn main() -> io::Result<()> {
                                         state.target_address =
                                             Some(Box::new(RawSocketAddress::new(target.address)));
                                         state.xudp_target = Some(target);
-                                    } else if site.sniffing {
+                                    } else if site.sniffing || router.needs_bittorrent() {
                                         state.pending_target = Some(target);
                                     } else {
                                         state.target_endpoint = Some(target.address);
@@ -2872,8 +3365,9 @@ fn main() -> io::Result<()> {
                                 state.timeout.authenticated(Instant::now());
                                 state.target_udp = target_udp;
                                 state.xudp = xudp;
-                                let one_shot = features.limiter
-                                    && site.users[user_index].limiter.requires_paced_io();
+                                let one_shot = !state.fixed_files
+                                    || features.limiter
+                                        && site.users[user_index].limiter.requires_paced_io();
                                 state.client_one_shot = one_shot;
                                 state.target_one_shot = one_shot;
                                 if state.target_one_shot {
@@ -2899,6 +3393,7 @@ fn main() -> io::Result<()> {
                                     state,
                                     site,
                                     features,
+                                    &router,
                                     &mut ring,
                                     &mut pending,
                                 ) {
@@ -2964,6 +3459,7 @@ fn main() -> io::Result<()> {
                                 state,
                                 &mut listeners[site],
                                 features,
+                                &router,
                                 &mut ring,
                                 &mut pending,
                             ) {
@@ -3314,14 +3810,24 @@ fn main() -> io::Result<()> {
                     queue_connection!(
                         state,
                         pending,
-                        cancel_entry(identifier, OP_RECV_CLIENT, OP_CANCEL_CLIENT_RECV)
+                        cancel_entry(
+                            identifier,
+                            OP_RECV_CLIENT,
+                            OP_CANCEL_CLIENT_RECV,
+                            state.fixed_files,
+                        )
                     );
                 }
                 if state.target_multishot_armed {
                     queue_connection!(
                         state,
                         pending,
-                        cancel_entry(identifier, OP_RECV_TARGET, OP_CANCEL_TARGET_RECV)
+                        cancel_entry(
+                            identifier,
+                            OP_RECV_TARGET,
+                            OP_CANCEL_TARGET_RECV,
+                            state.fixed_files,
+                        )
                     );
                 }
             }
@@ -3361,6 +3867,7 @@ fn main() -> io::Result<()> {
             &mut accept_armed_count,
             &mut accept_cursor,
             active_connections,
+            io_backend.fixed_files(),
             &mut pending,
         );
 
@@ -3394,6 +3901,9 @@ fn main() -> io::Result<()> {
                 }
                 let ss_status = ss_engine.status();
                 let status = serde_json::json!({
+                    "engine": "FastEngine",
+                    "io_backend": io_backend.name(),
+                    "io_backend_reason": io_backend_reason,
                     "vmess": {
                         "live_users": vmess_live_users,
                         "retired_users": vmess_retired_users,

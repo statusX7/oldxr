@@ -40,8 +40,13 @@ type ConnectionConfig struct {
 }
 
 type FastEngineFile struct {
-	Nodes      []Node
-	Connection ConnectionConfig
+	Nodes              []Node
+	Connection         ConnectionConfig
+	Routing            RoutingPlan
+	DNSConfigPath      string
+	InboundConfigPath  string
+	OutboundConfigPath string
+	RouteConfigPath    string
 }
 
 type Node struct {
@@ -169,8 +174,8 @@ func normalizedConnection(input *ConnectionConfig) ConnectionConfig {
 }
 
 func validateFastEngineFile(file File) error {
-	if file.DNSConfigPath != "" || file.InboundConfigPath != "" || file.OutboundConfigPath != "" || file.RouteConfigPath != "" {
-		return LegacyRequired("custom DNS, inbound, outbound or route files are configured")
+	if file.DNSConfigPath != "" || file.InboundConfigPath != "" {
+		return LegacyRequired("custom DNS or inbound files are configured")
 	}
 	if file.LogConfig.AccessPath != "" || file.LogConfig.ErrorPath != "" {
 		return LegacyRequired("custom access or error log paths are configured")
@@ -199,7 +204,7 @@ func validateFastEngineNode(node Node) error {
 	if controller.GlobalDeviceLimitConfig.Enable {
 		return LegacyRequired("GlobalDeviceLimitConfig is enabled")
 	}
-	if len(controller.FallBackConfigs) != 0 {
+	if controller.EnableFallback && len(controller.FallBackConfigs) != 0 {
 		return LegacyRequired("FallBackConfigs are configured")
 	}
 	if controller.CertConfig.CertMode != "" && !strings.EqualFold(controller.CertConfig.CertMode, "none") {
@@ -214,6 +219,10 @@ func LoadFastEngine(path string) (FastEngineFile, error) {
 		return FastEngineFile{}, err
 	}
 	if err := validateFastEngineFile(file); err != nil {
+		return FastEngineFile{}, err
+	}
+	routing, err := compileRouting(file.RouteConfigPath, file.OutboundConfigPath)
+	if err != nil {
 		return FastEngineFile{}, err
 	}
 	nodes := make([]Node, 0, len(file.Nodes))
@@ -240,5 +249,13 @@ func LoadFastEngine(path string) (FastEngineFile, error) {
 	if connection.BufferSize != 16 {
 		return FastEngineFile{}, LegacyRequired("ConnectionConfig.BufferSize %d is not supported by FastEngine", connection.BufferSize)
 	}
-	return FastEngineFile{Nodes: nodes, Connection: connection}, nil
+	return FastEngineFile{
+		Nodes:              nodes,
+		Connection:         connection,
+		Routing:            routing,
+		DNSConfigPath:      file.DNSConfigPath,
+		InboundConfigPath:  file.InboundConfigPath,
+		OutboundConfigPath: file.OutboundConfigPath,
+		RouteConfigPath:    file.RouteConfigPath,
+	}, nil
 }

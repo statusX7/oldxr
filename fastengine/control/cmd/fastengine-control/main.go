@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +38,11 @@ type engineProtocolConfig struct {
 type engineListenerConfig struct {
 	Address  string               `json:"address"`
 	Protocol engineProtocolConfig `json:"protocol"`
+}
+
+type engineConfigFile struct {
+	Listeners []engineListenerConfig `json:"listeners"`
+	Routing   config.RoutingPlan     `json:"routing"`
 }
 
 type managedNode struct {
@@ -361,7 +367,7 @@ func engineInputs(nodes []*managedNode) ([]engineListenerConfig, string, []strin
 	return vmess, ssAddress, ssPorts, ssSniffing, nil
 }
 
-func writeEngineConfig(configs []engineListenerConfig) (string, error) {
+func writeEngineConfig(configs []engineListenerConfig, routing config.RoutingPlan) (string, error) {
 	file, err := os.CreateTemp("", "oldxr-fastengine-*.json")
 	if err != nil {
 		return "", err
@@ -375,7 +381,7 @@ func writeEngineConfig(configs []engineListenerConfig) (string, error) {
 	if err := file.Chmod(0o600); err != nil {
 		return cleanup(err)
 	}
-	if err := json.NewEncoder(file).Encode(configs); err != nil {
+	if err := json.NewEncoder(file).Encode(engineConfigFile{Listeners: configs, Routing: routing}); err != nil {
 		return cleanup(err)
 	}
 	if err := file.Sync(); err != nil {
@@ -492,8 +498,124 @@ func invocationArguments(arguments []string) ([]string, bool) {
 	}
 }
 
+func diagnosticFile(path string) map[string]any {
+	result := map[string]any{"configured": path != "", "path": path}
+	if path == "" {
+		result["status"] = "未配置"
+		return result
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		result["status"] = "不可用"
+		result["error"] = err.Error()
+		return result
+	}
+	result["status"] = "可读"
+	result["size_bytes"] = info.Size()
+	return result
+}
+
+func diagnosticCommandOutput(name string, arguments ...string) string {
+	output, err := exec.Command(name, arguments...).Output()
+	if err != nil {
+		return "unknown"
+	}
+	return strings.TrimSpace(string(output))
+}
+
+func emitFastEngineDiagnostic(configPath, engineBinary string) int {
+	report := map[string]any{
+		"config":               configPath,
+		"fastengine_eligible":  false,
+		"selected_engine":      "none",
+		"unsupported_features": []string{},
+		"host": map[string]any{
+			"os":      runtime.GOOS,
+			"arch":    runtime.GOARCH,
+			"kernel":  diagnosticCommandOutput("uname", "-r"),
+			"libc":    diagnosticCommandOutput("getconf", "GNU_LIBC_VERSION"),
+			"cpu_abi": "generic Linux release baseline; no target-cpu=native",
+		},
+	}
+	loaded, err := config.LoadFastEngine(configPath)
+	if err != nil {
+		report["reason"] = err.Error()
+		if errors.Is(err, config.ErrLegacyRequired) {
+			report["selected_engine"] = "LegacyEngine"
+			report["unsupported_features"] = []string{err.Error()}
+		}
+		_ = json.NewEncoder(os.Stdout).Encode(report)
+		return 1
+	}
+
+	vmessNodes := 0
+	shadowsocksNodes := 0
+	ruleListNodes := 0
+	for _, node := range loaded.Nodes {
+		switch {
+		case strings.EqualFold(node.API.NodeType, "V2ray"):
+			vmessNodes++
+		case strings.EqualFold(node.API.NodeType, "Shadowsocks"):
+			shadowsocksNodes++
+		}
+		if node.API.RuleListPath != "" {
+			ruleListNodes++
+		}
+	}
+	report["paths"] = map[string]any{
+		"dns":      diagnosticFile(loaded.DNSConfigPath),
+		"inbound":  diagnosticFile(loaded.InboundConfigPath),
+		"outbound": diagnosticFile(loaded.OutboundConfigPath),
+		"route":    diagnosticFile(loaded.RouteConfigPath),
+	}
+	report["normalized_plan"] = map[string]any{
+		"vmess_nodes":           vmessNodes,
+		"shadowsocks_nodes":     shadowsocksNodes,
+		"rulelist_nodes":        ruleListNodes,
+		"routing_rules":         len(loaded.Routing.Rules),
+		"outbounds":             len(loaded.Routing.Outbounds),
+		"route_domain_strategy": loaded.Routing.DomainStrategy,
+	}
+	report["panel_runtime_validation"] = "启动时执行，诊断命令不访问面板或凭据"
+
+	command := exec.Command(engineBinary, "--probe-io-backend")
+	command.Env = os.Environ()
+	output, probeErr := command.Output()
+	if probeErr != nil {
+		probeDetail := probeErr.Error()
+		var exitError *exec.ExitError
+		if errors.As(probeErr, &exitError) && len(exitError.Stderr) != 0 {
+			probeDetail = strings.TrimSpace(string(exitError.Stderr))
+		}
+		report["reason"] = fmt.Sprintf("FastEngine I/O capability probe failed: %s", probeDetail)
+		report["io_backend"] = map[string]any{"status": "不可用", "binary": engineBinary}
+		_ = json.NewEncoder(os.Stdout).Encode(report)
+		return 1
+	}
+	var backend map[string]any
+	if err := json.Unmarshal(output, &backend); err != nil {
+		report["reason"] = fmt.Sprintf("FastEngine I/O probe returned invalid JSON: %v", err)
+		report["io_backend"] = map[string]any{"status": "无效响应", "binary": engineBinary}
+		_ = json.NewEncoder(os.Stdout).Encode(report)
+		return 1
+	}
+	backend["status"] = "可用"
+	backend["binary"] = engineBinary
+	report["io_backend"] = backend
+	report["fastengine_eligible"] = true
+	report["selected_engine"] = "FastEngine"
+	report["reason"] = "配置编译和 I/O capability probe 均通过"
+	_ = json.NewEncoder(os.Stdout).Encode(report)
+	return 0
+}
+
 func main() {
-	arguments, versionCommand := invocationArguments(os.Args[1:])
+	rawArguments := os.Args[1:]
+	diagnoseCommand := len(rawArguments) != 0 && rawArguments[0] == "diagnose-fastengine"
+	if diagnoseCommand {
+		rawArguments = rawArguments[1:]
+	}
+	arguments, versionCommand := invocationArguments(rawArguments)
 	if versionCommand {
 		showVersion()
 		return
@@ -520,6 +642,9 @@ func main() {
 		showVersion()
 		return
 	}
+	if diagnoseCommand {
+		os.Exit(emitFastEngineDiagnostic(*configPath, *engineBinary))
+	}
 
 	loaded, err := config.LoadFastEngine(*configPath)
 	if err != nil {
@@ -545,7 +670,7 @@ func main() {
 		}
 		log.Fatal(err)
 	}
-	engineConfigPath, err := writeEngineConfig(vmessConfigs)
+	engineConfigPath, err := writeEngineConfig(vmessConfigs, loaded.Routing)
 	if err != nil {
 		log.Fatal(err)
 	}
