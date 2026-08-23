@@ -201,6 +201,7 @@ func compileRouting(routePath, outboundPath string) (RoutingPlan, error) {
 		DomainStrategy:  "as_is",
 		DefaultOutbound: 0,
 		Outbounds:       outbounds,
+		Rules:           make([]RoutingRulePlan, 0),
 	}
 	if routePath == "" {
 		return plan, nil

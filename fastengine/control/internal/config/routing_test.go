@@ -73,6 +73,16 @@ func TestCompileRoutingExactPhase8Sample(t *testing.T) {
 	}
 }
 
+func TestCompileRoutingWithoutCustomRouteEmitsEmptyRuleArray(t *testing.T) {
+	plan, err := compileRouting("", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Rules == nil || len(plan.Rules) != 0 {
+		t.Fatalf("default rules = %#v, want non-nil empty slice", plan.Rules)
+	}
+}
+
 func TestCompileRoutingRejectsUnknownAndDuplicateOutbounds(t *testing.T) {
 	route := writeRoutingFixture(t, "route.json", `{"rules":[{"outboundTag":"missing","network":"tcp"}]}`)
 	if _, err := compileRouting(route, ""); err == nil || !strings.Contains(err.Error(), "unknown outboundTag") {
