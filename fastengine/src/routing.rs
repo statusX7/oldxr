@@ -522,6 +522,123 @@ mod tests {
     }
 
     #[test]
+    fn geoip_private_blocks_required_ipv4_and_ipv6_ranges() {
+        let router = Router::compile(PlanConfig {
+            domain_strategy: DomainStrategy::IpOnDemand,
+            default_outbound: 0,
+            outbounds: vec![
+                OutboundConfig {
+                    tag: "direct".into(),
+                    action: OutboundAction::Direct,
+                    domain_strategy: OutboundDomainStrategy::AsIs,
+                },
+                OutboundConfig {
+                    tag: "block".into(),
+                    action: OutboundAction::Blackhole,
+                    domain_strategy: OutboundDomainStrategy::AsIs,
+                },
+            ],
+            rules: vec![RuleConfig {
+                outbound: 1,
+                networks: NETWORK_TCP | NETWORK_UDP,
+                network_constraint: false,
+                ports: Vec::new(),
+                cidrs: vec![
+                    "10.0.0.0/8".into(),
+                    "172.16.0.0/12".into(),
+                    "127.0.0.0/8".into(),
+                    "fc00::/7".into(),
+                    "fe80::/10".into(),
+                ],
+                protocols: 0,
+            }],
+        })
+        .unwrap();
+
+        for address in [
+            "10.0.0.1:443",
+            "172.16.1.1:443",
+            "127.0.0.1:443",
+            "[fc00::1]:443",
+            "[fe80::1]:443",
+        ] {
+            let target = ResolvedTarget::from_ip(address.parse().unwrap());
+            assert_eq!(
+                router
+                    .route_target(NETWORK_TCP, &target, 0)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied,
+                "private target {address} was not blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn compiled_port_ranges_block_required_boundaries_only() {
+        let router = Router::compile(PlanConfig {
+            domain_strategy: DomainStrategy::AsIs,
+            default_outbound: 0,
+            outbounds: vec![
+                OutboundConfig {
+                    tag: "direct".into(),
+                    action: OutboundAction::Direct,
+                    domain_strategy: OutboundDomainStrategy::AsIs,
+                },
+                OutboundConfig {
+                    tag: "block".into(),
+                    action: OutboundAction::Blackhole,
+                    domain_strategy: OutboundDomainStrategy::AsIs,
+                },
+            ],
+            rules: vec![RuleConfig {
+                outbound: 1,
+                networks: NETWORK_TCP | NETWORK_UDP,
+                network_constraint: false,
+                ports: vec![
+                    PortRangeConfig { from: 22, to: 25 },
+                    PortRangeConfig {
+                        from: 3389,
+                        to: 3389,
+                    },
+                    PortRangeConfig {
+                        from: 6881,
+                        to: 6999,
+                    },
+                    PortRangeConfig {
+                        from: 10000,
+                        to: 38887,
+                    },
+                    PortRangeConfig {
+                        from: 38889,
+                        to: 65535,
+                    },
+                ],
+                cidrs: Vec::new(),
+                protocols: 0,
+            }],
+        })
+        .unwrap();
+
+        for port in [22, 25, 3389, 6881, 10000, 65535] {
+            let target = ResolvedTarget::from_ip(([8, 8, 8, 8], port).into());
+            assert_eq!(
+                router
+                    .route_target(NETWORK_TCP, &target, 0)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::PermissionDenied,
+                "blocked port {port} was allowed"
+            );
+        }
+        let allowed = ResolvedTarget::from_ip(([8, 8, 8, 8], 443).into());
+        assert_eq!(
+            router.route_target(NETWORK_TCP, &allowed, 0).unwrap(),
+            allowed
+        );
+    }
+
+    #[test]
     fn rejects_out_of_bounds_handles_and_invalid_cidrs() {
         let mut config = PlanConfig {
             domain_strategy: DomainStrategy::AsIs,

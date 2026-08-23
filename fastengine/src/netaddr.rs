@@ -258,6 +258,15 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_strategy_rejects_a_domain_without_ipv6_candidates() {
+        let target = ResolvedTarget::from_domain("ipv4-only.test", 443).unwrap();
+        let addresses = ["192.0.2.1:443".parse().unwrap()];
+        let error = target.resolve_ipv6_from(Some(&addresses)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "target name has no IPv6 address");
+    }
+
+    #[test]
     fn domain_targets_are_not_resolved_during_parsing() {
         let target = ResolvedTarget::from_domain("does-not-exist.invalid", 443).unwrap();
         assert_eq!(target.address, None);
