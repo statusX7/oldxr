@@ -68,7 +68,9 @@ case "${target_arch}" in
 esac
 
 version_value="${release_version#v}"
-legacy_build_flags=(-trimpath -buildvcs=false -ldflags "-s -w -buildid= -X main.version=${version_value}")
+# Keep the legacy binary's Go symbol metadata so govulncheck can distinguish
+# linked packages from module-only dependencies. DWARF remains omitted.
+legacy_build_flags=(-trimpath -buildvcs=false -ldflags "-w -buildid= -X main.version=${version_value}")
 control_build_flags=(-trimpath -buildvcs=false -ldflags "-s -w -buildid= -X main.version=${version_value}")
 
 echo "构建 ${target_os}/${target_arch} -> XrayR-${asset_name}.zip"
