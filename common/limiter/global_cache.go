@@ -11,6 +11,7 @@ import (
 	redisStore "github.com/eko/gocache/store/redis/v4"
 	"github.com/go-redis/redis/v8"
 	"github.com/vmihailenco/msgpack"
+	coreErrors "github.com/xtls/xray-core/common/errors"
 )
 
 type globalIPCache interface {
@@ -163,7 +164,7 @@ func (c *layeredGlobalIPCache) Close() error {
 func closeGlobalIPCache(globalCache globalIPCache) {
 	if closer, ok := globalCache.(interface{ Close() error }); ok {
 		if err := closer.Close(); err != nil {
-			newError("close global cache").Base(err).AtError().WriteToLog()
+			coreErrors.LogErrorInner(context.Background(), err, "close global cache")
 		}
 	}
 }

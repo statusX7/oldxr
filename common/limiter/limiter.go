@@ -13,6 +13,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/XrayR-project/XrayR/api"
+	coreErrors "github.com/xtls/xray-core/common/errors"
 )
 
 type UserInfo struct {
@@ -247,7 +248,7 @@ func (l *Limiter) GetUserBucket(tag string, email string, ip string) (limiter *r
 
 		return bucket, speedLimited, false
 	} else {
-		newError("Get Inbound Limiter information failed").AtDebug().WriteToLog()
+		coreErrors.LogDebug(context.Background(), "Get Inbound Limiter information failed")
 		return nil, false, false
 	}
 }
@@ -268,10 +269,10 @@ func globalLimit(inboundInfo *InboundInfo, email string, uid int, ip string, dev
 		if _, ok := err.(*store.NotFound); ok {
 			// If the email is a new device
 			if err := pushIP(ctx, inboundInfo, uniqueKey, &map[string]int{ip: uid}); err != nil {
-				newError("cache service").Base(err).AtError().WriteToLog()
+				coreErrors.LogErrorInner(ctx, err, "cache service")
 			}
 		} else {
-			newError("cache service").Base(err).AtError().WriteToLog()
+			coreErrors.LogErrorInner(ctx, err, "cache service")
 		}
 		return false
 	}
@@ -291,7 +292,7 @@ func globalLimit(inboundInfo *InboundInfo, email string, uid int, ip string, dev
 	}
 	updated[ip] = uid
 	if err := pushIP(ctx, inboundInfo, uniqueKey, &updated); err != nil {
-		newError("cache service").Base(err).AtError().WriteToLog()
+		coreErrors.LogErrorInner(ctx, err, "cache service")
 	}
 
 	return false

@@ -1,12 +1,14 @@
 package controller
 
 import (
+	"context"
 	"encoding/base64"
 	"fmt"
 	"strings"
 
 	"github.com/sagernet/sing-shadowsocks/shadowaead_2022"
 	C "github.com/sagernet/sing/common"
+	coreErrors "github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/infra/conf"
@@ -83,7 +85,7 @@ func (c *Controller) buildSSUser(userInfo *[]api.UserInfo, method string, tag st
 			e := formatUserTag(tag, &user)
 			userKey, err := c.checkShadowsocksPassword(user.Passwd, method)
 			if err != nil {
-				newError(fmt.Errorf("[UID: %d] %s", user.UID, err)).AtError().WriteToLog()
+				coreErrors.LogErrorInner(context.Background(), err, fmt.Sprintf("[UID: %d]", user.UID))
 				continue
 			}
 			users[i] = &protocol.User{
@@ -118,7 +120,7 @@ func (c *Controller) buildSSPluginUser(userInfo *[]api.UserInfo, tag string) (us
 			e := formatUserTag(tag, &user)
 			userKey, err := c.checkShadowsocksPassword(user.Passwd, user.Method)
 			if err != nil {
-				newError(fmt.Errorf("[UID: %d] %s", user.UID, err)).AtError().WriteToLog()
+				coreErrors.LogErrorInner(context.Background(), err, fmt.Sprintf("[UID: %d]", user.UID))
 				continue
 			}
 			users[i] = &protocol.User{
