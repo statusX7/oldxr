@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if [[ $# -lt 3 || $# -gt 6 ]]; then
-    echo "用法：$0 RELEASE_ARCHIVE INSTALL_SCRIPT OFFICIAL_BINARY [STATUSX7_XR_BINARY] [OLDXR_R1_BINARY] [OLDXR_R2_BINARY]" >&2
+if [[ $# -lt 3 || $# -gt 7 ]]; then
+    echo "用法：$0 RELEASE_ARCHIVE INSTALL_SCRIPT OFFICIAL_BINARY [STATUSX7_XR_BINARY] [OLDXR_R1_BINARY] [OLDXR_R2_BINARY] [OLDXR_R3_BINARY]" >&2
     exit 2
 fi
 
@@ -12,9 +12,11 @@ source_binary="$(cd "$(dirname "$3")" && pwd)/$(basename "$3")"
 statusx7_binary="${4:-${source_binary}}"
 oldxr_r1_binary="${5:-${source_binary}}"
 oldxr_r2_binary="${6:-${source_binary}}"
+oldxr_r3_binary="${7:-${source_binary}}"
 statusx7_binary="$(cd "$(dirname "${statusx7_binary}")" && pwd)/$(basename "${statusx7_binary}")"
 oldxr_r1_binary="$(cd "$(dirname "${oldxr_r1_binary}")" && pwd)/$(basename "${oldxr_r1_binary}")"
 oldxr_r2_binary="$(cd "$(dirname "${oldxr_r2_binary}")" && pwd)/$(basename "${oldxr_r2_binary}")"
+oldxr_r3_binary="$(cd "$(dirname "${oldxr_r3_binary}")" && pwd)/$(basename "${oldxr_r3_binary}")"
 archive_name="$(basename "${archive}")"
 checksum="${archive}.sha256"
 release_version="$(sed -n 's/^MAINTENANCE_0_9_0="\([^"]*\)"/\1/p' "${install_script}")"
@@ -24,7 +26,7 @@ if [[ ! "${release_version}" =~ ^v0\.9\.0-r[0-9]+$ ]]; then
     exit 1
 fi
 
-for required in "${archive}" "${checksum}" "${install_script}" "${source_binary}" "${statusx7_binary}" "${oldxr_r1_binary}" "${oldxr_r2_binary}"; do
+for required in "${archive}" "${checksum}" "${install_script}" "${source_binary}" "${statusx7_binary}" "${oldxr_r1_binary}" "${oldxr_r2_binary}" "${oldxr_r3_binary}"; do
     [[ -f "${required}" ]] || { echo "错误：测试输入不存在：${required}" >&2; exit 1; }
 done
 
@@ -178,6 +180,12 @@ printf 'v0.9.0-r2\n' > "${test_root}/oldxr-r2/usr/local/XrayR/.oldxr-release"
 printf 'v0.9.0-r2\n' > "${test_root}/oldxr-r2/version-before"
 assert_preserved_upgrade oldxr-r2 oldxr
 
+echo "执行 oldxr v0.9.0-r3 布局升级测试"
+prepare_layout oldxr-r3 'https://github.com/statusX7/oldxr' "${oldxr_r3_binary}"
+printf 'v0.9.0-r3\n' > "${test_root}/oldxr-r3/usr/local/XrayR/.oldxr-release"
+printf 'v0.9.0-r3\n' > "${test_root}/oldxr-r3/version-before"
+assert_preserved_upgrade oldxr-r3 oldxr
+
 echo "执行 service 启动失败回滚测试"
 prepare_layout rollback 'https://github.com/XrayR-project/XrayR' "${source_binary}"
 touch "${test_root}/rollback/systemctl-fail-once"
@@ -201,4 +209,4 @@ for absent_after_rollback in geoip.dat geosite.dat; do
     [[ ! -e "${test_root}/rollback/etc/XrayR/${absent_after_rollback}" ]]
 done
 
-echo "PASS：official、statusX7/XR、r1、r2 四类历史布局均保留配置与全部自定义文件，持久备份和 service 失败回滚有效。"
+echo "PASS：official、statusX7/XR、r1、r2、r3 五类历史布局均保留配置与全部自定义文件，持久备份和 service 失败回滚有效。"
