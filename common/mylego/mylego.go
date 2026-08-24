@@ -4,12 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 )
-
-var defaultPath string
 
 func New(certConf *CertConfig) (*LegoCMD, error) {
 	// Set default path to configPath/cert
@@ -23,7 +20,7 @@ func New(certConf *CertConfig) (*LegoCMD, error) {
 		p = "."
 	}
 
-	defaultPath = filepath.Join(p, "cert")
+	defaultPath := filepath.Join(p, "cert")
 	lego := &LegoCMD{
 		C:    certConf,
 		path: defaultPath,
@@ -64,7 +61,7 @@ func (l *LegoCMD) DNSCert() (CertPath string, KeyPath string, err error) {
 	}
 
 	// First check if the certificate exists
-	CertPath, KeyPath, err = checkCertFile(l.C.CertDomain)
+	CertPath, KeyPath, err = l.checkCertFile(l.C.CertDomain)
 	if err == nil {
 		return CertPath, KeyPath, err
 	}
@@ -73,7 +70,7 @@ func (l *LegoCMD) DNSCert() (CertPath string, KeyPath string, err error) {
 	if err != nil {
 		return "", "", err
 	}
-	CertPath, KeyPath, err = checkCertFile(l.C.CertDomain)
+	CertPath, KeyPath, err = l.checkCertFile(l.C.CertDomain)
 	if err != nil {
 		return "", "", err
 	}
@@ -99,7 +96,7 @@ func (l *LegoCMD) HTTPCert() (CertPath string, KeyPath string, err error) {
 	}()
 
 	// First check if the certificate exists
-	CertPath, KeyPath, err = checkCertFile(l.C.CertDomain)
+	CertPath, KeyPath, err = l.checkCertFile(l.C.CertDomain)
 	if err == nil {
 		return CertPath, KeyPath, err
 	}
@@ -109,7 +106,7 @@ func (l *LegoCMD) HTTPCert() (CertPath string, KeyPath string, err error) {
 		return "", "", err
 	}
 
-	CertPath, KeyPath, err = checkCertFile(l.C.CertDomain)
+	CertPath, KeyPath, err = l.checkCertFile(l.C.CertDomain)
 	if err != nil {
 		return "", "", err
 	}
@@ -140,7 +137,7 @@ func (l *LegoCMD) RenewCert() (CertPath string, KeyPath string, ok bool, err err
 		return
 	}
 
-	CertPath, KeyPath, err = checkCertFile(l.C.CertDomain)
+	CertPath, KeyPath, err = l.checkCertFile(l.C.CertDomain)
 	if err != nil {
 		return
 	}
@@ -148,16 +145,22 @@ func (l *LegoCMD) RenewCert() (CertPath string, KeyPath string, ok bool, err err
 	return
 }
 
-func checkCertFile(domain string) (string, string, error) {
-	keyPath := path.Join(defaultPath, "certificates", fmt.Sprintf("%s.key", domain))
-	certPath := path.Join(defaultPath, "certificates", fmt.Sprintf("%s.crt", domain))
-	if _, err := os.Stat(keyPath); os.IsNotExist(err) {
-		return "", "", fmt.Errorf("cert key failed: %s", domain)
+func (l *LegoCMD) checkCertFile(domain string) (string, string, error) {
+	keyPath := filepath.Join(l.path, "certificates", fmt.Sprintf("%s.key", domain))
+	certPath := filepath.Join(l.path, "certificates", fmt.Sprintf("%s.crt", domain))
+	if _, err := os.Stat(keyPath); err != nil {
+		return "", "", fmt.Errorf("cert key failed: %s: %w", domain, err)
 	}
-	if _, err := os.Stat(certPath); os.IsNotExist(err) {
-		return "", "", fmt.Errorf("cert cert failed: %s", domain)
+	if _, err := os.Stat(certPath); err != nil {
+		return "", "", fmt.Errorf("cert cert failed: %s: %w", domain, err)
 	}
-	absKeyPath, _ := filepath.Abs(keyPath)
-	absCertPath, _ := filepath.Abs(certPath)
+	absKeyPath, err := filepath.Abs(keyPath)
+	if err != nil {
+		return "", "", err
+	}
+	absCertPath, err := filepath.Abs(certPath)
+	if err != nil {
+		return "", "", err
+	}
 	return absCertPath, absKeyPath, nil
 }
