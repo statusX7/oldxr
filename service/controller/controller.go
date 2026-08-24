@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common/protocol"
@@ -37,6 +38,7 @@ type Controller struct {
 	tasks        []periodicTask
 	limitedUsers map[api.UserInfo]LimitInfo
 	warnedUsers  map[api.UserInfo]int
+	monitorMu    sync.Mutex
 	panelType    string
 	ibm          inbound.Manager
 	obm          outbound.Manager
@@ -167,11 +169,19 @@ func (c *Controller) Close() error {
 			}
 		}
 	}
+	// Periodic.Close stops future runs but does not wait for an Execute call
+	// that is already in flight. Wait for the serialized monitor section so
+	// no controller state is still being used when Close returns.
+	c.monitorMu.Lock()
+	c.monitorMu.Unlock()
 
 	return nil
 }
 
 func (c *Controller) nodeInfoMonitor() (err error) {
+	c.monitorMu.Lock()
+	defer c.monitorMu.Unlock()
+
 	// delay to start
 	if time.Since(c.startAt) < time.Duration(c.config.UpdatePeriodic)*time.Second {
 		return nil
@@ -477,6 +487,9 @@ func limitUser(c *Controller, user api.UserInfo, silentUsers *[]api.UserInfo) {
 }
 
 func (c *Controller) userInfoMonitor() (err error) {
+	c.monitorMu.Lock()
+	defer c.monitorMu.Unlock()
+
 	// delay to start
 	if time.Since(c.startAt) < time.Duration(c.config.UpdatePeriodic)*time.Second {
 		return nil
@@ -602,6 +615,9 @@ func (c *Controller) logPrefix() string {
 
 // Check Cert
 func (c *Controller) certMonitor() error {
+	c.monitorMu.Lock()
+	defer c.monitorMu.Unlock()
+
 	if c.nodeInfo.EnableTLS {
 		switch c.config.CertConfig.CertMode {
 		case "dns", "http", "tls":
