@@ -16,17 +16,21 @@ func TestControllerCloseWaitsForInFlightMonitor(t *testing.T) {
 		Periodic: &task.Periodic{
 			Interval: time.Hour,
 			Execute: func() error {
-				c.monitorMu.Lock()
-				defer c.monitorMu.Unlock()
-				close(started)
-				<-release
-				return nil
+				return c.runMonitor(func() error {
+					close(started)
+					<-release
+					return nil
+				})
 			},
 		},
 	}}
 
 	startDone := make(chan error, 1)
-	go func() { startDone <- c.tasks[0].Start() }()
+	c.taskStartWG.Add(1)
+	go func() {
+		defer c.taskStartWG.Done()
+		startDone <- c.tasks[0].Start()
+	}()
 	<-started
 
 	closeDone := make(chan error, 1)
@@ -48,5 +52,23 @@ func TestControllerCloseWaitsForInFlightMonitor(t *testing.T) {
 	}
 	if err := <-startDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestControllerCloseRejectsLateMonitor(t *testing.T) {
+	c := &Controller{}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ran := false
+	if err := c.runMonitor(func() error {
+		ran = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ran {
+		t.Fatal("monitor executed after Close returned")
 	}
 }

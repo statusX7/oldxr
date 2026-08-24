@@ -19,14 +19,18 @@ import (
 )
 
 type controllerRacePanel struct {
-	mu    sync.Mutex
-	node  api.NodeInfo
-	users []api.UserInfo
+	mu          sync.Mutex
+	node        api.NodeInfo
+	users       []api.UserInfo
+	nodeCalls   int
+	userCalls   int
+	statusCalls int
 }
 
 func (p *controllerRacePanel) GetNodeInfo() (*api.NodeInfo, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.nodeCalls++
 	node := p.node
 	return &node, nil
 }
@@ -34,11 +38,17 @@ func (p *controllerRacePanel) GetNodeInfo() (*api.NodeInfo, error) {
 func (p *controllerRacePanel) GetUserList() (*[]api.UserInfo, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.userCalls++
 	users := append([]api.UserInfo(nil), p.users...)
 	return &users, nil
 }
 
-func (*controllerRacePanel) ReportNodeStatus(*api.NodeStatus) error        { return nil }
+func (p *controllerRacePanel) ReportNodeStatus(*api.NodeStatus) error {
+	p.mu.Lock()
+	p.statusCalls++
+	p.mu.Unlock()
+	return nil
+}
 func (*controllerRacePanel) ReportNodeOnlineUsers(*[]api.OnlineUser) error { return nil }
 func (*controllerRacePanel) ReportUserTraffic(*[]api.UserTraffic) error    { return nil }
 func (*controllerRacePanel) GetNodeRule() (*[]api.DetectRule, error) {
@@ -119,7 +129,13 @@ func TestControllerPeriodicStateRace(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 
-	// Both original periodic workers wake on the same interval. The node
-	// worker republishes userList while the user worker reads it.
+	// The node and user workers intentionally keep their original independent
+	// cadence. State publication and snapshots must make their overlap safe.
 	time.Sleep(2500 * time.Millisecond)
+	panel.mu.Lock()
+	nodeCalls, userCalls, statusCalls := panel.nodeCalls, panel.userCalls, panel.statusCalls
+	panel.mu.Unlock()
+	if nodeCalls < 2 || userCalls < 2 || statusCalls < 1 {
+		t.Fatalf("periodic monitors did not execute all work: node=%d user=%d status=%d", nodeCalls, userCalls, statusCalls)
+	}
 }
