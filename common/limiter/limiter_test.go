@@ -1,13 +1,192 @@
 package limiter
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/eko/gocache/lib/v4/store"
 
 	"github.com/XrayR-project/XrayR/api"
 )
+
+func newTestGlobalInbound() *InboundInfo {
+	inboundInfo := &InboundInfo{Tag: "node-tag"}
+	inboundInfo.GlobalLimit.config = &GlobalDeviceLimitConfig{Enable: true, Timeout: 1, Expiry: 60}
+	inboundInfo.GlobalLimit.globalOnlineIP = &layeredGlobalIPCache{
+		local:       make(map[string]globalIPCacheEntry),
+		localExpiry: time.Minute,
+	}
+	return inboundInfo
+}
+
+func TestGlobalDeviceLimitRejectsNewIPAtBoundary(t *testing.T) {
+	inboundInfo := newTestGlobalInbound()
+	email := "node-tag|user@example.com|1"
+	key := "1|user@example.com|1"
+	existing := map[string]int{"192.0.2.1": 1}
+	if err := inboundInfo.GlobalLimit.globalOnlineIP.Set(context.Background(), key, &existing); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+	if reject := globalLimit(inboundInfo, email, 1, "192.0.2.1", 1); reject {
+		t.Fatal("same IP was rejected at the limit")
+	}
+	if reject := globalLimit(inboundInfo, email, 1, "192.0.2.2", 1); !reject {
+		t.Fatal("new IP was accepted when len(ipMap) == deviceLimit")
+	}
+}
+
+func TestGlobalDeviceLimitConcurrentBurstHonorsLimit(t *testing.T) {
+	inboundInfo := newTestGlobalInbound()
+	email := "node-tag|burst@example.com|2"
+	const (
+		deviceLimit = 5
+		connections = 100
+	)
+	start := make(chan struct{})
+	var accepted int64
+	var wait sync.WaitGroup
+	wait.Add(connections)
+	for index := 0; index < connections; index++ {
+		go func(index int) {
+			defer wait.Done()
+			<-start
+			if !globalLimit(inboundInfo, email, 2, fmt.Sprintf("198.51.100.%d", index+1), deviceLimit) {
+				atomic.AddInt64(&accepted, 1)
+			}
+		}(index)
+	}
+	close(start)
+	wait.Wait()
+	if got := atomic.LoadInt64(&accepted); got != deviceLimit {
+		t.Fatalf("accepted %d concurrent IPs, want exactly %d", got, deviceLimit)
+	}
+}
+
+type testGlobalIPCache struct {
+	mu         sync.Mutex
+	values     map[interface{}]map[string]int
+	getErr     error
+	setErr     error
+	setStarted chan struct{}
+	allowSet   chan struct{}
+	closed     int32
+	setOnce    sync.Once
+}
+
+func (c *testGlobalIPCache) Get(_ context.Context, key interface{}, returnObj interface{}) (interface{}, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.getErr != nil {
+		return nil, c.getErr
+	}
+	value, exists := c.values[key]
+	if !exists {
+		return nil, store.NotFoundWithCause(errors.New("not found"))
+	}
+	result := returnObj.(*map[string]int)
+	*result = make(map[string]int, len(value))
+	for ip, uid := range value {
+		(*result)[ip] = uid
+	}
+	return result, nil
+}
+
+func (c *testGlobalIPCache) Set(_ context.Context, key, object interface{}, _ ...store.Option) error {
+	if c.setStarted != nil {
+		c.setOnce.Do(func() { close(c.setStarted) })
+	}
+	if c.allowSet != nil {
+		<-c.allowSet
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.setErr != nil {
+		return c.setErr
+	}
+	value := *(object.(*map[string]int))
+	copyValue := make(map[string]int, len(value))
+	for ip, uid := range value {
+		copyValue[ip] = uid
+	}
+	if c.values == nil {
+		c.values = make(map[interface{}]map[string]int)
+	}
+	c.values[key] = copyValue
+	return nil
+}
+
+func (c *testGlobalIPCache) Close() error {
+	atomic.AddInt32(&c.closed, 1)
+	return nil
+}
+
+func TestGlobalDeviceLimitDoesNotDetachSlowSet(t *testing.T) {
+	cache := &testGlobalIPCache{setStarted: make(chan struct{}), allowSet: make(chan struct{})}
+	inboundInfo := newTestGlobalInbound()
+	inboundInfo.GlobalLimit.globalOnlineIP = cache
+	returned := make(chan bool, 1)
+	go func() {
+		returned <- globalLimit(inboundInfo, "node-tag|slow@example.com|3", 3, "192.0.2.1", 1)
+	}()
+	<-cache.setStarted
+	select {
+	case <-returned:
+		t.Fatal("globalLimit returned while cache Set was still running")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(cache.allowSet)
+	select {
+	case reject := <-returned:
+		if reject {
+			t.Fatal("first IP was rejected")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("globalLimit did not return after Set completed")
+	}
+}
+
+func TestGlobalDeviceLimitCacheUnavailableFailsOpen(t *testing.T) {
+	cache := &testGlobalIPCache{getErr: errors.New("redis unavailable")}
+	inboundInfo := newTestGlobalInbound()
+	inboundInfo.GlobalLimit.globalOnlineIP = cache
+	if reject := globalLimit(inboundInfo, "node-tag|offline@example.com|4", 4, "192.0.2.1", 1); reject {
+		t.Fatal("cache failure changed legacy fail-open behavior")
+	}
+}
+
+func TestGlobalIPCacheClosedOnDeleteAndReplace(t *testing.T) {
+	first := new(testGlobalIPCache)
+	firstInbound := &InboundInfo{}
+	firstInbound.GlobalLimit.globalOnlineIP = first
+	manager := New()
+	manager.InboundInfo.Store("node-tag", firstInbound)
+	users := []api.UserInfo{{UID: 1, Email: "user@example.com"}}
+	if err := manager.AddInboundLimiter("node-tag", 0, &users, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&first.closed); got != 1 {
+		t.Fatalf("replaced cache close count = %d, want 1", got)
+	}
+
+	second := new(testGlobalIPCache)
+	secondInbound := &InboundInfo{}
+	secondInbound.GlobalLimit.globalOnlineIP = second
+	manager.InboundInfo.Store("second-tag", secondInbound)
+	if err := manager.DeleteInboundLimiter("second-tag"); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.DeleteInboundLimiter("second-tag"); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&second.closed); got != 1 {
+		t.Fatalf("deleted cache close count = %d, want 1", got)
+	}
+}
 
 func newLocalTestLimiter(t testing.TB, deviceLimit int) (*Limiter, string) {
 	t.Helper()
