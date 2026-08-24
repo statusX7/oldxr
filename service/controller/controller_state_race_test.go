@@ -61,7 +61,8 @@ func (*controllerRacePanel) Describe() api.ClientInfo {
 	return api.ClientInfo{APIHost: "http://panel.invalid", NodeID: 1, NodeType: "V2ray"}
 }
 
-func TestControllerPeriodicStateRace(t *testing.T) {
+func newControllerTestPort(t *testing.T) uint32 {
+	t.Helper()
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -70,7 +71,11 @@ func TestControllerPeriodicStateRace(t *testing.T) {
 	if err := listener.Close(); err != nil {
 		t.Fatal(err)
 	}
+	return port
+}
 
+func newControllerTestServer(t *testing.T) *core.Instance {
+	t.Helper()
 	policyConfig, err := (&conf.PolicyConfig{Levels: map[uint32]*conf.Policy{0: {
 		StatsUserUplink:   true,
 		StatsUserDownlink: true,
@@ -99,10 +104,16 @@ func TestControllerPeriodicStateRace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer server.Close()
 	if err := server.Start(); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = server.Close() })
+	return server
+}
+
+func TestControllerPeriodicStateRace(t *testing.T) {
+	port := newControllerTestPort(t)
+	server := newControllerTestServer(t)
 
 	panel := &controllerRacePanel{
 		node: api.NodeInfo{
