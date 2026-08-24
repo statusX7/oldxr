@@ -105,31 +105,71 @@ func (c *Controller) removeUsers(users []string, tag string) error {
 	return nil
 }
 
-func (c *Controller) getTraffic(email string) (up int64, down int64, upCounter stats.Counter, downCounter stats.Counter) {
-	upName := "user>>>" + email + ">>>traffic>>>uplink"
-	downName := "user>>>" + email + ">>>traffic>>>downlink"
-	upCounter = c.stm.GetCounter(upName)
-	downCounter = c.stm.GetCounter(downName)
-	if upCounter != nil && upCounter.Value() != 0 {
-		up = upCounter.Value()
-	} else {
-		upCounter = nil
-	}
-	if downCounter != nil && downCounter.Value() != 0 {
-		down = downCounter.Value()
-	} else {
-		downCounter = nil
-	}
-	return up, down, upCounter, downCounter
+type trafficCounterDelta struct {
+	counter stats.Counter
+	value   int64
 }
 
-func (c *Controller) resetTraffic(upCounterList *[]stats.Counter, downCounterList *[]stats.Counter) {
-	for _, upCounter := range *upCounterList {
-		upCounter.Set(0)
+func drainTrafficCounter(counter stats.Counter) (trafficCounterDelta, bool) {
+	if counter == nil {
+		return trafficCounterDelta{}, false
 	}
-	for _, downCounter := range *downCounterList {
-		downCounter.Set(0)
+
+	value := counter.Set(0)
+	if value <= 0 {
+		// Do not silently change an unexpected negative counter value.
+		if value < 0 {
+			counter.Add(value)
+		}
+		return trafficCounterDelta{}, false
 	}
+
+	return trafficCounterDelta{counter: counter, value: value}, true
+}
+
+func restoreTraffic(deltas []trafficCounterDelta) {
+	for _, delta := range deltas {
+		delta.counter.Add(delta.value)
+	}
+}
+
+type userTrafficReporter interface {
+	ReportUserTraffic(userTraffic *[]api.UserTraffic) error
+}
+
+func flushUserTraffic(reporter userTrafficReporter, disabled bool, userTraffic []api.UserTraffic, deltas []trafficCounterDelta) (err error) {
+	if disabled {
+		// Preserve the legacy DisableUploadTraffic behavior: sampled traffic is
+		// discarded instead of retained indefinitely.
+		return nil
+	}
+
+	committed := false
+	defer func() {
+		if !committed {
+			restoreTraffic(deltas)
+		}
+	}()
+
+	if err = reporter.ReportUserTraffic(&userTraffic); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func (c *Controller) drainTraffic(email string) (up int64, down int64, deltas []trafficCounterDelta) {
+	upName := "user>>>" + email + ">>>traffic>>>uplink"
+	downName := "user>>>" + email + ">>>traffic>>>downlink"
+	if delta, ok := drainTrafficCounter(c.stm.GetCounter(upName)); ok {
+		up = delta.value
+		deltas = append(deltas, delta)
+	}
+	if delta, ok := drainTrafficCounter(c.stm.GetCounter(downName)); ok {
+		down = delta.value
+		deltas = append(deltas, delta)
+	}
+	return up, down, deltas
 }
 
 func (c *Controller) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList *[]api.UserInfo, globalDeviceLimitConfig *limiter.GlobalDeviceLimitConfig) error {

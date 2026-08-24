@@ -504,13 +504,12 @@ func (c *Controller) userInfoMonitor() (err error) {
 
 	// Get User traffic
 	var userTraffic []api.UserTraffic
-	var upCounterList []stats.Counter
-	var downCounterList []stats.Counter
+	var trafficDeltas []trafficCounterDelta
 	AutoSpeedLimit := int64(c.config.AutoSpeedLimitConfig.Limit)
 	UpdatePeriodic := int64(c.config.UpdatePeriodic)
 	limitedUsers := make([]api.UserInfo, 0)
 	for _, user := range *c.userList {
-		up, down, upCounter, downCounter := c.getTraffic(c.buildUserTag(&user))
+		up, down, deltas := c.drainTraffic(c.buildUserTag(&user))
 		if up > 0 || down > 0 {
 			// Over speed users
 			if AutoSpeedLimit > 0 {
@@ -536,12 +535,7 @@ func (c *Controller) userInfoMonitor() (err error) {
 				Upload:   up,
 				Download: down})
 
-			if upCounter != nil {
-				upCounterList = append(upCounterList, upCounter)
-			}
-			if downCounter != nil {
-				downCounterList = append(downCounterList, downCounter)
-			}
+			trafficDeltas = append(trafficDeltas, deltas...)
 		} else {
 			delete(c.warnedUsers, user)
 		}
@@ -552,15 +546,8 @@ func (c *Controller) userInfoMonitor() (err error) {
 		}
 	}
 	if len(userTraffic) > 0 {
-		var err error // Define an empty error
-		if !c.config.DisableUploadTraffic {
-			err = c.apiClient.ReportUserTraffic(&userTraffic)
-		}
-		// If report traffic error, not clear the traffic
-		if err != nil {
+		if err := flushUserTraffic(c.apiClient, c.config.DisableUploadTraffic, userTraffic, trafficDeltas); err != nil {
 			log.Print(err)
-		} else {
-			c.resetTraffic(&upCounterList, &downCounterList)
 		}
 	}
 
