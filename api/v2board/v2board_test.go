@@ -198,8 +198,8 @@ func TestV2BoardShadowsocksCompatibility(t *testing.T) {
 	if len(*users) != 1 || (*users)[0].UID != 303 || (*users)[0].Passwd != "legacy-shadowsocks-secret" || (*users)[0].Method != "aes-128-gcm" {
 		t.Fatalf("unexpected users: %#v", *users)
 	}
-	if requests != 2 {
-		t.Fatalf("user endpoint requests = %d, want legacy node/user fetches", requests)
+	if requests != 1 {
+		t.Fatalf("user endpoint requests = %d, want 1 shared node/user fetch", requests)
 	}
 }
 

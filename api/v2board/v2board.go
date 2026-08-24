@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"regexp"
 	"strconv"
@@ -33,6 +34,15 @@ type APIClient struct {
 	LocalRuleList []api.DetectRule
 	ConfigResp    *simplejson.Json
 	access        sync.Mutex
+	userAccess    sync.Mutex
+	userETag      string
+	lastUserList  *[]api.UserInfo
+	ssPending     *userListFetch
+}
+
+type userListFetch struct {
+	users     *[]api.UserInfo
+	unchanged bool
 }
 
 // New create an api instance
@@ -149,7 +159,7 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 	case "Trojan":
 		path = "/api/v1/server/TrojanTidalab/config"
 	case "Shadowsocks":
-		if nodeInfo, err = c.ParseSSNodeResponse(); err == nil {
+		if nodeInfo, err = c.fetchSSNodeResponse(); err == nil {
 			return nodeInfo, nil
 		} else {
 			return nil, err
@@ -191,6 +201,32 @@ func (c *APIClient) GetNodeInfo() (nodeInfo *api.NodeInfo, err error) {
 
 // GetUserList will pull user form sspanel
 func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
+	c.userAccess.Lock()
+	defer c.userAccess.Unlock()
+
+	if c.NodeType == "Shadowsocks" && c.ssPending != nil {
+		pending := c.ssPending
+		c.ssPending = nil
+		if pending.unchanged {
+			return nil, errors.New("users no change")
+		}
+		return pending.users, nil
+	}
+
+	userList, unchanged, err := c.fetchUserListLocked()
+	if err != nil {
+		return nil, err
+	}
+	if unchanged {
+		return nil, errors.New("users no change")
+	}
+	return userList, nil
+}
+
+// fetchUserListLocked fetches and publishes an immutable user snapshot.
+// The caller must hold userAccess so concurrent periodic refreshes cannot
+// decode and publish the same changed response more than once.
+func (c *APIClient) fetchUserListLocked() (UserList *[]api.UserInfo, unchanged bool, err error) {
 	var path string
 	switch c.NodeType {
 	case "V2ray":
@@ -200,15 +236,27 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 	case "Shadowsocks":
 		path = "/api/v1/server/ShadowsocksTidalab/user"
 	default:
-		return nil, fmt.Errorf("unsupported Node type: %s", c.NodeType)
+		return nil, false, fmt.Errorf("unsupported Node type: %s", c.NodeType)
 	}
-	res, err := c.client.R().
-		ForceContentType("application/json").
-		Get(path)
+	request := c.client.R().ForceContentType("application/json")
+	if c.userETag != "" {
+		request.SetHeader("If-None-Match", c.userETag)
+	}
+	res, err := request.Get(path)
+	if err != nil {
+		_, parseErr := c.parseResponse(res, path, err)
+		return nil, false, parseErr
+	}
+	if res.StatusCode() == http.StatusNotModified {
+		if c.lastUserList == nil {
+			return nil, false, fmt.Errorf("request %s returned 304 without a cached user list", c.assembleURL(path))
+		}
+		return c.lastUserList, true, nil
+	}
 
 	response, err := c.parseResponse(res, path, err)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	numOfUsers := len(response.Get("data").MustArray())
 	userList := make([]api.UserInfo, numOfUsers)
@@ -233,7 +281,12 @@ func (c *APIClient) GetUserList() (UserList *[]api.UserInfo, err error) {
 		}
 		userList[i] = user
 	}
-	return &userList, nil
+	// Publish only after the entire response has been parsed successfully.
+	// An absent ETag deliberately clears the old validator so the next poll
+	// obtains another full response instead of sending a stale condition.
+	c.userETag = res.Header().Get("ETag")
+	c.lastUserList = &userList
+	return &userList, false, nil
 }
 
 // ReportUserTraffic reports the user traffic
@@ -330,12 +383,34 @@ func (c *APIClient) ParseTrojanNodeResponse(nodeInfoResponse *simplejson.Json) (
 
 // ParseSSNodeResponse parse the response for the given nodeinfor format
 func (c *APIClient) ParseSSNodeResponse() (*api.NodeInfo, error) {
-	var port uint32
-	var method string
-	userInfo, err := c.GetUserList()
+	c.userAccess.Lock()
+	userInfo, _, err := c.fetchUserListLocked()
+	c.userAccess.Unlock()
 	if err != nil {
 		return nil, err
 	}
+	return c.buildSSNodeResponse(userInfo)
+}
+
+func (c *APIClient) fetchSSNodeResponse() (*api.NodeInfo, error) {
+	c.userAccess.Lock()
+	defer c.userAccess.Unlock()
+
+	userInfo, unchanged, err := c.fetchUserListLocked()
+	if err != nil {
+		return nil, err
+	}
+	nodeInfo, err := c.buildSSNodeResponse(userInfo)
+	if err != nil {
+		return nil, err
+	}
+	c.ssPending = &userListFetch{users: userInfo, unchanged: unchanged}
+	return nodeInfo, nil
+}
+
+func (c *APIClient) buildSSNodeResponse(userInfo *[]api.UserInfo) (*api.NodeInfo, error) {
+	var port uint32
+	var method string
 	if len(*userInfo) > 0 {
 		port = (*userInfo)[0].Port
 		method = (*userInfo)[0].Method
