@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/xtls/xray-core/common/buf"
 	"golang.org/x/time/rate"
@@ -43,16 +44,17 @@ func TestRateWriterDoesNotBypassWritesLargerThanBurst(t *testing.T) {
 	bucket := rate.NewLimiter(100, 4)
 	writer := New().RateWriter(underlying, bucket)
 	mb := buf.MultiBuffer{buf.FromBytes(make([]byte, 8))}
+	started := time.Now()
 	if err := writer.WriteMultiBuffer(mb); err != nil {
 		t.Fatalf("WriteMultiBuffer: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed < 25*time.Millisecond {
+		t.Fatalf("large write bypassed limiter: elapsed = %s", elapsed)
 	}
 	if got := atomic.LoadInt32(&underlying.calls); got != 1 {
 		t.Fatalf("underlying calls = %d, want 1", got)
 	}
 	if got := atomic.LoadInt64(&underlying.bytes); got != 8 {
 		t.Fatalf("underlying bytes = %d, want 8", got)
-	}
-	if tokens := bucket.Tokens(); tokens >= 1 {
-		t.Fatalf("large write bypassed limiter: tokens after write = %.2f", tokens)
 	}
 }
