@@ -1,0 +1,62 @@
+# oldxr 1.0.x 项目规则
+
+本文件适用于本仓库及其所有子目录。若与最新用户要求冲突，以最新用户要求为准。
+
+## 产品身份与源码基线
+
+- `1.0.x` 是单一 Go 二进制产品线，首个候选版本为 `v1.0.0`，binary version 显示 `XrayR 1.0.0`。
+- 开发基线必须是官方 `XrayR v0.9.0` commit `f95825395d192498adfc533ab925943088408cb4`；不得从 r3/r4 删除 Rust 后伪装成官方基线。
+- 历史 `v0.9.0`、`v0.9.0-r1`、`v0.9.0-r2`、`v0.9.0-r3`、`v0.9.0-r4` tags 不移动、不删除、不覆盖。
+- `v1.0.0` production package只包含一个主要运行二进制 `XrayR`。禁止依赖 `XrayR-fastengine`、`XrayR-legacy`、Rust runtime或三二进制 selector。
+
+## 不可破坏的兼容合同
+
+- 必须保持 V2Board 1.6.0 legacy API 和 XrayR 0.9.0 `config.yml` user-visible compatibility。
+- 必须保持 VMess、Shadowsocks、TCP、UDP、traffic accounting、online IP、SpeedLimit、DeviceLimit、rule、ETag与用户生命周期语义。
+- 必须保持 DNS、routing、`RouteConfigPath`、`OutboundConfigPath`、`InboundConfigPath`、custom files、ProxyProtocol、fallback、TLS/cert等官方 v0.9.0功能。
+- 用户的 `config.yml`、`route.json`、`custom_outbound.json`、`custom_inbound.json`、`dns.json`、`rulelist` 和 cert/key 默认只读保留；升级不得重写或迁移其内容。
+- Debian 11与Ubuntu 20.04是硬兼容目标；优先使用 `CGO_ENABLED=0`，禁止 `target-cpu=native`等不可移植构建。
+- 正式 installer 必须支持 fresh install与官方 XrayR v0.9.0无损升级；启动/健康检查失败必须自动回滚。
+
+## 实现边界
+
+- Go、xray-core与必要依赖版本可以升级，但每次变化必须有同源 A/B 性能证据、兼容验证、安全审计和license审计。
+- 允许一个明确热路径/package内部的局部数据结构、状态所有权、dispatcher、stats、limiter、buffer或core backport重构。
+- 禁止新建平行 FastEngine、重新实现完整VMess/SS协议引擎、用Rust/C替换data plane、全量重写整个项目架构。
+- r1/r2历史修复不得无脑cherry-pick：先在官方基线用测试复现，再移植最小逻辑修复。
+- 不得通过关闭功能、改变轮询/上报周期、降低并发/吞吐、减少站点/用户、改变cipher、安全或统计语义获得性能结果。
+
+## 性能与发布 Gate
+
+- 正式主负载：10个独立 V2Board 1.6.0 sites、1000 registered/site、25 VMess + 25 SS active/site、500 connections、1C1G、4KiB/328ms。
+- 原版与candidate必须使用相同硬件、CPU affinity/quota、MemoryMax、kernel、完整config/route/outbound/rulelist、用户、连接、流量、功能开关、warmup和measurement。
+- CPU硬目标：candidate normalized CPU cost `<=25%` official v0.9.0，即改善`>=75%`；核心指标为cgroup CPU seconds/application GB、task-clock ms/MB和CPU/Mbps。
+- RAM硬目标：candidate RSS `<=50%` official，并记录heap、objects、goroutines、FD和时间斜率。
+- 筛选至少3轮，正式结果至少10轮交叉/随机顺序；不得挑最好一次。
+- 主测试必须开启traffic accounting、online IP/device、SpeedLimit、DeviceLimit、route/outbound/rulelist、panel polling/submit与UDP support。
+- 任一CPU、RAM、功能、OS、soak、安全、升级或rollback Gate失败时，不得发布`v1.0.0`、不得更新master安装入口、不得宣称完成。
+
+## 证据驱动开发
+
+- 修改前先对官方基线采集CPU/heap/alloc/goroutine/mutex/block/syscall profile；只优化top hotspot。
+- 每个性能patch应独立、可回滚，并记录hypothesis、targeted test、system benchmark和保留/回退结论。
+- 已证伪的固定/adaptive pipe threshold、zero-wait drain、只减少goroutine或allocation、无4KiB收益的drop-in modern core不得机械重复。
+- `copyInternal`的cumulative值不得当作flat CPU；必须区分user copy、syscall、crypto、netpoll、scheduler、GC与wrapper成本。
+- 正式结果必须保持payload exact和traffic守恒：`successfully transferred = reported + pending + retiring-user pending`。
+
+## 测试与审计
+
+- Go变更最终执行`gofmt`、`go test ./...`、`go vet ./...`、`go test -race ./...`、`govulncheck ./...`与`go mod verify`。
+- installer/manager最终执行`bash -n`与`shellcheck`，correctness类告警必须修复。
+- 必须覆盖VMess TCP、SS AES-128-GCM TCP/UDP、完整示例route/outbound/rulelist、traffic、limit/device/online-IP、用户增删禁用/credential更新、panel失败恢复与同站点隔离。
+- 必须审计race、goroutine/FD/counter/limiter/timer leak、retry/busy loop、deadlock、partial write、close、reload与retiring traffic。
+- 最终soak最低：Debian 11 6小时、Ubuntu 20.04 2小时、Debian 12 2小时；持续采集RSS/heap/object/goroutine/FD/open connection斜率。
+- Release至少构建`linux/amd64`与`linux/arm64`单Go二进制ZIP；Docker不属于本产品部署、性能或Release Gate。
+
+## Git、报告与交流
+
+- 不force push，不重写/删除历史tag；实验只在独立branch，Gate通过前不merge main/master。
+- Git commit message保持英文，每个commit只解决一个逻辑问题。
+- 性能、pprof、perf、内部研究、审计和升级报告只写入`/root/projects/oldxr-reports/go-v1/`，不得提交GitHub。
+- GitHub只保留production source、必要tests/fixtures、build/install scripts、AGENTS与极简README。
+- 所有用户可见交流和本地人类可读报告使用简体中文；代码标识符、配置key、路径、命令、API字段和commit message保持英文。
