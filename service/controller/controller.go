@@ -313,6 +313,8 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 				err := c.removeUsers(deletedEmail, activeTag)
 				if err != nil {
 					log.Print(err)
+				} else if err := c.DeleteInboundLimiterUsers(activeTag, &deleted); err != nil {
+					log.Print(err)
 				}
 			}
 			if len(added) > 0 {
