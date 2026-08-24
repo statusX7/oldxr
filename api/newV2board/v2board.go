@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -84,21 +83,23 @@ func readLocalRuleList(path string) (LocalRuleList []api.DetectRule) {
 	if path != "" {
 		// open the file
 		file, err := os.Open(path)
-		defer file.Close()
 		// handle errors while opening
 		if err != nil {
 			log.Printf("Error when opening file: %s", err)
 			return LocalRuleList
 		}
+		defer file.Close()
 
 		fileScanner := bufio.NewScanner(file)
 
 		// read line by line
 		for fileScanner.Scan() {
-			LocalRuleList = append(LocalRuleList, api.DetectRule{
-				ID:      -1,
-				Pattern: regexp.MustCompile(fileScanner.Text()),
-			})
+			rule, err := api.CompileDetectRule(-1, fileScanner.Text())
+			if err != nil {
+				log.Printf("忽略无效的本地审计规则：%s", err)
+				continue
+			}
+			LocalRuleList = append(LocalRuleList, rule)
 		}
 		// handle first encountered error while reading
 		if err := fileScanner.Err(); err != nil {
@@ -262,14 +263,15 @@ func (c *APIClient) ReportUserTraffic(userTraffic *[]api.UserTraffic) error {
 func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
 	routes := c.resp.Load().(*serverConfig).Routes
 
-	ruleList := c.LocalRuleList
+	ruleList := append([]api.DetectRule(nil), c.LocalRuleList...)
 
 	for i := range routes {
 		if routes[i].Action == "block" {
-			ruleList = append(ruleList, api.DetectRule{
-				ID:      i,
-				Pattern: regexp.MustCompile(strings.Join(routes[i].Match, "|")),
-			})
+			rule, err := api.CompileDetectRule(i, strings.Join(routes[i].Match, "|"))
+			if err != nil {
+				return nil, fmt.Errorf("invalid V2Board route %d: %w", i, err)
+			}
+			ruleList = append(ruleList, rule)
 		}
 	}
 

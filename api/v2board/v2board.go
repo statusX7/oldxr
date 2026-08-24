@@ -8,7 +8,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -103,10 +102,12 @@ func readLocalRuleList(path string) (LocalRuleList []api.DetectRule) {
 
 		// read line by line
 		for fileScanner.Scan() {
-			LocalRuleList = append(LocalRuleList, api.DetectRule{
-				ID:      -1,
-				Pattern: regexp.MustCompile(fileScanner.Text()),
-			})
+			rule, err := api.CompileDetectRule(-1, fileScanner.Text())
+			if err != nil {
+				log.Printf("忽略无效的本地审计规则：%s", err)
+				continue
+			}
+			LocalRuleList = append(LocalRuleList, rule)
 		}
 		// handle first encountered error while reading
 		if err := fileScanner.Err(); err != nil {
@@ -139,7 +140,7 @@ func (c *APIClient) parseResponse(res *resty.Response, path string, err error) (
 		return nil, fmt.Errorf("request %s failed: %s", c.assembleURL(path), err)
 	}
 
-	if res.StatusCode() > 400 {
+	if res.StatusCode() >= http.StatusBadRequest {
 		body := res.Body()
 		return nil, fmt.Errorf("request %s failed: %s, %s", c.assembleURL(path), string(body), err)
 	}
@@ -323,7 +324,7 @@ func (c *APIClient) ReportUserTraffic(userTraffic *[]api.UserTraffic) error {
 
 // GetNodeRule implements the API interface
 func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
-	ruleList := c.LocalRuleList
+	ruleList := append([]api.DetectRule(nil), c.LocalRuleList...)
 	if c.NodeType != "V2ray" {
 		return &ruleList, nil
 	}
@@ -335,9 +336,9 @@ func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
 	ruleListResponse := c.ConfigResp.Get("routing").Get("rules").GetIndex(1).Get("domain").MustStringArray()
 	for i, rule := range ruleListResponse {
 		rule = strings.TrimPrefix(rule, "regexp:")
-		ruleListItem := api.DetectRule{
-			ID:      i,
-			Pattern: regexp.MustCompile(rule),
+		ruleListItem, err := api.CompileDetectRule(i, rule)
+		if err != nil {
+			return nil, fmt.Errorf("invalid V2Board rule %d: %w", i, err)
 		}
 		ruleList = append(ruleList, ruleListItem)
 	}

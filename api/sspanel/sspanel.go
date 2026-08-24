@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"reflect"
 	"regexp"
@@ -100,10 +101,12 @@ func readLocalRuleList(path string) (LocalRuleList []api.DetectRule) {
 
 		// read line by line
 		for fileScanner.Scan() {
-			LocalRuleList = append(LocalRuleList, api.DetectRule{
-				ID:      -1,
-				Pattern: regexp.MustCompile(fileScanner.Text()),
-			})
+			rule, err := api.CompileDetectRule(-1, fileScanner.Text())
+			if err != nil {
+				log.Printf("忽略无效的本地审计规则：%s", err)
+				continue
+			}
+			LocalRuleList = append(LocalRuleList, rule)
 		}
 		// handle first encountered error while reading
 		if err := fileScanner.Err(); err != nil {
@@ -136,7 +139,7 @@ func (c *APIClient) parseResponse(res *resty.Response, path string, err error) (
 		return nil, fmt.Errorf("request %s failed: %s", c.assembleURL(path), err)
 	}
 
-	if res.StatusCode() > 400 {
+	if res.StatusCode() >= http.StatusBadRequest {
 		body := res.Body()
 		return nil, fmt.Errorf("request %s failed: %s, %s", c.assembleURL(path), string(body), err)
 	}
@@ -320,7 +323,7 @@ func (c *APIClient) ReportUserTraffic(userTraffic *[]api.UserTraffic) error {
 
 // GetNodeRule will pull the audit rule form sspanel
 func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
-	ruleList := c.LocalRuleList
+	ruleList := append([]api.DetectRule(nil), c.LocalRuleList...)
 	path := "/mod_mu/func/detect_rules"
 	res, err := c.client.R().
 		SetResult(&Response{}).
@@ -339,10 +342,11 @@ func (c *APIClient) GetNodeRule() (*[]api.DetectRule, error) {
 	}
 
 	for _, r := range *ruleListResponse {
-		ruleList = append(ruleList, api.DetectRule{
-			ID:      r.ID,
-			Pattern: regexp.MustCompile(r.Content),
-		})
+		rule, compileErr := api.CompileDetectRule(r.ID, r.Content)
+		if compileErr != nil {
+			return nil, fmt.Errorf("invalid SSPanel rule %d: %w", r.ID, compileErr)
+		}
+		ruleList = append(ruleList, rule)
 	}
 	return &ruleList, nil
 }
