@@ -28,11 +28,12 @@
 
 ## 性能与发布 Gate
 
-- 正式主负载：10个独立 V2Board 1.6.0 sites、1000 registered/site、25 VMess + 25 SS active/site、500 connections、1C1G、4KiB/328ms。
-- 原版与candidate必须使用相同硬件、CPU affinity/quota、MemoryMax、kernel、完整config/route/outbound/rulelist、用户、连接、流量、功能开关、warmup和measurement。
+- 正式主负载：10个独立 V2Board 1.6.0 sites、1000 registered/site、25 VMess + 25 SS active/site、500 TCP connections、4KiB/application write、1000Mbps aggregate application payload（500Mbps upload + echo返回500Mbps download）。
+- 正式server固定4 vCPU/4GiB；1C1G只用于maximum-sustainable辅助结果。正式网络路径使用隔离veth/netns public-like地址，loopback只作诊断，不得作为唯一Release Gate。
+- 原版与candidate必须使用相同硬件、CPU affinity/quota、MemoryMax、kernel、完整config/route/outbound/rulelist、用户、连接、流量、功能开关、warmup和measurement。筛选吞吐必须在1000Mbps±2%，正式结果必须在±1%。
 - CPU硬目标：candidate normalized CPU cost `<=25%` official v0.9.0，即改善`>=75%`；核心指标为cgroup CPU seconds/application GB、task-clock ms/MB和CPU/Mbps。
 - RAM硬目标：candidate RSS `<=50%` official，并记录heap、objects、goroutines、FD和时间斜率。
-- 筛选至少3轮，正式结果至少10轮交叉/随机顺序；不得挑最好一次。
+- 筛选至少3轮、warmup至少30秒、measurement至少60秒；正式结果至少10轮交叉/随机顺序且measurement至少180秒，不得挑最好一次。
 - 主测试必须开启traffic accounting、online IP/device、SpeedLimit、DeviceLimit、route/outbound/rulelist、panel polling/submit与UDP support。
 - 任一CPU、RAM、功能、OS、soak、安全、升级或rollback Gate失败时，不得发布`v1.0.0`、不得更新master安装入口、不得宣称完成。
 
