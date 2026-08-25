@@ -37,6 +37,7 @@ var (
 	directDispatchAttempts = expvar.NewInt("oldxr_direct_dispatch_attempts")
 	directDispatchFallback = expvar.NewInt("oldxr_direct_dispatch_fallback")
 	directDispatchSuccess  = expvar.NewInt("oldxr_direct_dispatch_success")
+	directDispatchFailures = expvar.NewMap("oldxr_direct_dispatch_failures")
 )
 
 var directDataPathEnabled = func() bool {
@@ -742,6 +743,7 @@ func (d *DefaultDispatcher) DispatchDirect(ctx context.Context, destination net.
 	}
 	directDispatchAttempts.Add(1)
 	if !destination.IsValid() {
+		directDispatchFailures.Add("invalid_destination", 1)
 		return nil, input, newError("Dispatcher: Invalid destination.")
 	}
 	if destination.Network != net.Network_TCP {
@@ -757,6 +759,7 @@ func (d *DefaultDispatcher) DispatchDirect(ctx context.Context, destination net.
 	}
 	userIO, err := d.getUserIO(ctx)
 	if err != nil {
+		directDispatchFailures.Add("user_io", 1)
 		return nil, input, err
 	}
 
@@ -783,6 +786,7 @@ func (d *DefaultDispatcher) DispatchDirect(ctx context.Context, destination net.
 
 	selection, err := d.selectOutbound(ctx, destination)
 	if err != nil {
+		directDispatchFailures.Add("select_outbound", 1)
 		userIO.Release()
 		return nil, replayReader, err
 	}
@@ -795,6 +799,7 @@ func (d *DefaultDispatcher) DispatchDirect(ctx context.Context, destination net.
 
 	directLink, supported, err := directHandler.OpenDirect(ctx, selection.destination)
 	if err != nil {
+		directDispatchFailures.Add("open_direct", 1)
 		userIO.Release()
 		return nil, replayReader, err
 	}
@@ -804,6 +809,7 @@ func (d *DefaultDispatcher) DispatchDirect(ctx context.Context, destination net.
 		return nil, replayReader, nil
 	}
 	if directLink == nil || directLink.Reader == nil || directLink.Writer == nil {
+		directDispatchFailures.Add("invalid_link", 1)
 		if directLink != nil {
 			_ = directLink.Close()
 		}
