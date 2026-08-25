@@ -4,7 +4,6 @@ package main
 
 import (
 	"expvar"
-	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -24,14 +23,9 @@ var (
 func applyRuntimePolicy() {
 	ownerEnabled := owner.Enabled()
 	effectiveCPUs := effectiveCPUCount()
-	selected := selectOwnerGOMAXPROCS(ownerEnabled, os.Getenv("GOMAXPROCS"), effectiveCPUs)
-	if selected != 0 {
-		previous := runtime.GOMAXPROCS(selected)
-		runtimePolicyAutoApplied.Set(1)
-		log.Printf("socket-owner运行时策略：有效CPU=%d，GOMAXPROCS=%d（原值%d）；显式GOMAXPROCS环境变量优先", effectiveCPUs, selected, previous)
-	} else {
-		runtimePolicyAutoApplied.Set(0)
-	}
+	// Go's default scheduler width preserves throughput headroom across the
+	// supported CPU matrix. Operators can still set GOMAXPROCS explicitly.
+	runtimePolicyAutoApplied.Set(0)
 	runtimePolicyGOMAXPROCS.Set(int64(runtime.GOMAXPROCS(0)))
 	runtimePolicyEffectiveCPU.Set(int64(effectiveCPUs))
 	if ownerEnabled {
@@ -39,13 +33,6 @@ func applyRuntimePolicy() {
 	} else {
 		runtimePolicyOwnerEnabled.Set(0)
 	}
-}
-
-func selectOwnerGOMAXPROCS(ownerEnabled bool, explicit string, effectiveCPUs int) int {
-	if !ownerEnabled || strings.TrimSpace(explicit) != "" || effectiveCPUs != 4 {
-		return 0
-	}
-	return 3
 }
 
 func effectiveCPUCount() int {

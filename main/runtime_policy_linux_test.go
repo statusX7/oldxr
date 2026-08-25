@@ -4,28 +4,6 @@ package main
 
 import "testing"
 
-func TestSelectOwnerGOMAXPROCS(t *testing.T) {
-	for _, testCase := range []struct {
-		name      string
-		owner     bool
-		explicit  string
-		effective int
-		want      int
-	}{
-		{"owner four CPUs", true, "", 4, 3},
-		{"explicit override", true, "4", 4, 0},
-		{"owner disabled", false, "", 4, 0},
-		{"three CPUs", true, "", 3, 0},
-		{"eight CPUs", true, "", 8, 0},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			if got := selectOwnerGOMAXPROCS(testCase.owner, testCase.explicit, testCase.effective); got != testCase.want {
-				t.Fatalf("selectOwnerGOMAXPROCS()=%d, want %d", got, testCase.want)
-			}
-		})
-	}
-}
-
 func TestParseCPUQuotaV2(t *testing.T) {
 	for _, testCase := range []struct {
 		contents string
