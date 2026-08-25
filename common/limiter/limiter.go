@@ -249,6 +249,14 @@ func globalLimit(inboundInfo *InboundInfo, email string, uid int, ip string, dev
 
 	// reformat email for unique key
 	uniqueKey := strings.Replace(email, inboundInfo.Tag, strconv.Itoa(deviceLimit), 1)
+	if atomicCache, ok := inboundInfo.GlobalLimit.globalOnlineIP.(atomicGlobalIPCache); ok {
+		accepted, err := atomicCache.ReserveIP(ctx, uniqueKey, ip, uid, deviceLimit)
+		if err != nil {
+			newError("cache service").Base(err).AtError().WriteToLog()
+			return false
+		}
+		return !accepted
+	}
 	globalLock := deviceLock(&inboundInfo.GlobalLimit.ipLocks, uniqueKey)
 	globalLock.Lock()
 	defer globalLock.Unlock()

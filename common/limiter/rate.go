@@ -15,6 +15,12 @@ type Writer struct {
 	ctx     context.Context
 }
 
+type Reader struct {
+	reader  buf.Reader
+	limiter *rate.Limiter
+	ctx     context.Context
+}
+
 func (l *Limiter) RateWriter(writer buf.Writer, limiter *rate.Limiter) buf.Writer {
 	return l.RateWriterContext(context.Background(), writer, limiter)
 }
@@ -28,6 +34,33 @@ func (l *Limiter) RateWriterContext(ctx context.Context, writer buf.Writer, limi
 		limiter: limiter,
 		ctx:     ctx,
 	}
+}
+
+func (l *Limiter) RateReaderContext(ctx context.Context, reader buf.Reader, limiter *rate.Limiter) buf.Reader {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return &Reader{
+		reader:  reader,
+		limiter: limiter,
+		ctx:     ctx,
+	}
+}
+
+func (r *Reader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	mb, err := r.reader.ReadMultiBuffer()
+	if mb.IsEmpty() {
+		return mb, err
+	}
+	if waitErr := waitRateLimit(r.ctx, r.limiter, int(mb.Len())); waitErr != nil {
+		buf.ReleaseMulti(mb)
+		return nil, waitErr
+	}
+	return mb, err
+}
+
+func (r *Reader) Interrupt() {
+	common.Interrupt(r.reader)
 }
 
 func (w *Writer) Close() error {

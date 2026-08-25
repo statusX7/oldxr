@@ -172,6 +172,24 @@ func (c *Controller) drainTraffic(email string) (up int64, down int64, deltas []
 	return up, down, deltas
 }
 
+func appendUserTraffic(traffic *[]api.UserTraffic, index map[int]int, user api.UserInfo, up, down int64) {
+	if up <= 0 && down <= 0 {
+		return
+	}
+	if position, ok := index[user.UID]; ok {
+		(*traffic)[position].Upload += up
+		(*traffic)[position].Download += down
+		return
+	}
+	index[user.UID] = len(*traffic)
+	*traffic = append(*traffic, api.UserTraffic{
+		UID:      user.UID,
+		Email:    user.Email,
+		Upload:   up,
+		Download: down,
+	})
+}
+
 func (c *Controller) AddInboundLimiter(tag string, nodeSpeedLimit uint64, userList *[]api.UserInfo, globalDeviceLimitConfig *limiter.GlobalDeviceLimitConfig) error {
 	err := c.dispatcher.Limiter.AddInboundLimiter(tag, nodeSpeedLimit, userList, globalDeviceLimitConfig)
 	return err

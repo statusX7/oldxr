@@ -38,6 +38,7 @@ type Controller struct {
 	tasks         []periodicTask
 	limitedUsers  map[api.UserInfo]LimitInfo
 	warnedUsers   map[api.UserInfo]int
+	retiringUsers map[retiringUserKey]retiringUser
 	stateMu       sync.RWMutex
 	monitorMu     sync.Mutex
 	monitorWG     sync.WaitGroup
@@ -59,15 +60,16 @@ type periodicTask struct {
 // New return a Controller service with default parameters.
 func New(server *core.Instance, api api.API, config *Config, panelType string) *Controller {
 	controller := &Controller{
-		server:     server,
-		config:     config,
-		apiClient:  api,
-		panelType:  panelType,
-		ibm:        server.GetFeature(inbound.ManagerType()).(inbound.Manager),
-		obm:        server.GetFeature(outbound.ManagerType()).(outbound.Manager),
-		stm:        server.GetFeature(stats.ManagerType()).(stats.Manager),
-		dispatcher: server.GetFeature(routing.DispatcherType()).(*mydispatcher.DefaultDispatcher),
-		startAt:    time.Now(),
+		server:        server,
+		config:        config,
+		apiClient:     api,
+		panelType:     panelType,
+		ibm:           server.GetFeature(inbound.ManagerType()).(inbound.Manager),
+		obm:           server.GetFeature(outbound.ManagerType()).(outbound.Manager),
+		stm:           server.GetFeature(stats.ManagerType()).(stats.Manager),
+		dispatcher:    server.GetFeature(routing.DispatcherType()).(*mydispatcher.DefaultDispatcher),
+		startAt:       time.Now(),
+		retiringUsers: make(map[retiringUserKey]retiringUser),
 	}
 
 	return controller
@@ -249,9 +251,11 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 	activeTag := oldTag
 	// If nodeInfo changed
 	if !reflect.DeepEqual(oldNodeInfo, newNodeInfo) {
+		c.retireManagedUsers(oldTag, oldUserInfo)
 		// Remove old tag
 		err := c.removeOldTag(oldTag)
 		if err != nil {
+			c.restoreManagedUsers(oldTag, oldUserInfo)
 			log.Print(err)
 			return nil
 		}
@@ -259,6 +263,7 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 			err = c.removeOldTag(fmt.Sprintf("dokodemo-door_%s+1", oldTag))
 		}
 		if err != nil {
+			c.restoreManagedUsers(oldTag, oldUserInfo)
 			log.Print(err)
 			return nil
 		}
@@ -306,13 +311,16 @@ func (c *Controller) nodeInfoMonitor() (err error) {
 		if usersChanged {
 			deleted, added, limitUpdated = compareUserList(oldUserInfo, newUserInfo)
 			if len(deleted) > 0 {
+				c.retireManagedUsers(activeTag, &deleted)
 				deletedEmail := make([]string, len(deleted))
 				for i, u := range deleted {
 					deletedEmail[i] = c.buildUserTagWithTag(activeTag, &u)
 				}
 				err := c.removeUsers(deletedEmail, activeTag)
 				if err != nil {
+					c.restoreManagedUsers(activeTag, &deleted)
 					log.Print(err)
+					return nil
 				} else if err := c.DeleteInboundLimiterUsers(activeTag, &deleted); err != nil {
 					log.Print(err)
 				}
@@ -462,8 +470,10 @@ func (c *Controller) addNewUser(userInfo *[]api.UserInfo, nodeInfo *api.NodeInfo
 		return fmt.Errorf("unsupported node type: %s", nodeInfo.NodeType)
 	}
 
+	c.registerManagedUsers(tag, userInfo)
 	err = c.addUsers(users, tag)
 	if err != nil {
+		c.retireManagedUsers(tag, userInfo)
 		return err
 	}
 	log.Printf("%s Added %d new users", c.logPrefix(), len(*userInfo))
@@ -554,8 +564,12 @@ func (c *Controller) userInfoMonitor() (err error) {
 	}
 	c.stateMu.RLock()
 	tag := c.Tag
-	userInfo := c.userList
+	var userInfo []api.UserInfo
+	if c.userList != nil {
+		userInfo = append(userInfo, (*c.userList)...)
+	}
 	c.stateMu.RUnlock()
+	retiringUsers := c.retiringUserSnapshot()
 	// Unlock users
 	if c.config.AutoSpeedLimitConfig.Limit > 0 && len(c.limitedUsers) > 0 {
 		log.Printf("%s Limited users:", c.logPrefix())
@@ -579,11 +593,12 @@ func (c *Controller) userInfoMonitor() (err error) {
 
 	// Get User traffic
 	var userTraffic []api.UserTraffic
+	trafficIndex := make(map[int]int, len(userInfo)+len(retiringUsers))
 	var trafficDeltas []trafficCounterDelta
 	AutoSpeedLimit := int64(c.config.AutoSpeedLimitConfig.Limit)
 	UpdatePeriodic := int64(c.config.UpdatePeriodic)
 	limitedUsers := make([]api.UserInfo, 0)
-	for _, user := range *userInfo {
+	for _, user := range userInfo {
 		up, down, deltas := c.drainTraffic(c.buildUserTagWithTag(tag, &user))
 		if up > 0 || down > 0 {
 			// Over speed users
@@ -604,26 +619,32 @@ func (c *Controller) userInfoMonitor() (err error) {
 					delete(c.warnedUsers, user)
 				}
 			}
-			userTraffic = append(userTraffic, api.UserTraffic{
-				UID:      user.UID,
-				Email:    user.Email,
-				Upload:   up,
-				Download: down})
-
+			appendUserTraffic(&userTraffic, trafficIndex, user, up, down)
 			trafficDeltas = append(trafficDeltas, deltas...)
 		} else {
 			delete(c.warnedUsers, user)
 		}
+	}
+	for _, retired := range retiringUsers {
+		email := c.buildUserTagWithTag(retired.tag, &retired.user)
+		up, down, deltas := c.drainTraffic(email)
+		appendUserTraffic(&userTraffic, trafficIndex, retired.user, up, down)
+		trafficDeltas = append(trafficDeltas, deltas...)
 	}
 	if len(limitedUsers) > 0 {
 		if err := c.UpdateInboundLimiter(tag, &limitedUsers); err != nil {
 			log.Print(err)
 		}
 	}
+	reportSucceeded := true
 	if len(userTraffic) > 0 {
 		if err := flushUserTraffic(c.apiClient, c.config.DisableUploadTraffic, userTraffic, trafficDeltas); err != nil {
 			log.Print(err)
+			reportSucceeded = false
 		}
+	}
+	if reportSucceeded {
+		c.finalizeRetiringUsers(retiringUsers)
 	}
 
 	// Report Online info

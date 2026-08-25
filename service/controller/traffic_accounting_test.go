@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"runtime"
 	"sync"
@@ -8,6 +9,9 @@ import (
 	"testing"
 
 	"github.com/XrayR-project/XrayR/api"
+	"github.com/XrayR-project/XrayR/app/mydispatcher"
+	corestats "github.com/xtls/xray-core/app/stats"
+	"github.com/xtls/xray-core/features/stats"
 )
 
 type testTrafficCounter struct {
@@ -175,5 +179,71 @@ func TestTrafficDrainConcurrentStressConservesBytes(t *testing.T) {
 	}
 	if got, want := drained+counter.Value(), int64(writers*increments); got != want {
 		t.Fatalf("concurrent traffic = %d, want %d", got, want)
+	}
+}
+
+func TestAppendUserTrafficMergesRetiredGenerationByUID(t *testing.T) {
+	var traffic []api.UserTraffic
+	index := make(map[int]int)
+	appendUserTraffic(&traffic, index, api.UserInfo{UID: 7, Email: "current@example.com"}, 11, 13)
+	appendUserTraffic(&traffic, index, api.UserInfo{UID: 7, Email: "old@example.com"}, 17, 19)
+	if len(traffic) != 1 {
+		t.Fatalf("traffic rows = %d, want 1", len(traffic))
+	}
+	if got := traffic[0]; got.Email != "current@example.com" || got.Upload != 28 || got.Download != 32 {
+		t.Fatalf("merged traffic = %+v", got)
+	}
+}
+
+func TestRetiringTrafficFailureRestoresThenFinalizes(t *testing.T) {
+	manager, err := corestats.NewManager(context.Background(), &corestats.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatcher := new(mydispatcher.DefaultDispatcher)
+	if err := dispatcher.Init(&mydispatcher.Config{}, nil, nil, nil, manager, nil); err != nil {
+		t.Fatal(err)
+	}
+	c := &Controller{
+		stm:           manager,
+		dispatcher:    dispatcher,
+		retiringUsers: make(map[retiringUserKey]retiringUser),
+	}
+	const tag = "node"
+	user := api.UserInfo{UID: 9, Email: "retired@example.com"}
+	email := c.buildUserTagWithTag(tag, &user)
+	dispatcher.RegisterManagedUsers(tag, []string{email})
+	c.retireManagedUsers(tag, &[]api.UserInfo{user})
+	uplink, err := stats.GetOrRegisterCounter(manager, "user>>>"+email+">>>traffic>>>uplink")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uplink.Add(101)
+
+	retiring := c.retiringUserSnapshot()
+	up, down, deltas := c.drainTraffic(email)
+	traffic := []api.UserTraffic{{UID: user.UID, Email: user.Email, Upload: up, Download: down}}
+	wantErr := errors.New("submit failed")
+	if err := flushUserTraffic(testTrafficReporter{report: func(*[]api.UserTraffic) error { return wantErr }}, false, traffic, deltas); !errors.Is(err, wantErr) {
+		t.Fatalf("flush error = %v, want %v", err, wantErr)
+	}
+	if got := uplink.Value(); got != 101 {
+		t.Fatalf("restored late traffic = %d, want 101", got)
+	}
+	if len(c.retiringUserSnapshot()) != 1 {
+		t.Fatal("failed report removed retiring user")
+	}
+
+	up, down, deltas = c.drainTraffic(email)
+	traffic = []api.UserTraffic{{UID: user.UID, Email: user.Email, Upload: up, Download: down}}
+	if err := flushUserTraffic(testTrafficReporter{report: func(*[]api.UserTraffic) error { return nil }}, false, traffic, deltas); err != nil {
+		t.Fatal(err)
+	}
+	c.finalizeRetiringUsers(retiring)
+	if len(c.retiringUserSnapshot()) != 0 {
+		t.Fatal("successful report retained idle user")
+	}
+	if manager.GetCounter("user>>>"+email+">>>traffic>>>uplink") != nil {
+		t.Fatal("successful report retained traffic counter")
 	}
 }

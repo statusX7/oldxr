@@ -4,7 +4,9 @@ package mydispatcher
 
 import (
 	"context"
+	"expvar"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -13,7 +15,6 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/dns"
@@ -24,6 +25,7 @@ import (
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/pipe"
+	"golang.org/x/time/rate"
 
 	"github.com/XrayR-project/XrayR/common/limiter"
 	"github.com/XrayR-project/XrayR/common/rule"
@@ -31,14 +33,61 @@ import (
 
 var errSniffingTimeout = newError("timeout on sniffing")
 
+var (
+	directDispatchAttempts = expvar.NewInt("oldxr_direct_dispatch_attempts")
+	directDispatchFallback = expvar.NewInt("oldxr_direct_dispatch_fallback")
+	directDispatchSuccess  = expvar.NewInt("oldxr_direct_dispatch_success")
+)
+
+var directDataPathEnabled = func() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("XRAYR_DIRECT_DATAPATH"))) {
+	case "0", "false", "off":
+		return false
+	default:
+		return true
+	}
+}()
+
 type cachedReader struct {
 	sync.Mutex
-	reader *pipe.Reader
+	reader buf.Reader
 	cache  buf.MultiBuffer
 }
 
+type replayReader struct {
+	reader buf.Reader
+	cache  buf.MultiBuffer
+}
+
+func (r *replayReader) TakeBuffered() buf.MultiBuffer {
+	mb := r.cache
+	r.cache = nil
+	return mb
+}
+
+func (r *replayReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	if !r.cache.IsEmpty() {
+		mb := r.cache
+		r.cache = nil
+		return mb, nil
+	}
+	return r.reader.ReadMultiBuffer()
+}
+
+func (r *replayReader) Interrupt() {
+	if r.cache != nil {
+		r.cache = buf.ReleaseMulti(r.cache)
+	}
+	common.Interrupt(r.reader)
+}
+
 func (r *cachedReader) Cache(b *buf.Buffer) {
-	mb, _ := r.reader.ReadMultiBufferTimeout(time.Millisecond * 100)
+	var mb buf.MultiBuffer
+	if timeoutReader, ok := r.reader.(buf.TimeoutReader); ok {
+		mb, _ = timeoutReader.ReadMultiBufferTimeout(time.Millisecond * 100)
+	} else {
+		mb, _ = r.reader.ReadMultiBuffer()
+	}
 	r.Lock()
 	if !mb.IsEmpty() {
 		r.cache, _ = buf.MergeMulti(r.cache, mb)
@@ -78,7 +127,10 @@ func (r *cachedReader) ReadMultiBufferTimeout(timeout time.Duration) (buf.MultiB
 		return mb, nil
 	}
 
-	return r.reader.ReadMultiBufferTimeout(timeout)
+	if timeoutReader, ok := r.reader.(buf.TimeoutReader); ok {
+		return timeoutReader.ReadMultiBufferTimeout(timeout)
+	}
+	return r.reader.ReadMultiBuffer()
 }
 
 func (r *cachedReader) Interrupt() {
@@ -87,7 +139,29 @@ func (r *cachedReader) Interrupt() {
 		r.cache = buf.ReleaseMulti(r.cache)
 	}
 	r.Unlock()
-	r.reader.Interrupt()
+	common.Interrupt(r.reader)
+}
+
+func (r *cachedReader) TakeBuffered() buf.MultiBuffer {
+	r.Lock()
+	defer r.Unlock()
+	mb := r.cache
+	r.cache = nil
+	return mb
+}
+
+func (r *cachedReader) ReplayReader() buf.Reader {
+	r.Lock()
+	defer r.Unlock()
+	if r.cache.IsEmpty() {
+		return r.reader
+	}
+	replay := &replayReader{
+		reader: r.reader,
+		cache:  r.cache,
+	}
+	r.cache = nil
+	return replay
 }
 
 // DefaultDispatcher is a default implementation of Dispatcher.
@@ -100,6 +174,149 @@ type DefaultDispatcher struct {
 	fdns        dns.FakeDNSEngine
 	Limiter     *limiter.Limiter
 	RuleManager *rule.Manager
+	userFlows   userFlowRegistry
+}
+
+type userIO struct {
+	bucket          *rate.Limiter
+	speedLimited    bool
+	uplinkCounter   stats.Counter
+	downlinkCounter stats.Counter
+	runtime         *userFlowRuntime
+	releaseOnce     sync.Once
+}
+
+func (u *userIO) OwnerEligible() bool {
+	if !u.speedLimited || u.bucket == nil {
+		return true
+	}
+	// The owner keeps at most one 64 KiB readiness batch per direction. Smaller
+	// token bursts continue through the generic WaitN path, which can split the
+	// write without stalling an event loop.
+	return u.bucket.Burst() >= 64*1024
+}
+
+func (u *userIO) Acquire(bytes int) (time.Duration, bool) {
+	if bytes <= 0 || !u.speedLimited || u.bucket == nil {
+		return 0, true
+	}
+	burst := u.bucket.Burst()
+	if burst <= 0 {
+		return 0, false
+	}
+	now := time.Now()
+	var ready time.Duration
+	for bytes > 0 {
+		chunk := bytes
+		if chunk > burst {
+			chunk = burst
+		}
+		reservation := u.bucket.ReserveN(now, chunk)
+		if !reservation.OK() {
+			return 0, false
+		}
+		if delay := reservation.DelayFrom(now); delay > ready {
+			ready = delay
+		}
+		bytes -= chunk
+	}
+	return ready, true
+}
+
+func (u *userIO) AddUplink(bytes int64) {
+	if u.uplinkCounter != nil && bytes > 0 {
+		u.uplinkCounter.Add(bytes)
+	}
+}
+
+func (u *userIO) AddDownlink(bytes int64) {
+	if u.downlinkCounter != nil && bytes > 0 {
+		u.downlinkCounter.Add(bytes)
+	}
+}
+
+func (u *userIO) Release() {
+	if u == nil {
+		return
+	}
+	u.releaseOnce.Do(func() {
+		if u.runtime != nil {
+			u.runtime.release()
+		}
+	})
+}
+
+func (d *DefaultDispatcher) getUserIO(ctx context.Context) (*userIO, error) {
+	result := new(userIO)
+	sessionInbound := session.InboundFromContext(ctx)
+	if sessionInbound == nil || sessionInbound.User == nil || len(sessionInbound.User.Email) == 0 {
+		return result, nil
+	}
+
+	user := sessionInbound.User
+	runtime, allowed := d.userFlows.acquire(sessionInbound.Tag, user.Email)
+	if !allowed {
+		return nil, newError("user is no longer active: ", user.Email)
+	}
+	result.runtime = runtime
+	keepRuntime := false
+	defer func() {
+		if !keepRuntime {
+			result.Release()
+		}
+	}()
+	bucket, ok, reject := d.Limiter.GetUserBucket(sessionInbound.Tag, user.Email, sessionInbound.Source.Address.IP().String())
+	if reject {
+		newError("Devices reach the limit: ", user.Email).AtWarning().WriteToLog()
+		return nil, newError("Devices reach the limit: ", user.Email)
+	}
+	result.bucket = bucket
+	result.speedLimited = ok
+
+	p := d.policy.ForLevel(user.Level)
+	if p.Stats.UserUplink {
+		name := userUplinkCounterName(user.Email)
+		result.uplinkCounter, _ = getOrRegisterCounter(d.stats, name)
+	}
+	if p.Stats.UserDownlink {
+		name := userDownlinkCounterName(user.Email)
+		result.downlinkCounter, _ = getOrRegisterCounter(d.stats, name)
+	}
+
+	keepRuntime = true
+	return result, nil
+}
+
+func getOrRegisterCounter(manager stats.Manager, name string) (stats.Counter, error) {
+	counter, err := stats.GetOrRegisterCounter(manager, name)
+	if err != nil {
+		// GetOrRegisterCounter is intentionally generic and can lose a concurrent
+		// RegisterCounter race. Re-read the manager before surfacing the error.
+		if counter = manager.GetCounter(name); counter != nil {
+			return counter, nil
+		}
+	}
+	return counter, err
+}
+
+func (d *DefaultDispatcher) wrapUserWriter(ctx context.Context, writer buf.Writer, bucket *rate.Limiter, speedLimited bool, counter stats.Counter) buf.Writer {
+	if speedLimited {
+		writer = d.Limiter.RateWriterContext(ctx, writer, bucket)
+	}
+	if counter != nil {
+		writer = &SizeStatWriter{Counter: counter, Writer: writer}
+	}
+	return writer
+}
+
+func (d *DefaultDispatcher) wrapUserReader(ctx context.Context, reader buf.Reader, bucket *rate.Limiter, speedLimited bool, counter stats.Counter) buf.Reader {
+	if counter != nil {
+		reader = &SizeStatReader{Counter: counter, Reader: reader}
+	}
+	if speedLimited {
+		reader = d.Limiter.RateReaderContext(ctx, reader, bucket)
+	}
+	return reader
 }
 
 func init() {
@@ -226,47 +443,19 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network, sn
 		Writer: downlinkWriter,
 	}
 
-	sessionInbound := session.InboundFromContext(ctx)
-	var user *protocol.MemoryUser
-	if sessionInbound != nil {
-		user = sessionInbound.User
+	io, err := d.getUserIO(ctx)
+	if err != nil {
+		common.Close(outboundLink.Writer)
+		common.Close(inboundLink.Writer)
+		common.Interrupt(outboundLink.Reader)
+		common.Interrupt(inboundLink.Reader)
+		return nil, nil, err
 	}
-
-	if user != nil && len(user.Email) > 0 {
-		// Speed Limit and Device Limit
-		bucket, ok, reject := d.Limiter.GetUserBucket(sessionInbound.Tag, user.Email, sessionInbound.Source.Address.IP().String())
-		if reject {
-			newError("Devices reach the limit: ", user.Email).AtWarning().WriteToLog()
-			common.Close(outboundLink.Writer)
-			common.Close(inboundLink.Writer)
-			common.Interrupt(outboundLink.Reader)
-			common.Interrupt(inboundLink.Reader)
-			return nil, nil, newError("Devices reach the limit: ", user.Email)
-		}
-		if ok {
-			inboundLink.Writer = d.Limiter.RateWriterContext(ctx, inboundLink.Writer, bucket)
-			outboundLink.Writer = d.Limiter.RateWriterContext(ctx, outboundLink.Writer, bucket)
-		}
-		p := d.policy.ForLevel(user.Level)
-		if p.Stats.UserUplink {
-			name := "user>>>" + user.Email + ">>>traffic>>>uplink"
-			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
-				inboundLink.Writer = &SizeStatWriter{
-					Counter: c,
-					Writer:  inboundLink.Writer,
-				}
-			}
-		}
-		if p.Stats.UserDownlink {
-			name := "user>>>" + user.Email + ">>>traffic>>>downlink"
-			if c, _ := stats.GetOrRegisterCounter(d.stats, name); c != nil {
-				outboundLink.Writer = &SizeStatWriter{
-					Counter: c,
-					Writer:  outboundLink.Writer,
-				}
-			}
-		}
-	}
+	inboundLink.Writer = d.wrapUserWriter(ctx, inboundLink.Writer, io.bucket, io.speedLimited, io.uplinkCounter)
+	outboundLink.Writer = d.wrapUserWriter(ctx, outboundLink.Writer, io.bucket, io.speedLimited, io.downlinkCounter)
+	lifecycle := newUserConnectionLifecycle(io, 2)
+	inboundLink.Writer = &lifecycleWriter{Writer: inboundLink.Writer, lifecycle: lifecycle}
+	outboundLink.Writer = &lifecycleWriter{Writer: outboundLink.Writer, lifecycle: lifecycle}
 
 	return inboundLink, outboundLink, nil
 }
@@ -439,8 +628,18 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 	return contentResult, contentErr
 }
 
-func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.Link, destination net.Destination) {
+type outboundSelection struct {
+	handler     outbound.Handler
+	destination net.Destination
+	inboundTag  string
+	pickRoute   int
+}
+
+func (d *DefaultDispatcher) selectOutbound(ctx context.Context, destination net.Destination) (*outboundSelection, error) {
 	ob := session.OutboundFromContext(ctx)
+	if ob == nil {
+		return nil, newError("outbound session not found")
+	}
 	if hosts, ok := d.dns.(dns.HostsLookup); ok && destination.Address.Family().IsDomain() {
 		proxied := hosts.LookupHosts(ob.Target.String())
 		if proxied != nil {
@@ -459,13 +658,10 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 	// Check if domain and protocol hit the rule
 	sessionInbound := session.InboundFromContext(ctx)
 	// Whether the inbound connection contains a user
-	if sessionInbound.User != nil {
+	if sessionInbound != nil && sessionInbound.User != nil {
 		if d.RuleManager.Detect(sessionInbound.Tag, destination.String(), sessionInbound.User.Email) {
 			newError(fmt.Sprintf("User %s access %s reject by rule", sessionInbound.User.Email, destination.String())).AtError().WriteToLog()
-			newError("destination is reject by rule")
-			common.Close(link.Writer)
-			common.Interrupt(link.Reader)
-			return
+			return nil, newError("destination is reject by rule")
 		}
 	}
 
@@ -480,9 +676,7 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 			handler = h
 		} else {
 			newError("non existing tag for platform initialized detour: ", forcedOutboundTag).AtError().WriteToLog(session.ExportIDToError(ctx))
-			common.Close(link.Writer)
-			common.Interrupt(link.Reader)
-			return
+			return nil, newError("non existing tag for platform initialized detour: ", forcedOutboundTag)
 		}
 	} else if d.router != nil {
 		if route, err := d.router.PickRoute(routingLink); err == nil {
@@ -510,25 +704,131 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 
 	if handler == nil {
 		newError("default outbound handler not exist").WriteToLog(session.ExportIDToError(ctx))
+		return nil, newError("default outbound handler not exist")
+	}
+
+	return &outboundSelection{
+		handler:     handler,
+		destination: ob.Target,
+		inboundTag:  inTag,
+		pickRoute:   isPickRoute,
+	}, nil
+}
+
+func recordAccess(ctx context.Context, selection *outboundSelection) {
+	if accessMessage := log.AccessMessageFromContext(ctx); accessMessage != nil {
+		if tag := selection.handler.Tag(); tag != "" {
+			if selection.inboundTag == "" {
+				accessMessage.Detour = tag
+			} else if selection.pickRoute == 1 {
+				accessMessage.Detour = selection.inboundTag + " ==> " + tag
+			} else if selection.pickRoute == 2 {
+				accessMessage.Detour = selection.inboundTag + " -> " + tag
+			} else {
+				accessMessage.Detour = selection.inboundTag + " >> " + tag
+			}
+		}
+		log.Record(accessMessage)
+	}
+}
+
+// DispatchDirect performs sniffing and routing synchronously, then transfers
+// ownership of a supported direct outbound socket to the protocol handler. Any
+// bytes consumed while sniffing are returned through the replay reader so the
+// regular dispatcher remains a lossless fallback.
+func (d *DefaultDispatcher) DispatchDirect(ctx context.Context, destination net.Destination, input buf.Reader) (*transport.DirectLink, buf.Reader, error) {
+	if !directDataPathEnabled {
+		return nil, input, nil
+	}
+	directDispatchAttempts.Add(1)
+	if !destination.IsValid() {
+		return nil, input, newError("Dispatcher: Invalid destination.")
+	}
+	if destination.Network != net.Network_TCP {
+		return nil, input, nil
+	}
+
+	ob := &session.Outbound{Target: destination}
+	ctx = session.ContextWithOutbound(ctx, ob)
+	content := session.ContentFromContext(ctx)
+	if content == nil {
+		content = new(session.Content)
+		ctx = session.ContextWithContent(ctx, content)
+	}
+	userIO, err := d.getUserIO(ctx)
+	if err != nil {
+		return nil, input, err
+	}
+
+	replayReader := input
+	sniffingRequest := content.SniffingRequest
+	if sniffingRequest.Enabled {
+		cReader := &cachedReader{reader: input}
+		result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
+		if err == nil {
+			content.Protocol = result.Protocol()
+		}
+		if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
+			domain := result.Domain()
+			newError("sniffed domain: ", domain).WriteToLog(session.ExportIDToError(ctx))
+			destination.Address = net.ParseAddress(domain)
+			if sniffingRequest.RouteOnly && result.Protocol() != "fakedns" {
+				ob.RouteTarget = destination
+			} else {
+				ob.Target = destination
+			}
+		}
+		replayReader = cReader.ReplayReader()
+	}
+
+	selection, err := d.selectOutbound(ctx, destination)
+	if err != nil {
+		userIO.Release()
+		return nil, replayReader, err
+	}
+	directHandler, ok := selection.handler.(outbound.DirectHandler)
+	if !ok {
+		directDispatchFallback.Add(1)
+		userIO.Release()
+		return nil, replayReader, nil
+	}
+
+	directLink, supported, err := directHandler.OpenDirect(ctx, selection.destination)
+	if err != nil {
+		userIO.Release()
+		return nil, replayReader, err
+	}
+	if !supported {
+		directDispatchFallback.Add(1)
+		userIO.Release()
+		return nil, replayReader, nil
+	}
+	if directLink == nil || directLink.Reader == nil || directLink.Writer == nil {
+		if directLink != nil {
+			_ = directLink.Close()
+		}
+		userIO.Release()
+		return nil, replayReader, newError("direct outbound returned an invalid link")
+	}
+
+	directLink.SetFlow(userIO)
+	directLink.Writer = d.wrapUserWriter(ctx, directLink.Writer, userIO.bucket, userIO.speedLimited, userIO.uplinkCounter)
+	directLink.Reader = d.wrapUserReader(ctx, directLink.Reader, userIO.bucket, userIO.speedLimited, userIO.downlinkCounter)
+	recordAccess(ctx, selection)
+	directDispatchSuccess.Add(1)
+	return directLink, replayReader, nil
+}
+
+func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.Link, destination net.Destination) {
+	defer common.Close(link.Writer)
+	defer common.Interrupt(link.Reader)
+	selection, err := d.selectOutbound(ctx, destination)
+	if err != nil {
 		common.Close(link.Writer)
 		common.Interrupt(link.Reader)
 		return
 	}
 
-	if accessMessage := log.AccessMessageFromContext(ctx); accessMessage != nil {
-		if tag := handler.Tag(); tag != "" {
-			if inTag == "" {
-				accessMessage.Detour = tag
-			} else if isPickRoute == 1 {
-				accessMessage.Detour = inTag + " ==> " + tag
-			} else if isPickRoute == 2 {
-				accessMessage.Detour = inTag + " -> " + tag
-			} else {
-				accessMessage.Detour = inTag + " >> " + tag
-			}
-		}
-		log.Record(accessMessage)
-	}
-
-	handler.Dispatch(ctx, link)
+	recordAccess(ctx, selection)
+	selection.handler.Dispatch(ctx, link)
 }

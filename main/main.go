@@ -4,6 +4,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path"
@@ -65,12 +67,26 @@ func getConfig() *viper.Viper {
 	return config
 }
 
+func startDebugServer() {
+	addr := os.Getenv("XRAYR_DEBUG_ADDR")
+	if addr == "" {
+		return
+	}
+	go func() {
+		if err := http.ListenAndServe(addr, nil); err != nil {
+			log.Printf("调试端点启动失败：%v", err)
+		}
+	}()
+}
+
 func main() {
 	flag.Parse()
 	showVersion()
 	if *printVersion {
 		return
 	}
+	applyRuntimePolicy()
+	startDebugServer()
 
 	config := getConfig()
 	panelConfig := &panel.Config{}
