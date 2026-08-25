@@ -21,8 +21,10 @@
 ## 实现边界
 
 - Go、xray-core与必要依赖版本可以升级，但每次变化必须有同源 A/B 性能证据、兼容验证、安全审计和license审计。
-- 允许一个明确热路径/package内部的局部数据结构、状态所有权、dispatcher、stats、limiter、buffer或core backport重构。
-- 禁止新建平行 FastEngine、重新实现完整VMess/SS协议引擎、用Rust/C替换data plane、全量重写整个项目架构。
+- 允许在单一Go二进制内部深度重构data path、socket ownership、I/O reactor、dispatcher、transport/pipe、协议handler与freedom outbound之间的连接模型；允许维护可追踪的xray-core Go fork或兼容shim。
+- common-case fast path可以绕过旧generic pipe/dispatcher handoff，但必须在连接建立时完成route、outbound、traffic、SpeedLimit、DeviceLimit、rule和online-IP绑定；不支持的配置必须无损走原generic path，禁止静默降级。
+- 允许跨多个Go package重构和较大代码改动，不再要求局限于单一package；每个架构里程碑仍须独立可关闭、可回滚，并用same-P 1000Mbps A/B证明收益来源。
+- 禁止新建平行独立FastEngine产品、重新发明VMess/SS密码协议、用Rust/C替换data plane、恢复多二进制selector或把项目改成非Go后端。
 - r1/r2历史修复不得无脑cherry-pick：先在官方基线用测试复现，再移植最小逻辑修复。
 - 不得通过关闭功能、改变轮询/上报周期、降低并发/吞吐、减少站点/用户、改变cipher、安全或统计语义获得性能结果。
 
@@ -42,6 +44,7 @@
 - 修改前先对官方基线采集CPU/heap/alloc/goroutine/mutex/block/syscall profile；只优化top hotspot。
 - 每个性能patch应独立、可回滚，并记录hypothesis、targeted test、system benchmark和保留/回退结论。
 - 已证伪的固定/adaptive pipe threshold、zero-wait drain、只减少goroutine或allocation、无4KiB收益的drop-in modern core不得机械重复。
+- 允许在新socket ownership或direct relay架构下重新验证旧pipe相关假设，但必须明确说明机制为何不同；不得把旧参数实验原样重复。
 - `copyInternal`的cumulative值不得当作flat CPU；必须区分user copy、syscall、crypto、netpoll、scheduler、GC与wrapper成本。
 - 正式结果必须保持payload exact和traffic守恒：`successfully transferred = reported + pending + retiring-user pending`。
 
