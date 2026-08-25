@@ -245,6 +245,75 @@ func TestV2BoardShadowsocksSharesNodeAndUserFetch(t *testing.T) {
 	}
 }
 
+func TestV2BoardShadowsocksPublishesEmptyUsersWithCachedNodeInfo(t *testing.T) {
+	var state struct {
+		sync.Mutex
+		empty   bool
+		version int
+	}
+	state.version = 1
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		state.Lock()
+		empty := state.empty
+		version := state.version
+		state.Unlock()
+		etag := fmt.Sprintf("\"ss-users-v%d\"", version)
+		if r.Header.Get("If-None-Match") == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", etag)
+		if empty {
+			writeJSON(t, w, map[string]any{"data": []any{}})
+			return
+		}
+		writeETagUsers(t, w, "Shadowsocks", version)
+	}))
+	defer server.Close()
+
+	client := newETagClient(server.URL, "Shadowsocks")
+	node, err := client.GetNodeInfo()
+	if err != nil || node.Port != 8388 || node.CypherMethod != "aes-128-gcm" {
+		t.Fatalf("initial node=%#v err=%v", node, err)
+	}
+	users, err := client.GetUserList()
+	if err != nil || len(*users) != 1 {
+		t.Fatalf("initial users=%#v err=%v", users, err)
+	}
+
+	state.Lock()
+	state.empty = true
+	state.version = 2
+	state.Unlock()
+	node, err = client.GetNodeInfo()
+	if err != nil || node.Port != 8388 || node.CypherMethod != "aes-128-gcm" {
+		t.Fatalf("empty-list node=%#v err=%v", node, err)
+	}
+	users, err = client.GetUserList()
+	if err != nil || users == nil || len(*users) != 0 {
+		t.Fatalf("empty users=%#v err=%v", users, err)
+	}
+
+	node, err = client.GetNodeInfo()
+	if err != nil || node.Port != 8388 || node.CypherMethod != "aes-128-gcm" {
+		t.Fatalf("cached empty-list node=%#v err=%v", node, err)
+	}
+	if _, err := client.GetUserList(); err == nil || err.Error() != "users no change" {
+		t.Fatalf("cached empty-list error=%v, want users no change", err)
+	}
+}
+
+func TestV2BoardShadowsocksRejectsInitialEmptyUsers(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(t, w, map[string]any{"data": []any{}})
+	}))
+	defer server.Close()
+
+	if _, err := newETagClient(server.URL, "Shadowsocks").GetNodeInfo(); err == nil || !strings.Contains(err.Error(), "number of node users is 0") {
+		t.Fatalf("error=%v, want initial empty-user diagnostic", err)
+	}
+}
+
 func TestV2BoardConcurrentRefreshPublishesOnce(t *testing.T) {
 	var state struct {
 		sync.Mutex

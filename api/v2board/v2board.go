@@ -21,22 +21,23 @@ import (
 
 // APIClient create an api client to the panel.
 type APIClient struct {
-	client        *resty.Client
-	APIHost       string
-	NodeID        int
-	Key           string
-	NodeType      string
-	EnableVless   bool
-	EnableXTLS    bool
-	SpeedLimit    float64
-	DeviceLimit   int
-	LocalRuleList []api.DetectRule
-	ConfigResp    *simplejson.Json
-	access        sync.Mutex
-	userAccess    sync.Mutex
-	userETag      string
-	lastUserList  *[]api.UserInfo
-	ssPending     *userListFetch
+	client         *resty.Client
+	APIHost        string
+	NodeID         int
+	Key            string
+	NodeType       string
+	EnableVless    bool
+	EnableXTLS     bool
+	SpeedLimit     float64
+	DeviceLimit    int
+	LocalRuleList  []api.DetectRule
+	ConfigResp     *simplejson.Json
+	access         sync.Mutex
+	userAccess     sync.Mutex
+	userETag       string
+	lastUserList   *[]api.UserInfo
+	ssPending      *userListFetch
+	lastSSNodeInfo *api.NodeInfo
 }
 
 type userListFetch struct {
@@ -385,12 +386,12 @@ func (c *APIClient) ParseTrojanNodeResponse(nodeInfoResponse *simplejson.Json) (
 // ParseSSNodeResponse parse the response for the given nodeinfor format
 func (c *APIClient) ParseSSNodeResponse() (*api.NodeInfo, error) {
 	c.userAccess.Lock()
+	defer c.userAccess.Unlock()
 	userInfo, _, err := c.fetchUserListLocked()
-	c.userAccess.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	return c.buildSSNodeResponse(userInfo)
+	return c.buildOrReuseSSNodeResponseLocked(userInfo)
 }
 
 func (c *APIClient) fetchSSNodeResponse() (*api.NodeInfo, error) {
@@ -401,7 +402,7 @@ func (c *APIClient) fetchSSNodeResponse() (*api.NodeInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	nodeInfo, err := c.buildSSNodeResponse(userInfo)
+	nodeInfo, err := c.buildOrReuseSSNodeResponseLocked(userInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -429,6 +430,25 @@ func (c *APIClient) buildSSNodeResponse(userInfo *[]api.UserInfo) (*api.NodeInfo
 	}
 
 	return nodeinfo, nil
+}
+
+// buildOrReuseSSNodeResponseLocked preserves the last validated listen port
+// and cipher when V2Board publishes an empty Shadowsocks user list. V2Board's
+// legacy endpoint carries these node fields only on user records, so rejecting
+// an empty list would also prevent the controller from removing every user.
+// The caller must hold userAccess.
+func (c *APIClient) buildOrReuseSSNodeResponseLocked(userInfo *[]api.UserInfo) (*api.NodeInfo, error) {
+	nodeInfo, err := c.buildSSNodeResponse(userInfo)
+	if err == nil {
+		cached := *nodeInfo
+		c.lastSSNodeInfo = &cached
+		return nodeInfo, nil
+	}
+	if userInfo == nil || len(*userInfo) != 0 || c.lastSSNodeInfo == nil {
+		return nil, err
+	}
+	cached := *c.lastSSNodeInfo
+	return &cached, nil
 }
 
 // ParseV2rayNodeResponse parse the response for the given nodeinfor format
