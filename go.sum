@@ -1676,8 +1676,8 @@ github.com/statusX7/oldxr-giouring v0.0.0-oldxr.1 h1:pyDgW9xBJ4g+RF5kUrbR59vac3f
 github.com/statusX7/oldxr-giouring v0.0.0-oldxr.1/go.mod h1:HwOQqYv/WE3RMp4iTQsS6ou8WP3wKO9UXD0oDqB3NPU=
 github.com/statusX7/oldxr-gnet/v2 v2.10.0-oldxr.1 h1:HZP7+kMsGJSLEzQdUzfDECDKHI4TO1JQzC8wU4naEEI=
 github.com/statusX7/oldxr-gnet/v2 v2.10.0-oldxr.1/go.mod h1:f9wdbOFsdbZqlSvXctWbPRW5bB/W++q8Zqz+D7tQIVQ=
-github.com/statusX7/oldxr-xray-core v1.7.5-oldxr.1.0.20260827101946-5d02e12b64bb h1:Zx7lnpPj8kpAbwIwLUm1QB7WPdNIYLZP9LsOuqS7jmA=
-github.com/statusX7/oldxr-xray-core v1.7.5-oldxr.1.0.20260827101946-5d02e12b64bb/go.mod h1:0qfl+pVWeh+ctFQh7fECn075SILPgeb3TnctdG0jR2A=
+github.com/statusX7/oldxr-xray-core v1.7.5-oldxr.1.0.20260827104344-df14d7142494 h1:cRPy7W9QQJo21wehlpElS9ut7fH3Rqkcj7lHIp1d2eo=
+github.com/statusX7/oldxr-xray-core v1.7.5-oldxr.1.0.20260827104344-df14d7142494/go.mod h1:0qfl+pVWeh+ctFQh7fECn075SILPgeb3TnctdG0jR2A=
 github.com/streadway/amqp v0.0.0-20190404075320-75d898a42a94/go.mod h1:AZpEONHx3DKn8O/DFsRAY58/XVQiIPMTMB1SddzLXVw=
 github.com/streadway/amqp v1.0.0/go.mod h1:AZpEONHx3DKn8O/DFsRAY58/XVQiIPMTMB1SddzLXVw=
 github.com/streadway/handy v0.0.0-20200128134331-0f66f006fb2e/go.mod h1:qNTQ5P5JnDBl6z3cMAg/SywNDC5ABu5ApDIw6lUbRmI=
