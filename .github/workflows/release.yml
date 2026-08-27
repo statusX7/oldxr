@@ -7,9 +7,6 @@ on:
         description: Release version (v1.0.N)
         required: true
         default: v1.0.0
-  push:
-    tags:
-      - "v1.0.*"
 
 permissions:
   contents: write
@@ -89,10 +86,3 @@ jobs:
             dist/XrayR-${{ matrix.asset }}.zip
             dist/XrayR-${{ matrix.asset }}.zip.sha256
           if-no-files-found: error
-      - name: Upload tagged release assets
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/XrayR-${{ matrix.asset }}.zip
-            dist/XrayR-${{ matrix.asset }}.zip.sha256
