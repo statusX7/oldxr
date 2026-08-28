@@ -33,15 +33,16 @@ type Server struct {
 // NewServer create a new Shadowsocks server.
 func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	validator := new(Validator)
+	users := make([]*protocol.MemoryUser, 0, len(config.Users))
 	for _, user := range config.Users {
 		u, err := user.ToMemoryUser()
 		if err != nil {
 			return nil, newError("failed to get shadowsocks user").Base(err).AtError()
 		}
-
-		if err := validator.Add(u); err != nil {
-			return nil, newError("failed to add user").Base(err).AtError()
-		}
+		users = append(users, u)
+	}
+	if err := validator.addUsers(users); err != nil {
+		return nil, newError("failed to add users").Base(err).AtError()
 	}
 
 	v := core.MustFromContext(ctx)
