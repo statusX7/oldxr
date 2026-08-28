@@ -6,7 +6,7 @@ on:
       version:
         description: Release version (v1.0.N)
         required: true
-        default: v1.0.0
+        default: v1.0.1
 
 permissions:
   contents: write

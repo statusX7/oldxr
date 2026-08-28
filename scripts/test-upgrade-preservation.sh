@@ -203,7 +203,7 @@ assert_successful_upgrade() {
 
     config_path="$(<"${root}/config-path")"
     config_dir="$(dirname "${config_path}")"
-    output="$(run_installer "${name}" 1.0.0)"
+    output="$(run_installer "${name}" "${release_version#v}")"
     grep -F '检测到现有安装：来源=official XrayR' <<<"${output}" >/dev/null
     grep -F "检测到配置：${config_path}" <<<"${output}" >/dev/null
     grep -F 'XrayR service 已启动' <<<"${output}" >/dev/null
@@ -249,7 +249,7 @@ assert_successful_upgrade official-short
 echo "执行 service 启动失败自动回滚"
 prepare_official_layout rollback space
 touch "${test_root}/rollback/systemctl-fail-once"
-if run_installer rollback 1.0.0 >/dev/null 2>&1; then
+if run_installer rollback "${release_version#v}" >/dev/null 2>&1; then
     echo "错误：service 启动失败时安装器未返回失败。" >&2
     exit 1
 fi

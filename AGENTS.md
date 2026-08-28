@@ -4,10 +4,10 @@
 
 ## 产品身份与源码基线
 
-- `1.0.x` 是单一 Go 二进制产品线，首个候选版本为 `v1.0.0`，binary version 显示 `XrayR 1.0.0`。
+- `1.0.x` 是单一 Go 二进制产品线；当前补丁版本为 `v1.0.1`，binary version 显示 `XrayR 1.0.1`。
 - 开发基线必须是官方 `XrayR v0.9.0` commit `f95825395d192498adfc533ab925943088408cb4`；不得从 r3/r4 删除 Rust 后伪装成官方基线。
 - 历史 `v0.9.0`、`v0.9.0-r1`、`v0.9.0-r2`、`v0.9.0-r3`、`v0.9.0-r4` tags 不移动、不删除、不覆盖。
-- `v1.0.0` production package只包含一个主要运行二进制 `XrayR`。禁止依赖 `XrayR-fastengine`、`XrayR-legacy`、Rust runtime或三二进制 selector。
+- `v1.0.x` production package只包含一个主要运行二进制 `XrayR`。禁止依赖 `XrayR-fastengine`、`XrayR-legacy`、Rust runtime或三二进制 selector。
 
 ## 不可破坏的兼容合同
 
@@ -33,11 +33,11 @@
 - 正式主负载：10个独立 V2Board 1.6.0 sites、1000 registered/site、25 VMess + 25 SS active/site、500 TCP connections、4KiB/application write、1000Mbps aggregate application payload（500Mbps upload + echo返回500Mbps download）。
 - 正式server固定4 vCPU/4GiB；1C1G只用于maximum-sustainable辅助结果。发布主判定使用独立物理/云Proxy Host，暂不可用时使用独立KVM virtio P-path并明确标注；本机veth/netns只作系统下界、开发回归和调度诊断，loopback不得作为Release Gate。
 - 原版与candidate必须使用相同硬件、CPU affinity/quota、MemoryMax、kernel、完整config/route/outbound/rulelist、用户、连接、流量、功能开关、warmup和measurement。负载发生器仍以1000Mbps aggregate application payload为目标；执行时实测吞吐达到`950Mbps`即通过筛选与正式throughput Gate，CPU按实际成功传输的application bytes归一化。不得为了过Gate主动降低发送计划、连接数或功能。
-- CPU发布硬目标：在正式P-path 1000Mbps固定吞吐主负载中，candidate cgroup normalized CPU cost `<=70%` exact official v0.9.0，即改善`>=30%`。`30%–40%`可接受，`>=40%`为优先目标；低于`30%`不得发布`v1.0.0`。Mixed必须达到该Gate；VMess-only和SS-only各自目标`>=20%`且任何一个不得回退超过`5%`。同时报告same-P代码收益、task-clock ms/MB和CPU/Mbps，不得把单纯P-width变化冒充源码收益。
+- CPU发布硬目标：在正式P-path 1000Mbps固定吞吐主负载中，candidate cgroup normalized CPU cost `<=70%` exact official v0.9.0，即改善`>=30%`。`30%–40%`可接受，`>=40%`为优先目标；低于`30%`不得发布`v1.0.x`。Mixed必须达到该Gate；VMess-only和SS-only各自目标`>=20%`且任何一个不得回退超过`5%`。同时报告same-P代码收益、task-clock ms/MB和CPU/Mbps，不得把单纯P-width变化冒充源码收益。
 - RAM硬目标：candidate RSS `<=50%` official，并记录heap、objects、goroutines、FD和时间斜率。
 - 筛选至少3轮、warmup至少30秒、measurement至少60秒；正式结果至少10轮交叉/随机顺序且measurement至少180秒，不得挑最好一次。
 - 主测试必须开启traffic accounting、online IP/device、SpeedLimit、DeviceLimit、route/outbound/rulelist、panel polling/submit与UDP support。
-- 任一CPU、RAM、功能、OS、soak、安全、升级或rollback Gate失败时，不得发布`v1.0.0`、不得更新master安装入口、不得宣称完成。
+- 任一CPU、RAM、功能、OS、soak、安全、升级或rollback Gate失败时，不得发布`v1.0.x`、不得更新master安装入口、不得宣称完成；用户明确接受且在Release notes完整披露的特定安全例外除外，该例外不得自动延伸到其他版本。
 
 ## 证据驱动开发
 
