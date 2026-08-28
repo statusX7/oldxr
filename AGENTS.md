@@ -4,7 +4,7 @@
 
 ## 产品身份与源码基线
 
-- `1.0.x` 是单一 Go 二进制产品线；当前补丁版本为 `v1.0.1`，binary version 显示 `XrayR 1.0.1`。
+- `1.0.x` 是单一 Go 二进制产品线；当前补丁版本为 `v1.0.2`，binary version 显示 `XrayR 1.0.2`。
 - 开发基线必须是官方 `XrayR v0.9.0` commit `f95825395d192498adfc533ab925943088408cb4`；不得从 r3/r4 删除 Rust 后伪装成官方基线。
 - 历史 `v0.9.0`、`v0.9.0-r1`、`v0.9.0-r2`、`v0.9.0-r3`、`v0.9.0-r4` tags 不移动、不删除、不覆盖。
 - `v1.0.x` production package只包含一个主要运行二进制 `XrayR`。禁止依赖 `XrayR-fastengine`、`XrayR-legacy`、Rust runtime或三二进制 selector。

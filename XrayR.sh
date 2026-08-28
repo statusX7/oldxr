@@ -6,11 +6,12 @@ green='\033[0;32m'
 yellow='\033[0;33m'
 plain='\033[0m'
 
-version="v1.0.1"
+version="v1.0.2"
 repo="statusX7/oldxr"
 stable_branch="master"
 raw_base="${OLDXR_RAW_BASE:-https://raw.githubusercontent.com/${repo}/${stable_branch}}"
 install_url="${raw_base}/install.sh"
+bbr_script_url="${OLDXR_BBR_SCRIPT_URL:-https://raw.githubusercontent.com/chiakge/Linux-NetSpeed/master/tcp.sh}"
 install_root="${OLDXR_INSTALL_ROOT:-}"
 systemctl_bin="${OLDXR_SYSTEMCTL_BIN:-systemctl}"
 service_file="${OLDXR_SERVICE_FILE:-${install_root}/etc/systemd/system/XrayR.service}"
@@ -198,8 +199,28 @@ update_shell() {
 }
 
 install_bbr() {
-    echo -e "${yellow}已保留原版 v0.9.0 的 BBR 菜单入口，但不会自动运行已归档的第三方内核脚本。${plain}"
-    echo "请使用当前发行版官方内核与系统工具启用 BBR。"
+    local temporary
+    local status
+    temporary="$(mktemp)"
+    echo -e "${yellow}即将运行原版菜单使用的第三方内核/BBR脚本。该脚本会修改系统内核并可能要求重启。${plain}"
+    if ! curl --fail --location --silent --show-error --retry 3 --output "${temporary}" "${bbr_script_url}"; then
+        rm -f -- "${temporary}"
+        echo -e "${red}下载 BBR 安装脚本失败：${bbr_script_url}${plain}" >&2
+        return 1
+    fi
+    if ! bash -n "${temporary}"; then
+        rm -f -- "${temporary}"
+        echo -e "${red}BBR 安装脚本语法校验失败，已拒绝执行。${plain}" >&2
+        return 1
+    fi
+    if bash "${temporary}"; then
+        status=0
+    else
+        status=$?
+        echo -e "${red}第三方内核/BBR脚本执行失败，退出码：${status}${plain}" >&2
+    fi
+    rm -f -- "${temporary}"
+    return "${status}"
 }
 
 uninstall_xrayr() {
@@ -224,7 +245,7 @@ XrayR 管理命令：
   XrayR update [1.0.x]
   XrayR start|stop|restart|status|log
   XrayR enable|disable
-  XrayR config|version|update_shell|uninstall
+  XrayR config|version|bbr|update_shell|uninstall
 USAGE
 }
 
@@ -287,6 +308,7 @@ case "${1:-}" in
     log) show_log ;;
     config) edit_config ;;
     version) show_version ;;
+    bbr) install_bbr ;;
     update_shell) update_shell ;;
     uninstall) check_install; uninstall_xrayr ;;
     help|-h|--help) show_usage ;;

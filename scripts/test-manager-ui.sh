@@ -8,6 +8,8 @@ trap 'rm -rf "${test_root}"' EXIT
 
 mock_systemctl="${test_root}/systemctl"
 systemctl_log="${test_root}/systemctl.log"
+mock_bbr_script="${test_root}/bbr.sh"
+bbr_marker="${test_root}/bbr.executed"
 cat > "${mock_systemctl}" <<'MOCK'
 #!/usr/bin/env bash
 set -u
@@ -23,12 +25,21 @@ esac
 MOCK
 chmod +x "${mock_systemctl}"
 
+cat > "${mock_bbr_script}" <<'MOCK'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf 'executed\n' > "${OLDXR_BBR_TEST_MARKER}"
+MOCK
+chmod +x "${mock_bbr_script}"
+
 run_menu() {
     local selection="$1"
     printf '%s\n' "${selection}" | env \
         OLDXR_INSTALL_ROOT="${test_root}/root" \
         OLDXR_SYSTEMCTL_BIN="${mock_systemctl}" \
         OLDXR_SYSTEMCTL_LOG="${systemctl_log}" \
+        OLDXR_BBR_SCRIPT_URL="file://${mock_bbr_script}" \
+        OLDXR_BBR_TEST_MARKER="${bbr_marker}" \
         bash "${repo_root}/XrayR.sh" 2>&1
 }
 
@@ -93,7 +104,8 @@ run_menu 4 >/dev/null
 grep -Fx 'start XrayR' "${systemctl_log}" >/dev/null
 
 bbr_output="$(run_menu 11)"
-grep -F '不会自动运行已归档的第三方内核脚本' <<<"${bbr_output}" >/dev/null
+grep -F '即将运行原版菜单使用的第三方内核/BBR脚本' <<<"${bbr_output}" >/dev/null
+grep -Fx 'executed' "${bbr_marker}" >/dev/null
 
-grep -F 'version="v1.0.1"' "${repo_root}/XrayR.sh" >/dev/null
-echo "PASS：v1.0.1 管理脚本采用原版 v0.9.0 菜单布局，状态展示与菜单路由通过。"
+grep -F 'version="v1.0.2"' "${repo_root}/XrayR.sh" >/dev/null
+echo "PASS：v1.0.2 管理脚本采用原版 v0.9.0 菜单布局，状态展示与第三方内核脚本菜单路由通过。"
