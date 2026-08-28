@@ -59,6 +59,11 @@
 
 ## Git、报告与交流
 
+- oldxr 唯一允许使用的 GitHub 仓库是 `https://github.com/statusX7/oldxr`。
+- 禁止新建、上传、迁移或保留任何其他名称中包含 `oldxr` 的 GitHub 仓库，包括 `oldxr-gnet`、`oldxr-xray-core`、`oldxr-giouring` 等独立依赖仓库。
+- oldxr 的正式源码、必要维护依赖、版本更新、tag 和 Release 必须统一进入 `statusX7/oldxr`；需要维护的 fork 源码应放入本仓库受控目录，不得另建远程仓库。
+- 删除旧 GitHub 仓库不授权删除任何对应本地源码、配置、构建产物、实验结果或 Git mirror；本地证据必须完整保留。
+- 任何与 oldxr 无关的 GitHub 仓库均不在操作范围内，禁止修改、删除、重命名或迁移。
 - 不force push，不重写/删除历史tag；实验只在独立branch，Gate通过前不merge main/master。
 - Git commit message保持英文，每个commit只解决一个逻辑问题。
 - 性能、pprof、perf、内部研究、审计和升级报告只写入`/root/projects/oldxr-reports/go-v1/`，不得提交GitHub。
