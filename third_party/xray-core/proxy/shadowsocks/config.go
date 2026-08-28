@@ -238,6 +238,49 @@ func passwordToCipherKey(password []byte, keySize int32) []byte {
 }
 
 func hkdfSHA1(secret, salt, outKey []byte) {
+	if len(secret) == 16 && len(salt) == 16 && len(outKey) == 16 {
+		hkdfSHA1AES128((*[16]byte)(secret), (*[16]byte)(salt), (*[16]byte)(outKey))
+		return
+	}
+
 	r := hkdf.New(sha1.New, secret, salt, []byte("ss-subkey"))
 	common.Must2(io.ReadFull(r, outKey))
+}
+
+// hkdfSHA1AES128 computes the single HKDF-SHA1 output block used by
+// Shadowsocks AES-128-GCM without constructing hash.Hash and HMAC objects.
+// The random salt remains the HKDF-Extract HMAC key; no per-connection key
+// material is cached or reused.
+func hkdfSHA1AES128(secret, salt, outKey *[16]byte) {
+	var extractInner [sha1.BlockSize + 16]byte
+	var extractOuter [sha1.BlockSize + sha1.Size]byte
+	for i := 0; i < sha1.BlockSize; i++ {
+		extractInner[i] = 0x36
+		extractOuter[i] = 0x5c
+	}
+	for i := range salt {
+		extractInner[i] ^= salt[i]
+		extractOuter[i] ^= salt[i]
+	}
+	copy(extractInner[sha1.BlockSize:], secret[:])
+	extractedInner := sha1.Sum(extractInner[:])
+	copy(extractOuter[sha1.BlockSize:], extractedInner[:])
+	prk := sha1.Sum(extractOuter[:])
+
+	var expandInner [sha1.BlockSize + len("ss-subkey") + 1]byte
+	var expandOuter [sha1.BlockSize + sha1.Size]byte
+	for i := 0; i < sha1.BlockSize; i++ {
+		expandInner[i] = 0x36
+		expandOuter[i] = 0x5c
+	}
+	for i := range prk {
+		expandInner[i] ^= prk[i]
+		expandOuter[i] ^= prk[i]
+	}
+	copy(expandInner[sha1.BlockSize:], "ss-subkey")
+	expandInner[len(expandInner)-1] = 1
+	expandedInner := sha1.Sum(expandInner[:])
+	copy(expandOuter[sha1.BlockSize:], expandedInner[:])
+	expanded := sha1.Sum(expandOuter[:])
+	copy(outKey[:], expanded[:len(outKey)])
 }
