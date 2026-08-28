@@ -13,6 +13,8 @@ const (
 	defaultSourceCacheMaxSources          = 4096
 	defaultSourceCacheCandidatesPerSource = 8
 	defaultSourceCacheTTL                 = 10 * time.Minute
+	defaultSourceCacheMissBurst           = 16
+	defaultSourceCacheBypassCooldown      = 30 * time.Second
 	sourceCacheWays                       = 4
 	maxSourceCandidates                   = 8
 )
@@ -46,6 +48,7 @@ type sourceCandidateSet struct {
 	users        [maxSourceCandidates]*protocol.MemoryUser
 	count        int
 	blockedUntil int64
+	bypassUntil  int64
 }
 
 type sourceCandidateEntry struct {
@@ -53,8 +56,10 @@ type sourceCandidateEntry struct {
 	users        [maxSourceCandidates]*protocol.MemoryUser
 	lastSeen     int64
 	blockedUntil int64
+	bypassUntil  int64
 	count        uint8
 	failures     uint8
+	misses       uint8
 	occupied     bool
 }
 
@@ -115,8 +120,12 @@ func (c *sourceCandidateCache) lookup(key authSourceKey, now int64) sourceCandid
 			continue
 		}
 		var candidates sourceCandidateSet
-		candidates.count = int(entry.count)
 		candidates.blockedUntil = entry.blockedUntil
+		candidates.bypassUntil = entry.bypassUntil
+		if now < entry.bypassUntil {
+			return candidates
+		}
+		candidates.count = int(entry.count)
 		copy(candidates.users[:candidates.count], entry.users[:candidates.count])
 		return candidates
 	}
@@ -152,15 +161,7 @@ func (c *sourceCandidateCache) findOrReplaceEntryLocked(bucket *sourceCandidateB
 	return entry
 }
 
-func (c *sourceCandidateCache) recordSuccess(key authSourceKey, user *protocol.MemoryUser, now int64) {
-	if c == nil || user == nil {
-		return
-	}
-	bucket := c.bucketFor(key)
-	bucket.Lock()
-	defer bucket.Unlock()
-	entry := c.findOrReplaceEntryLocked(bucket, key, now)
-
+func (c *sourceCandidateCache) promoteUserLocked(entry *sourceCandidateEntry, user *protocol.MemoryUser) {
 	userIndex := -1
 	for index := 0; index < int(entry.count); index++ {
 		if entry.users[index] == user {
@@ -182,6 +183,59 @@ func (c *sourceCandidateCache) recordSuccess(key authSourceKey, user *protocol.M
 	}
 	copy(entry.users[1:int(entry.count)], entry.users[:int(entry.count)-1])
 	entry.users[0] = user
+}
+
+func (c *sourceCandidateCache) recordSuccess(key authSourceKey, user *protocol.MemoryUser, now int64) {
+	if c == nil || user == nil {
+		return
+	}
+	bucket := c.bucketFor(key)
+	bucket.Lock()
+	defer bucket.Unlock()
+	entry := c.findOrReplaceEntryLocked(bucket, key, now)
+	if now < entry.bypassUntil {
+		return
+	}
+	if entry.misses > 0 {
+		entry.misses--
+	}
+	c.promoteUserLocked(entry, user)
+}
+
+// recordMissSuccess learns a fully authenticated user after the source hint
+// missed. A high-fanout NAT that repeatedly overflows the small candidate set
+// is temporarily bypassed so it cannot add several doomed cryptographic
+// attempts to every connection. The immutable global/cold fallback remains
+// complete and unchanged.
+func (c *sourceCandidateCache) recordMissSuccess(key authSourceKey, user *protocol.MemoryUser, now int64) {
+	if c == nil || user == nil {
+		return
+	}
+	bucket := c.bucketFor(key)
+	bucket.Lock()
+	defer bucket.Unlock()
+	entry := c.findOrReplaceEntryLocked(bucket, key, now)
+	if now < entry.bypassUntil {
+		return
+	}
+	if entry.bypassUntil != 0 {
+		entry.bypassUntil = 0
+		entry.misses = 0
+	}
+	if int(entry.count) >= c.candidatesPerSource {
+		if entry.misses < defaultSourceCacheMissBurst {
+			entry.misses++
+		}
+		if entry.misses >= defaultSourceCacheMissBurst {
+			for index := range entry.users {
+				entry.users[index] = nil
+			}
+			entry.count = 0
+			entry.bypassUntil = now + int64(defaultSourceCacheBypassCooldown)
+			return
+		}
+	}
+	c.promoteUserLocked(entry, user)
 }
 
 func (c *sourceCandidateCache) recordFailure(key authSourceKey, now int64, burst uint8, cooldown time.Duration) {

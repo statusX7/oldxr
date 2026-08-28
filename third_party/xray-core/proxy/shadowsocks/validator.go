@@ -519,7 +519,13 @@ func (v *Validator) get(bs []byte, command protocol.RequestCommand, sourceKey au
 			v.recordHotSuccess(snapshot.counters[u])
 			if hasSource && cache != nil {
 				eventNow := time.Now().UnixNano()
-				cache.recordSuccess(sourceKey, u, eventNow)
+				if candidates.bypassUntil <= eventNow {
+					if layer == authMatchSource {
+						cache.recordSuccess(sourceKey, u, eventNow)
+					} else {
+						cache.recordMissSuccess(sourceKey, u, eventNow)
+					}
+				}
 				if layer == authMatchCold {
 					cache.clearFailures(sourceKey, eventNow)
 				}

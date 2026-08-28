@@ -167,6 +167,37 @@ func TestSourceCandidateCacheTTLAddressFamilyAndCapacity(t *testing.T) {
 	}
 }
 
+func TestSourceCandidateCacheBypassesHighFanoutWithoutDisablingSmallNAT(t *testing.T) {
+	cache := newSourceCandidateCache(64, 8, time.Minute)
+	key, ok := authSourceKeyFromAddress(sourceCacheTestAddress(t, "198.51.100.90"))
+	if !ok {
+		t.Fatal("source key was not created")
+	}
+	now := time.Now().UnixNano()
+	users := make([]*protocol.MemoryUser, 32)
+	for index := range users {
+		users[index] = &protocol.MemoryUser{Email: fmt.Sprintf("high-fanout-%d@example.invalid", index)}
+		cache.recordMissSuccess(key, users[index], now+int64(index))
+	}
+
+	bypassed := cache.lookup(key, now+int64(len(users)))
+	if bypassed.count != 0 || bypassed.bypassUntil <= now {
+		t.Fatalf("high-fanout source was not bypassed: count=%d bypassUntil=%d", bypassed.count, bypassed.bypassUntil)
+	}
+
+	smallKey, _ := authSourceKeyFromAddress(sourceCacheTestAddress(t, "198.51.100.91"))
+	for index := 0; index < 8; index++ {
+		cache.recordMissSuccess(smallKey, users[index], now+int64(index))
+	}
+	for iteration := 0; iteration < 64; iteration++ {
+		cache.recordSuccess(smallKey, users[iteration%8], now+100+int64(iteration))
+	}
+	small := cache.lookup(smallKey, now+1000)
+	if small.count != 8 || small.bypassUntil > now+1000 {
+		t.Fatalf("small NAT was incorrectly bypassed: count=%d bypassUntil=%d", small.count, small.bypassUntil)
+	}
+}
+
 func TestSourceCandidatesTCPAndUDPEntryPoints(t *testing.T) {
 	validator, users := benchmarkSSUsersWithHotCapacity(t, 300, 128)
 	source := sourceCacheTestAddress(t, "198.51.100.88")
