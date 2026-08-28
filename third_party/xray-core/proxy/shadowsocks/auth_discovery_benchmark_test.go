@@ -16,8 +16,12 @@ var (
 )
 
 func benchmarkSSUsers(tb testing.TB, count int) (*Validator, []*protocol.MemoryUser) {
+	return benchmarkSSUsersWithHotCapacity(tb, count, 0)
+}
+
+func benchmarkSSUsersWithHotCapacity(tb testing.TB, count, hotCapacity int) (*Validator, []*protocol.MemoryUser) {
 	tb.Helper()
-	validator := new(Validator)
+	validator := &Validator{hotCapacity: hotCapacity}
 	users := make([]*protocol.MemoryUser, count)
 	for i := range users {
 		account, err := (&Account{
@@ -31,10 +35,10 @@ func benchmarkSSUsers(tb testing.TB, count int) (*Validator, []*protocol.MemoryU
 			Email:   fmt.Sprintf("auth-benchmark-%d@example.invalid", i),
 			Account: account,
 		}
-		if err := validator.Add(user); err != nil {
-			tb.Fatalf("add user %d: %v", i, err)
-		}
 		users[i] = user
+	}
+	if err := validator.addUsers(users); err != nil {
+		tb.Fatalf("add users: %v", err)
 	}
 	return validator, users
 }

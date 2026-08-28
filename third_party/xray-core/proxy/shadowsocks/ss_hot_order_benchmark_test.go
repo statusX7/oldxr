@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"testing"
+	"time"
 
 	"github.com/xtls/xray-core/common/protocol"
 )
@@ -41,11 +42,15 @@ func benchmarkSSDeterministicTCPAuthWire(tb testing.TB, user *protocol.MemoryUse
 }
 
 func benchmarkSSAirportRequests(tb testing.TB, userCount int) (*Validator, []benchmarkSSAirportRequest) {
+	return benchmarkSSAirportRequestsWithHotCapacity(tb, userCount, 0)
+}
+
+func benchmarkSSAirportRequestsWithHotCapacity(tb testing.TB, userCount, hotCapacity int) (*Validator, []benchmarkSSAirportRequest) {
 	tb.Helper()
 	if userCount < benchmarkSSAirportActiveUsers {
 		tb.Fatalf("user count %d is smaller than active population", userCount)
 	}
-	validator, users := benchmarkSSUsers(tb, userCount)
+	validator, users := benchmarkSSUsersWithHotCapacity(tb, userCount, hotCapacity)
 	rng := rand.New(rand.NewSource(benchmarkSSAirportSeed + int64(userCount)))
 	activeIndexes := rng.Perm(userCount)[:benchmarkSSAirportActiveUsers]
 
@@ -104,8 +109,38 @@ func benchmarkSSAirportRequests(tb testing.TB, userCount int) (*Validator, []ben
 	return validator, requests
 }
 
-func benchmarkSSRealAirportCold(b *testing.B, userCount int) {
-	validator, requests := benchmarkSSAirportRequests(b, userCount)
+func benchmarkSSWarmAirportSnapshot(tb testing.TB, validator *Validator, requests []benchmarkSSAirportRequest) {
+	tb.Helper()
+	snapshot := validator.authSnapshot.Load()
+	if snapshot == nil {
+		tb.Fatal("hot snapshot is disabled")
+	}
+	for _, request := range requests {
+		if request.want == nil {
+			continue
+		}
+		counter := snapshot.counters[request.want]
+		if counter == nil {
+			tb.Fatalf("missing hot counter for %s", request.want.Email)
+		}
+		counter.successes.Add(1)
+	}
+	validator.rebuildHotSnapshot(time.Now())
+	snapshot = validator.authSnapshot.Load()
+	rank := make(map[*protocol.MemoryUser]int, len(snapshot.ordered))
+	for index, user := range snapshot.ordered {
+		rank[user] = index + 1
+	}
+	for index := range requests {
+		if requests[index].want == nil {
+			requests[index].attempts = len(snapshot.ordered)
+		} else {
+			requests[index].attempts = rank[requests[index].want]
+		}
+	}
+}
+
+func benchmarkSSAirportRequestStream(b *testing.B, validator *Validator, requests []benchmarkSSAirportRequest) {
 	totalAttempts := 0
 	for _, request := range requests {
 		totalAttempts += request.attempts
@@ -129,10 +164,47 @@ func benchmarkSSRealAirportCold(b *testing.B, userCount int) {
 	b.ReportMetric(5, "invalid_pct")
 }
 
+func benchmarkSSRealAirportCold(b *testing.B, userCount int) {
+	validator, requests := benchmarkSSAirportRequests(b, userCount)
+	benchmarkSSAirportRequestStream(b, validator, requests)
+}
+
 func BenchmarkSSRealAirportCold(b *testing.B) {
 	for _, userCount := range []int{1000, 5000, 10000} {
 		b.Run(fmt.Sprintf("users_%05d", userCount), func(b *testing.B) {
 			benchmarkSSRealAirportCold(b, userCount)
+		})
+	}
+}
+
+func BenchmarkSSRealAirportWarm(b *testing.B) {
+	for _, hotCapacity := range []int{32, 64, 128} {
+		for _, userCount := range []int{1000, 5000, 10000} {
+			b.Run(fmt.Sprintf("hot_%03d/users_%05d", hotCapacity, userCount), func(b *testing.B) {
+				validator, requests := benchmarkSSAirportRequestsWithHotCapacity(b, userCount, hotCapacity)
+				benchmarkSSWarmAirportSnapshot(b, validator, requests)
+				benchmarkSSAirportRequestStream(b, validator, requests)
+			})
+		}
+	}
+}
+
+func BenchmarkSSHotSnapshotRebuild(b *testing.B) {
+	for _, hotCapacity := range []int{32, 64, 128} {
+		b.Run(fmt.Sprintf("hot_%03d/users_10000", hotCapacity), func(b *testing.B) {
+			validator, requests := benchmarkSSAirportRequestsWithHotCapacity(b, 10000, hotCapacity)
+			snapshot := validator.authSnapshot.Load()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				for _, request := range requests {
+					if request.want != nil {
+						snapshot.counters[request.want].successes.Add(1)
+					}
+				}
+				validator.rebuildHotSnapshot(time.Now())
+				snapshot = validator.authSnapshot.Load()
+			}
 		})
 	}
 }
