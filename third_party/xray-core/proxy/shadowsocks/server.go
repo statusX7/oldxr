@@ -30,6 +30,26 @@ type Server struct {
 	cone          bool
 }
 
+func authenticationSourceAddress(inbound *session.Inbound, remote stdnet.Addr) net.Address {
+	if inbound != nil && inbound.Source.Address != nil && inbound.Source.Address.Family().IsIP() {
+		return inbound.Source.Address
+	}
+	switch address := remote.(type) {
+	case *stdnet.TCPAddr:
+		if len(address.IP) == 0 {
+			return nil
+		}
+		return net.IPAddress(address.IP)
+	case *stdnet.UDPAddr:
+		if len(address.IP) == 0 {
+			return nil
+		}
+		return net.IPAddress(address.IP)
+	default:
+		return nil
+	}
+}
+
 // NewServer create a new Shadowsocks server.
 func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	validator := new(Validator)
@@ -119,6 +139,7 @@ func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dis
 	}
 
 	var dest *net.Destination
+	sourceAddress := authenticationSourceAddress(inbound, conn.RemoteAddr())
 
 	reader := buf.NewPacketReader(conn)
 	for {
@@ -137,7 +158,7 @@ func (s *Server) handleUDPPayload(ctx context.Context, conn stat.Connection, dis
 				validator.Add(inbound.User)
 				request, data, err = DecodeUDPPacket(validator, payload)
 			} else {
-				request, data, err = DecodeUDPPacket(s.validator, payload)
+				request, data, err = decodeUDPPacketWithSource(s.validator, payload, sourceAddress)
 				if err == nil {
 					inbound.User = request.User
 				}
@@ -191,6 +212,12 @@ func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dis
 		return newError("unable to set read deadline").Base(err).AtWarning()
 	}
 
+	inbound := session.InboundFromContext(ctx)
+	if inbound == nil {
+		panic("no inbound metadata")
+	}
+	sourceAddress := authenticationSourceAddress(inbound, conn.RemoteAddr())
+
 	var (
 		request            *protocol.RequestHeader
 		bodyReader         buf.Reader
@@ -202,12 +229,12 @@ func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dis
 	)
 	ownerInbound, ownerInboundReads, ownerInboundWrites, ownerCandidate := s.ownerEligible(conn, dispatcher)
 	if ownerCandidate {
-		request, ownerReader, err = readOwnerTCPSession(s.validator, conn)
+		request, ownerReader, err = readOwnerTCPSession(s.validator, conn, sourceAddress)
 		bodyReader = ownerReader
 		ownerSSAttempts.Add(1)
 	} else {
 		bufferedReader := buf.BufferedReader{Reader: buf.NewReader(conn)}
-		request, bodyReader, err = ReadTCPSession(s.validator, &bufferedReader)
+		request, bodyReader, err = readTCPSessionWithSource(s.validator, &bufferedReader, sourceAddress)
 	}
 	if err != nil {
 		log.Record(&log.AccessMessage{
@@ -220,10 +247,6 @@ func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dis
 	}
 	conn.SetReadDeadline(time.Time{})
 
-	inbound := session.InboundFromContext(ctx)
-	if inbound == nil {
-		panic("no inbound metadata")
-	}
 	inbound.User = request.User
 
 	dest := request.Destination()

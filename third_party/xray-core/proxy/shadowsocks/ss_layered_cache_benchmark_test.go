@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	xraynet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 )
 
@@ -31,10 +32,13 @@ const (
 type benchmarkSSLayeredSource [16]byte
 
 type benchmarkSSLayeredRequest struct {
-	source   benchmarkSSLayeredSource
-	wire     []byte
-	want     *protocol.MemoryUser
-	attempts int
+	source       benchmarkSSLayeredSource
+	wire         []byte
+	want         *protocol.MemoryUser
+	attempts     int
+	sourceHit    bool
+	globalHit    bool
+	coldFallback bool
 }
 
 func benchmarkSSLayeredSourceID(id uint32) benchmarkSSLayeredSource {
@@ -54,6 +58,10 @@ func benchmarkSSLayeredBaseSource(activeIndex int) benchmarkSSLayeredSource {
 	default:
 		return benchmarkSSLayeredSourceID(uint32(661 + (activeIndex-900)/50))
 	}
+}
+
+func benchmarkSSLayeredSourceAddress(source benchmarkSSLayeredSource) xraynet.Address {
+	return xraynet.IPAddress(source[:])
 }
 
 func benchmarkSSLayeredModelName(model benchmarkSSLayeredModel) string {
@@ -204,6 +212,64 @@ func benchmarkSSWarmLayeredGlobal(tb testing.TB, validator *Validator, requests 
 	}
 }
 
+func benchmarkSSWarmLayeredCandidate(tb testing.TB, validator *Validator, requests []benchmarkSSLayeredRequest, candidatesPerSource int) {
+	tb.Helper()
+	benchmarkSSWarmLayeredGlobal(tb, validator, requests)
+	cache := newSourceCandidateCache(defaultSourceCacheMaxSources, candidatesPerSource, defaultSourceCacheTTL)
+	validator.sourceCache.Store(cache)
+	now := time.Unix(1700000000, 0).UnixNano()
+	for _, request := range requests {
+		if request.want == nil {
+			continue
+		}
+		key, _ := authSourceKeyFromAddress(benchmarkSSLayeredSourceAddress(request.source))
+		cache.recordSuccess(key, request.want, now)
+	}
+
+	snapshot := validator.authSnapshot.Load()
+	for index := range requests {
+		request := &requests[index]
+		key, _ := authSourceKeyFromAddress(benchmarkSSLayeredSourceAddress(request.source))
+		candidates := cache.lookup(key, now)
+		if request.want == nil {
+			request.attempts = len(snapshot.ordered)
+			request.coldFallback = true
+			continue
+		}
+
+		targetRank := snapshot.ranks[request.want]
+		sourceRank := 0
+		skippedBeforeTarget := 0
+		validSourceCandidates := 0
+		for candidateIndex := 0; candidateIndex < candidates.count; candidateIndex++ {
+			rank, present := snapshot.ranks[candidates.users[candidateIndex]]
+			if !present {
+				continue
+			}
+			validSourceCandidates++
+			if candidates.users[candidateIndex] == request.want {
+				sourceRank = validSourceCandidates
+				break
+			}
+			if rank < targetRank {
+				skippedBeforeTarget++
+			}
+		}
+		if sourceRank > 0 {
+			request.attempts = sourceRank
+			request.sourceHit = true
+		} else {
+			request.attempts = validSourceCandidates + int(targetRank) - skippedBeforeTarget
+			if int(targetRank) <= snapshot.hotCount {
+				request.globalHit = true
+			} else {
+				request.coldFallback = true
+			}
+		}
+		cache.recordSuccess(key, request.want, now)
+	}
+}
+
 func benchmarkSSLayeredParentStream(b *testing.B, validator *Validator, requests []benchmarkSSLayeredRequest) {
 	totalAttempts := 0
 	valid := 0
@@ -232,6 +298,48 @@ func benchmarkSSLayeredParentStream(b *testing.B, validator *Validator, requests
 	b.ReportMetric(float64(valid)*100/float64(len(requests)), "valid_pct")
 }
 
+func benchmarkSSLayeredCandidateStream(b *testing.B, validator *Validator, requests []benchmarkSSLayeredRequest) {
+	totalAttempts := 0
+	valid := 0
+	sourceHits := 0
+	globalHits := 0
+	coldFallbacks := 0
+	for _, request := range requests {
+		totalAttempts += request.attempts
+		if request.want != nil {
+			valid++
+		}
+		if request.sourceHit {
+			sourceHits++
+		}
+		if request.globalHit {
+			globalHits++
+		}
+		if request.coldFallback {
+			coldFallbacks++
+		}
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		request := &requests[i%len(requests)]
+		user, _, _, _, err := validator.GetWithSource(request.wire, protocol.RequestCommandTCP, benchmarkSSLayeredSourceAddress(request.source))
+		if request.want == nil {
+			if err != ErrNotFound || user != nil {
+				b.Fatalf("invalid request unexpectedly matched: user=%v err=%v", user, err)
+			}
+		} else if err != nil || user != request.want {
+			b.Fatalf("valid request mismatch: got=%v want=%v err=%v", user, request.want, err)
+		}
+		benchmarkSSUser = user
+		benchmarkSSErr = err
+	}
+	b.ReportMetric(float64(totalAttempts)/float64(len(requests)), "attempts/op")
+	b.ReportMetric(float64(sourceHits)*100/float64(valid), "source_hit_pct")
+	b.ReportMetric(float64(globalHits)*100/float64(valid), "global_hit_pct")
+	b.ReportMetric(float64(coldFallbacks)*100/float64(len(requests)), "cold_pct")
+}
+
 func BenchmarkSSLayeredAuthParent(b *testing.B) {
 	models := []benchmarkSSLayeredModel{
 		benchmarkSSLayeredBalanced,
@@ -247,6 +355,29 @@ func BenchmarkSSLayeredAuthParent(b *testing.B) {
 			benchmarkSSWarmLayeredGlobal(b, validator, requests)
 			benchmarkSSLayeredParentStream(b, validator, requests)
 		})
+	}
+}
+
+func BenchmarkSSLayeredAuthCandidate(b *testing.B) {
+	models := []benchmarkSSLayeredModel{
+		benchmarkSSLayeredBalanced,
+		benchmarkSSLayeredRealistic,
+		benchmarkSSLayeredInvalidHeavy,
+		benchmarkSSLayeredAttackSingle,
+		benchmarkSSLayeredAttackRotating,
+	}
+	for _, candidatesPerSource := range []int{4, 8} {
+		for _, hotCapacity := range []int{1024, 2048} {
+			for _, model := range models {
+				model := model
+				name := fmt.Sprintf("source_%d/hot_%04d/%s", candidatesPerSource, hotCapacity, benchmarkSSLayeredModelName(model))
+				b.Run(name, func(b *testing.B) {
+					validator, requests := benchmarkSSLayeredRequestsForModel(b, model, hotCapacity)
+					benchmarkSSWarmLayeredCandidate(b, validator, requests, candidatesPerSource)
+					benchmarkSSLayeredCandidateStream(b, validator, requests)
+				})
+			}
+		}
 	}
 }
 

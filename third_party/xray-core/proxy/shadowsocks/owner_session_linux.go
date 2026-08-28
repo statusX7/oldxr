@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common/buf"
+	xraynet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/routing"
@@ -163,12 +164,12 @@ func (r *ownerTCPReader) TakeBuffered() buf.MultiBuffer {
 	return buf.MultiBuffer{buf.FromBytes(pending)}
 }
 
-func readOwnerTCPSession(validator *Validator, reader io.Reader) (*protocol.RequestHeader, *ownerTCPReader, error) {
+func readOwnerTCPSession(validator *Validator, reader io.Reader, source xraynet.Address) (*protocol.RequestHeader, *ownerTCPReader, error) {
 	first := make([]byte, 50)
 	if _, err := io.ReadFull(reader, first); err != nil {
 		return nil, nil, err
 	}
-	user, aead, length, ivLength, err := validator.Get(first, protocol.RequestCommandTCP)
+	user, aead, length, ivLength, err := validator.GetWithSource(first, protocol.RequestCommandTCP, source)
 	if err != nil {
 		return nil, nil, err
 	}

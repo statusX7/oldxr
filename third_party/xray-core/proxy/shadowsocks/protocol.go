@@ -53,6 +53,10 @@ func (r *FullReader) Read(p []byte) (n int, err error) {
 
 // ReadTCPSession reads a Shadowsocks TCP session from the given reader, returns its header and remaining parts.
 func ReadTCPSession(validator *Validator, reader io.Reader) (*protocol.RequestHeader, buf.Reader, error) {
+	return readTCPSessionWithSource(validator, reader, nil)
+}
+
+func readTCPSessionWithSource(validator *Validator, reader io.Reader, source net.Address) (*protocol.RequestHeader, buf.Reader, error) {
 	behaviorSeed := validator.GetBehaviorSeed()
 	drainer, errDrain := drain.NewBehaviorSeedLimitedDrainer(int64(behaviorSeed), 16+38, 3266, 64)
 
@@ -70,7 +74,7 @@ func ReadTCPSession(validator *Validator, reader io.Reader) (*protocol.RequestHe
 	}
 
 	bs := buffer.Bytes()
-	user, aead, _, ivLen, err := validator.Get(bs, protocol.RequestCommandTCP)
+	user, aead, _, ivLen, err := validator.GetWithSource(bs, protocol.RequestCommandTCP, source)
 
 	switch err {
 	case ErrNotFound:
@@ -236,12 +240,16 @@ func EncodeUDPPacket(request *protocol.RequestHeader, payload []byte) (*buf.Buff
 }
 
 func DecodeUDPPacket(validator *Validator, payload *buf.Buffer) (*protocol.RequestHeader, *buf.Buffer, error) {
+	return decodeUDPPacketWithSource(validator, payload, nil)
+}
+
+func decodeUDPPacketWithSource(validator *Validator, payload *buf.Buffer, source net.Address) (*protocol.RequestHeader, *buf.Buffer, error) {
 	bs := payload.Bytes()
 	if len(bs) <= 32 {
 		return nil, nil, newError("len(bs) <= 32")
 	}
 
-	user, _, d, _, err := validator.Get(bs, protocol.RequestCommandUDP)
+	user, _, d, _, err := validator.GetWithSource(bs, protocol.RequestCommandUDP, source)
 	switch err {
 	case ErrIVNotUnique:
 		return nil, nil, newError("failed iv check").Base(err)

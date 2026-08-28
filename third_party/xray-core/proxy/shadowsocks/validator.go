@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/xtls/xray-core/common/dice"
+	xraynet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 )
 
@@ -29,6 +30,7 @@ type hotUserCounter struct {
 type authSnapshot struct {
 	ordered  []*protocol.MemoryUser
 	counters map[*protocol.MemoryUser]*hotUserCounter
+	ranks    map[*protocol.MemoryUser]uint32
 	hotCount int
 }
 
@@ -45,9 +47,53 @@ type Validator struct {
 	hotSuccessEvents   atomic.Uint64
 	hotNextRebuild     atomic.Int64
 	hotRebuildPending  atomic.Bool
+	sourceCache        atomic.Pointer[sourceCandidateCache]
+	sourceMaxSources   int
+	sourceCandidates   int
+	sourceTTL          time.Duration
 
 	behaviorSeed  uint64
 	behaviorFused bool
+}
+
+func newAuthSnapshot(ordered []*protocol.MemoryUser, counters map[*protocol.MemoryUser]*hotUserCounter, hotCount int) *authSnapshot {
+	ranks := make(map[*protocol.MemoryUser]uint32, len(ordered))
+	for index, user := range ordered {
+		ranks[user] = uint32(index + 1)
+	}
+	return &authSnapshot{
+		ordered:  ordered,
+		counters: counters,
+		ranks:    ranks,
+		hotCount: hotCount,
+	}
+}
+
+func (v *Validator) effectiveSourceMaxSources() int {
+	if v.sourceMaxSources < 0 {
+		return 0
+	}
+	if v.sourceMaxSources > 0 {
+		return v.sourceMaxSources
+	}
+	return defaultSourceCacheMaxSources
+}
+
+func (v *Validator) effectiveSourceCandidates() int {
+	if v.sourceCandidates < 0 {
+		return 0
+	}
+	if v.sourceCandidates > 0 {
+		return v.sourceCandidates
+	}
+	return defaultSourceCacheCandidatesPerSource
+}
+
+func (v *Validator) effectiveSourceTTL() time.Duration {
+	if v.sourceTTL > 0 {
+		return v.sourceTTL
+	}
+	return defaultSourceCacheTTL
 }
 
 var ErrNotFound = newError("Not Found")
@@ -99,6 +145,7 @@ func (v *Validator) publishUsersLocked() {
 	if len(v.users) < hotUserMinimumPopulation || v.effectiveHotCapacity() == 0 {
 		v.hotCounters = nil
 		v.authSnapshot.Store(nil)
+		v.sourceCache.Store(nil)
 		return
 	}
 
@@ -146,11 +193,10 @@ func (v *Validator) publishUsersLocked() {
 		}
 		ordered = append(ordered, user)
 	}
-	v.authSnapshot.Store(&authSnapshot{
-		ordered:  ordered,
-		counters: immutableCounters,
-		hotCount: hotCount,
-	})
+	v.authSnapshot.Store(newAuthSnapshot(ordered, immutableCounters, hotCount))
+	if v.sourceCache.Load() == nil {
+		v.sourceCache.Store(newSourceCandidateCache(v.effectiveSourceMaxSources(), v.effectiveSourceCandidates(), v.effectiveSourceTTL()))
+	}
 	v.initializeHotRebuildDeadline()
 }
 
@@ -278,69 +324,143 @@ func (v *Validator) rebuildHotSnapshot(now time.Time) {
 			ordered = append(ordered, user)
 		}
 	}
-	v.authSnapshot.Store(&authSnapshot{
-		ordered:  ordered,
-		counters: current.counters,
-		hotCount: len(scored),
-	})
+	v.authSnapshot.Store(newAuthSnapshot(ordered, current.counters, len(scored)))
+}
+
+type shadowsocksUserMatcher struct {
+	bs      []byte
+	command protocol.RequestCommand
+	subkey  []byte
+	data    []byte
+}
+
+func (m *shadowsocksUserMatcher) try(user *protocol.MemoryUser) (aead cipher.AEAD, ret []byte, ivLen int32, matched bool, err error) {
+	account := user.Account.(*MemoryAccount)
+	if !account.Cipher.IsAEAD() {
+		return nil, nil, account.Cipher.IVSize(), true, nil
+	}
+
+	aeadCipher := account.Cipher.(*AEADCipher)
+	ivLen = aeadCipher.IVSize()
+	iv := m.bs[:ivLen]
+	if int32(cap(m.subkey)) < aeadCipher.KeyBytes {
+		m.subkey = make([]byte, aeadCipher.KeyBytes)
+	} else {
+		m.subkey = m.subkey[:aeadCipher.KeyBytes]
+	}
+	hkdfSHA1(account.Key, iv, m.subkey)
+	aead = aeadCipher.AEADAuthCreator(m.subkey)
+
+	var matchErr error
+	switch m.command {
+	case protocol.RequestCommandTCP:
+		dataLen := 4 + aead.NonceSize()
+		if cap(m.data) < dataLen {
+			m.data = make([]byte, dataLen)
+		} else {
+			m.data = m.data[:dataLen]
+		}
+		ret, matchErr = aead.Open(m.data[:0], m.data[4:], m.bs[ivLen:ivLen+18], nil)
+	case protocol.RequestCommandUDP:
+		if cap(m.data) < 8192 {
+			m.data = make([]byte, 8192)
+		} else {
+			m.data = m.data[:8192]
+		}
+		ret, matchErr = aead.Open(m.data[:0], m.data[8192-aead.NonceSize():8192], m.bs[ivLen:], nil)
+	}
+	if matchErr != nil {
+		return nil, nil, 0, false, nil
+	}
+	return aead, ret, ivLen, true, account.CheckIV(iv)
 }
 
 func getShadowsocksUser(users []*protocol.MemoryUser, bs []byte, command protocol.RequestCommand) (u *protocol.MemoryUser, aead cipher.AEAD, ret []byte, ivLen int32, err error) {
-	var subkey []byte
-	var data []byte
+	matcher := shadowsocksUserMatcher{bs: bs, command: command}
 	for _, user := range users {
-		if account := user.Account.(*MemoryAccount); account.Cipher.IsAEAD() {
-			aeadCipher := account.Cipher.(*AEADCipher)
-			ivLen = aeadCipher.IVSize()
-			iv := bs[:ivLen]
-			if int32(cap(subkey)) < aeadCipher.KeyBytes {
-				subkey = make([]byte, aeadCipher.KeyBytes)
-			} else {
-				subkey = subkey[:aeadCipher.KeyBytes]
-			}
-			hkdfSHA1(account.Key, iv, subkey)
-			aead = aeadCipher.AEADAuthCreator(subkey)
+		candidateAEAD, candidateRet, candidateIVLen, matched, matchErr := matcher.try(user)
+		if matched {
+			return user, candidateAEAD, candidateRet, candidateIVLen, matchErr
+		}
+	}
+	return nil, nil, nil, 0, ErrNotFound
+}
 
-			var matchErr error
-			switch command {
-			case protocol.RequestCommandTCP:
-				dataLen := 4 + aead.NonceSize()
-				if cap(data) < dataLen {
-					data = make([]byte, dataLen)
-				} else {
-					data = data[:dataLen]
-				}
-				ret, matchErr = aead.Open(data[:0], data[4:], bs[ivLen:ivLen+18], nil)
-			case protocol.RequestCommandUDP:
-				if cap(data) < 8192 {
-					data = make([]byte, 8192)
-				} else {
-					data = data[:8192]
-				}
-				ret, matchErr = aead.Open(data[:0], data[8192-aead.NonceSize():8192], bs[ivLen:], nil)
+func getShadowsocksUserLayered(snapshot *authSnapshot, candidates sourceCandidateSet, bs []byte, command protocol.RequestCommand) (u *protocol.MemoryUser, aead cipher.AEAD, ret []byte, ivLen int32, err error) {
+	matcher := shadowsocksUserMatcher{bs: bs, command: command}
+	var attemptedRanks [maxSourceCandidates]uint32
+	attemptedCount := 0
+	for index := 0; index < candidates.count; index++ {
+		user := candidates.users[index]
+		rank, present := snapshot.ranks[user]
+		if !present {
+			continue
+		}
+		duplicate := false
+		for attemptedIndex := 0; attemptedIndex < attemptedCount; attemptedIndex++ {
+			if attemptedRanks[attemptedIndex] == rank {
+				duplicate = true
+				break
 			}
-
-			if matchErr == nil {
-				u = user
-				err = account.CheckIV(iv)
-				return
-			}
-		} else {
-			u = user
-			ivLen = user.Account.(*MemoryAccount).Cipher.IVSize()
-			return
+		}
+		if duplicate {
+			continue
+		}
+		attemptedRanks[attemptedCount] = rank
+		attemptedCount++
+		candidateAEAD, candidateRet, candidateIVLen, matched, matchErr := matcher.try(user)
+		if matched {
+			return user, candidateAEAD, candidateRet, candidateIVLen, matchErr
 		}
 	}
 
+	for index, user := range snapshot.ordered {
+		rank := uint32(index + 1)
+		skip := false
+		for attemptedIndex := 0; attemptedIndex < attemptedCount; attemptedIndex++ {
+			if attemptedRanks[attemptedIndex] == rank {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+		candidateAEAD, candidateRet, candidateIVLen, matched, matchErr := matcher.try(user)
+		if matched {
+			return user, candidateAEAD, candidateRet, candidateIVLen, matchErr
+		}
+	}
 	return nil, nil, nil, 0, ErrNotFound
 }
 
 // Get a Shadowsocks user.
 func (v *Validator) Get(bs []byte, command protocol.RequestCommand) (u *protocol.MemoryUser, aead cipher.AEAD, ret []byte, ivLen int32, err error) {
+	return v.get(bs, command, authSourceKey{}, false)
+}
+
+// GetWithSource uses a source address only as an ordered authentication hint.
+// A miss always falls back to the complete immutable user snapshot.
+func (v *Validator) GetWithSource(bs []byte, command protocol.RequestCommand, source xraynet.Address) (u *protocol.MemoryUser, aead cipher.AEAD, ret []byte, ivLen int32, err error) {
+	sourceKey, hasSource := authSourceKeyFromAddress(source)
+	return v.get(bs, command, sourceKey, hasSource)
+}
+
+func (v *Validator) get(bs []byte, command protocol.RequestCommand, sourceKey authSourceKey, hasSource bool) (u *protocol.MemoryUser, aead cipher.AEAD, ret []byte, ivLen int32, err error) {
 	if snapshot := v.authSnapshot.Load(); snapshot != nil {
-		u, aead, ret, ivLen, err = getShadowsocksUser(snapshot.ordered, bs, command)
+		cache := v.sourceCache.Load()
+		var candidates sourceCandidateSet
+		now := int64(0)
+		if hasSource && cache != nil {
+			now = time.Now().UnixNano()
+			candidates = cache.lookup(sourceKey, now)
+		}
+		u, aead, ret, ivLen, err = getShadowsocksUserLayered(snapshot, candidates, bs, command)
 		if err == nil && u != nil {
 			v.recordHotSuccess(snapshot.counters[u])
+			if hasSource && cache != nil {
+				cache.recordSuccess(sourceKey, u, now)
+			}
 		}
 		return
 	}
