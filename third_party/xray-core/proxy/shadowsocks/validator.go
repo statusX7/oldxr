@@ -17,8 +17,8 @@ import (
 )
 
 const (
-	defaultHotUserCapacity        = 128
-	defaultHotUserRebuildInterval = 30 * time.Second
+	defaultHotUserCapacity        = 1024
+	defaultHotUserRebuildInterval = 15 * time.Second
 	hotUserMinimumPopulation      = 256
 	hotUserClockSampleMask        = 63
 )

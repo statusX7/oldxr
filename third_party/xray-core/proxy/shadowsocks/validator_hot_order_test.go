@@ -249,3 +249,13 @@ func TestValidatorSmallPopulationKeepsLegacyPath(t *testing.T) {
 		t.Fatalf("small population unexpectedly enabled hot snapshot: users=%d", len(snapshot.ordered))
 	}
 }
+
+func TestValidatorActiveSnapshotDefaults(t *testing.T) {
+	validator := new(Validator)
+	if got := validator.effectiveHotCapacity(); got != 1024 {
+		t.Fatalf("default active-user capacity: got=%d want=1024", got)
+	}
+	if got := validator.effectiveHotRebuildInterval(); got != 15*time.Second {
+		t.Fatalf("default active-user rebuild interval: got=%s want=15s", got)
+	}
+}

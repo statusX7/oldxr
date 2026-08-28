@@ -190,7 +190,7 @@ func BenchmarkSSRealAirportWarm(b *testing.B) {
 }
 
 func BenchmarkSSHotSnapshotRebuild(b *testing.B) {
-	for _, hotCapacity := range []int{32, 64, 128} {
+	for _, hotCapacity := range []int{32, 64, 128, 1024, 2048} {
 		b.Run(fmt.Sprintf("hot_%03d/users_10000", hotCapacity), func(b *testing.B) {
 			validator, requests := benchmarkSSAirportRequestsWithHotCapacity(b, 10000, hotCapacity)
 			snapshot := validator.authSnapshot.Load()
