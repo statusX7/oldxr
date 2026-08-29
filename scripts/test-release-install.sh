@@ -8,6 +8,8 @@ fi
 
 archive="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 install_script="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
+repo_root="$(cd "$(dirname "${install_script}")" && pwd)"
+default_config="${repo_root}/main/config.yml.example"
 archive_name="$(basename "${archive}")"
 checksum="${archive}.sha256"
 release_version="$(sed -n 's/^CURRENT_V1="\([^"]*\)"/\1/p' "${install_script}")"
@@ -16,7 +18,7 @@ if [[ ! "${release_version}" =~ ^v1\.0\.[0-9]+$ ]]; then
     echo "错误：无法从 install.sh 解析 v1.0.x Release。" >&2
     exit 1
 fi
-for required in "${archive}" "${checksum}" "${install_script}"; do
+for required in "${archive}" "${checksum}" "${install_script}" "${default_config}"; do
     [[ -f "${required}" ]] || { echo "错误：测试输入不存在：${required}" >&2; exit 1; }
 done
 
@@ -45,6 +47,10 @@ case "${1:-}" in
         [[ -f "${OLDXR_SYSTEMCTL_STATE}" ]]
         ;;
     start|restart)
+        if [[ -n "${OLDXR_SYSTEMCTL_FAIL_ONCE:-}" && -f "${OLDXR_SYSTEMCTL_FAIL_ONCE}" ]]; then
+            rm -f "${OLDXR_SYSTEMCTL_FAIL_ONCE}"
+            exit 1
+        fi
         touch "${OLDXR_SYSTEMCTL_STATE}"
         ;;
     stop)
@@ -57,9 +63,35 @@ esac
 MOCK
 chmod +x "${mock_systemctl}"
 
+bad_config="${test_root}/bad-default-config.yml"
+bad_install_root="${test_root}/bad-config-root"
+cp "${default_config}" "${bad_config}"
+printf '\n# CHECKSUM-MISMATCH\n' >> "${bad_config}"
+echo "执行新装默认配置 checksum 停服前保护"
+if env \
+    OLDXR_RELEASE_BASE="file://${release_root}" \
+    OLDXR_DEFAULT_CONFIG_URL="file://${bad_config}" \
+    OLDXR_INSTALL_ROOT="${bad_install_root}" \
+    OLDXR_SKIP_BASE_INSTALL=1 \
+    OLDXR_HEALTH_WAIT_SECONDS=0 \
+    OLDXR_SYSTEMCTL_BIN="${mock_systemctl}" \
+    OLDXR_SYSTEMCTL_STATE="${test_root}/bad-config-systemctl-active" \
+    OLDXR_SYSTEMCTL_LOG="${test_root}/bad-config-systemctl.log" \
+    OLDXR_ARCH=amd64 \
+    bash "${install_script}" "${release_version#v}" >/dev/null 2>&1; then
+    echo "错误：被篡改的新装默认配置未被 SHA256 拒绝。" >&2
+    exit 1
+fi
+[[ ! -e "${bad_install_root}/usr/local/XrayR" ]]
+if [[ -f "${test_root}/bad-config-systemctl.log" ]] && grep -Fx "stop XrayR" "${test_root}/bad-config-systemctl.log" >/dev/null; then
+    echo "错误：默认配置校验失败后服务已被停止。" >&2
+    exit 1
+fi
+
 run_installer() {
     env \
         OLDXR_RELEASE_BASE="file://${release_root}" \
+        OLDXR_DEFAULT_CONFIG_URL="file://${default_config}" \
         OLDXR_INSTALL_ROOT="${install_root}" \
         OLDXR_SKIP_BASE_INSTALL=1 \
         OLDXR_HEALTH_WAIT_SECONDS=0 \
@@ -108,6 +140,12 @@ if grep -Fx "start XrayR" "${systemctl_log}" >/dev/null; then
     exit 1
 fi
 
+cmp -s "${default_config}" "${install_root}/etc/XrayR/config.yml" || {
+    echo "错误：fresh install 未采用固定的新装默认配置。" >&2
+    exit 1
+}
+
+printf '\n# USER-PRESERVED-SENTINEL\n' >> "${install_root}/etc/XrayR/config.yml"
 config_hash_before="$(sha256sum "${install_root}/etc/XrayR/config.yml" | awk '{print $1}')"
 touch "${systemctl_state}"
 echo "执行 ${release_version} 事务更新"
@@ -150,6 +188,109 @@ stop_count_after="$(grep -c '^stop XrayR$' "${systemctl_log}" || true)"
     exit 1
 }
 cp "${pristine_archive}" "${release_root}/${release_version}/${archive_name}"
+
+prepare_v102_legacy_default() {
+    local root="$1"
+    mkdir -p "${root}/usr/local/XrayR" "${root}/etc/XrayR" "${root}/etc/systemd/system" "${root}/usr/bin"
+    cat > "${root}/usr/local/XrayR/XrayR" <<'OLD_BINARY'
+#!/usr/bin/env bash
+echo 'XrayR 1.0.2'
+OLD_BINARY
+    chmod +x "${root}/usr/local/XrayR/XrayR"
+    printf 'v1.0.2\n' > "${root}/usr/local/XrayR/.oldxr-release"
+    cat > "${root}/usr/bin/XrayR" <<'OLD_MANAGER'
+#!/usr/bin/env bash
+# statusX7/oldxr
+OLD_MANAGER
+    chmod +x "${root}/usr/bin/XrayR"
+    ln -s /usr/bin/XrayR "${root}/usr/bin/xrayr"
+    cat > "${root}/etc/systemd/system/XrayR.service" <<'OLD_SERVICE'
+[Service]
+ExecStart=/usr/local/XrayR/XrayR --config /etc/XrayR/config.yml
+OLD_SERVICE
+    cat > "${root}/etc/XrayR/config.yml" <<'OLD_CONFIG'
+# oldxr 1C/1GiB高连接默认模板：10000配置用户、1000在线、3000 TCP实测。
+ConnectionConfig:
+  Handshake: 4 # legacy
+  ConnIdle: 120 # legacy
+  UplinkOnly: 0 # legacy
+  DownlinkOnly: 0 # legacy
+  BufferSize: 8 # legacy
+Nodes:
+  - PanelType: V2board
+    ApiConfig:
+      ApiHost: https://user-preserved.invalid
+      ApiKey: USER-PRESERVED
+      NodeID: 41
+      NodeType: V2ray
+      Timeout: 5 # legacy
+    ControllerConfig:
+      CertConfig:
+        CertMode: none
+OLD_CONFIG
+    printf '{"sentinel":"route-preserved"}\n' > "${root}/etc/XrayR/route.json"
+    chmod 640 "${root}/etc/XrayR/config.yml" "${root}/etc/XrayR/route.json"
+    touch "${root}/systemctl-active"
+}
+
+run_v102_migration() {
+    local root="$1"
+    local fail_once="${2:-}"
+    env \
+        OLDXR_RELEASE_BASE="file://${release_root}" \
+        OLDXR_DEFAULT_CONFIG_URL="file://${test_root}/must-not-be-downloaded" \
+        OLDXR_INSTALL_ROOT="${root}" \
+        OLDXR_SKIP_BASE_INSTALL=1 \
+        OLDXR_HEALTH_WAIT_SECONDS=0 \
+        OLDXR_SYSTEMCTL_BIN="${mock_systemctl}" \
+        OLDXR_SYSTEMCTL_STATE="${root}/systemctl-active" \
+        OLDXR_SYSTEMCTL_LOG="${root}/systemctl.log" \
+        OLDXR_SYSTEMCTL_FAIL_ONCE="${fail_once}" \
+        OLDXR_ARCH=amd64 \
+        bash "${install_script}" "${release_version#v}"
+}
+
+echo "执行v1.0.2旧默认连接参数定向迁移"
+migration_root="${test_root}/migration-root"
+prepare_v102_legacy_default "${migration_root}"
+migration_mode_before="$(stat -c '%a' "${migration_root}/etc/XrayR/config.yml")"
+migration_owner_before="$(stat -c '%u:%g' "${migration_root}/etc/XrayR/config.yml")"
+route_hash_before="$(sha256sum "${migration_root}/etc/XrayR/route.json" | awk '{print $1}')"
+migration_output="$(run_v102_migration "${migration_root}")"
+grep -F '已将v1.0.2旧默认连接参数安全迁移为v1.0.3稳定值' <<<"${migration_output}" >/dev/null
+grep -Eq '^[[:space:]]*Handshake:[[:space:]]*8([[:space:]]|$)' "${migration_root}/etc/XrayR/config.yml"
+grep -Eq '^[[:space:]]*ConnIdle:[[:space:]]*21600([[:space:]]|$)' "${migration_root}/etc/XrayR/config.yml"
+grep -Eq '^[[:space:]]*UplinkOnly:[[:space:]]*2([[:space:]]|$)' "${migration_root}/etc/XrayR/config.yml"
+grep -Eq '^[[:space:]]*DownlinkOnly:[[:space:]]*4([[:space:]]|$)' "${migration_root}/etc/XrayR/config.yml"
+grep -Eq '^[[:space:]]*BufferSize:[[:space:]]*256([[:space:]]|$)' "${migration_root}/etc/XrayR/config.yml"
+grep -Eq '^[[:space:]]{6}Timeout:[[:space:]]*30([[:space:]]|$)' "${migration_root}/etc/XrayR/config.yml"
+grep -F 'ApiKey: USER-PRESERVED' "${migration_root}/etc/XrayR/config.yml" >/dev/null
+[[ "${migration_mode_before}" == "$(stat -c '%a' "${migration_root}/etc/XrayR/config.yml")" ]]
+[[ "${migration_owner_before}" == "$(stat -c '%u:%g' "${migration_root}/etc/XrayR/config.yml")" ]]
+[[ "${route_hash_before}" == "$(sha256sum "${migration_root}/etc/XrayR/route.json" | awk '{print $1}')" ]]
+migration_backup="$(find "${migration_root}/etc/XrayR/backups" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
+grep -Eq '^[[:space:]]*ConnIdle:[[:space:]]*120([[:space:]]|$)' "${migration_backup}/files/etc/XrayR/config.yml"
+
+echo "执行v1.0.2自定义配置不迁移保护"
+migration_custom_root="${test_root}/migration-custom-root"
+prepare_v102_legacy_default "${migration_custom_root}"
+sed -i '1s/.*/# USER-MANAGED-CONFIG/' "${migration_custom_root}/etc/XrayR/config.yml"
+migration_custom_hash="$(sha256sum "${migration_custom_root}/etc/XrayR/config.yml" | awk '{print $1}')"
+run_v102_migration "${migration_custom_root}" >/dev/null
+[[ "${migration_custom_hash}" == "$(sha256sum "${migration_custom_root}/etc/XrayR/config.yml" | awk '{print $1}')" ]]
+
+echo "执行v1.0.2迁移后启动失败自动回滚"
+migration_rollback_root="${test_root}/migration-rollback-root"
+prepare_v102_legacy_default "${migration_rollback_root}"
+migration_hash_before="$(sha256sum "${migration_rollback_root}/etc/XrayR/config.yml" | awk '{print $1}')"
+touch "${migration_rollback_root}/fail-once"
+if run_v102_migration "${migration_rollback_root}" "${migration_rollback_root}/fail-once" >/dev/null 2>&1; then
+    echo "错误：迁移后启动失败未触发回滚。" >&2
+    exit 1
+fi
+[[ "${migration_hash_before}" == "$(sha256sum "${migration_rollback_root}/etc/XrayR/config.yml" | awk '{print $1}')" ]]
+grep -Fx 'v1.0.2' "${migration_rollback_root}/usr/local/XrayR/.oldxr-release" >/dev/null
+[[ -f "${migration_rollback_root}/systemctl-active" ]]
 
 if run_installer 0.9.0 >/dev/null 2>&1; then
     echo "错误：旧 0.9.0 maintenance 参数未被拒绝。" >&2
