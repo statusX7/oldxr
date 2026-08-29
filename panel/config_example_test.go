@@ -28,11 +28,11 @@ func TestProductionExampleConfig(t *testing.T) {
 		t.Fatal("ConnectionConfig is missing")
 	}
 	connection := config.ConnectionConfig
-	if connection.Handshake != 4 || connection.ConnIdle != 120 || connection.UplinkOnly != 0 || connection.DownlinkOnly != 0 {
+	if connection.Handshake != 8 || connection.ConnIdle != 21600 || connection.UplinkOnly != 2 || connection.DownlinkOnly != 4 {
 		t.Fatalf("unexpected connection timeouts: %+v", *connection)
 	}
-	if connection.BufferSize != 8 {
-		t.Fatalf("ConnectionConfig.BufferSize = %d, want 8", connection.BufferSize)
+	if connection.BufferSize != 256 {
+		t.Fatalf("ConnectionConfig.BufferSize = %d, want 256", connection.BufferSize)
 	}
 
 	if len(config.NodesConfig) != 1 {
@@ -45,8 +45,8 @@ func TestProductionExampleConfig(t *testing.T) {
 	if node.PanelType != "V2board" {
 		t.Fatalf("PanelType = %q, want V2board", node.PanelType)
 	}
-	if node.ApiConfig.Timeout != 5 {
-		t.Fatalf("ApiConfig.Timeout = %d, want 5", node.ApiConfig.Timeout)
+	if node.ApiConfig.Timeout != 30 {
+		t.Fatalf("ApiConfig.Timeout = %d, want 30", node.ApiConfig.Timeout)
 	}
 	if node.ControllerConfig.UpdatePeriodic != 60 {
 		t.Fatalf("ControllerConfig.UpdatePeriodic = %d, want 60", node.ControllerConfig.UpdatePeriodic)
