@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 env:
-  GO_VERSION: 1.26.7
+  GO_VERSION: 1.27.0
 
 jobs:
   verify:
@@ -28,7 +28,19 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Verify modules
-        run: go mod verify
+        run: |
+          go mod verify
+          (cd third_party/xray-core && go mod verify)
+          (cd third_party/gnet && go mod verify)
+          (cd third_party/giouring && go mod verify)
+          if grep -R -E 'github.com/statusX7/(oldxr-|xray-core-oldxr)' go.mod third_party/*/go.mod; then
+            echo 'oldxr must not depend on deleted auxiliary GitHub repositories' >&2
+            exit 1
+          fi
+          if grep -R -E '^replace .*=> /' go.mod third_party/*/go.mod; then
+            echo 'absolute module replacements are forbidden' >&2
+            exit 1
+          fi
       - name: Test
         run: go test -mod=readonly ./...
       - name: Vet

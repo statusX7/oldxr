@@ -273,8 +273,8 @@ require (
 	lukechampine.com/blake3 v1.3.0 // indirect
 )
 
-replace github.com/xtls/xray-core => github.com/statusX7/oldxr-xray-core v1.7.5-oldxr.1.0.20260827104344-df14d7142494
+replace github.com/xtls/xray-core => ./third_party/xray-core
 
-replace github.com/panjf2000/gnet/v2 => github.com/statusX7/oldxr-gnet/v2 v2.10.0-oldxr.1
+replace github.com/panjf2000/gnet/v2 => ./third_party/gnet
 
-replace github.com/pawelgaczynski/giouring => github.com/statusX7/oldxr-giouring v0.0.0-oldxr.1
+replace github.com/pawelgaczynski/giouring => ./third_party/giouring
