@@ -1,5 +1,7 @@
+# oldxr 1C/1GiB高连接默认模板：10000配置用户、1000在线、3000 TCP实测。
+# VMess+TCP与Shadowsocks AES-128-GCM无TLS时，只需填写面板地址、密钥、节点ID和NodeType。
 Log:
-  Level: warning # Log level: none, error, warning, info, debug 
+  Level: none # CPU最低；排障时可临时改为 error、warning、info 或 debug
   AccessPath: # /etc/XrayR/access.Log
   ErrorPath: # /etc/XrayR/error.log
 DnsConfigPath: # /etc/XrayR/dns.json # Path to dns config, check https://xtls.github.io/config/dns.html for help
@@ -8,19 +10,19 @@ InboundConfigPath: # /etc/XrayR/custom_inbound.json # Path to custom inbound con
 OutboundConfigPath: # /etc/XrayR/custom_outbound.json # Path to custom outbound config, check https://xtls.github.io/config/outbound.html for help
 ConnectionConfig:
   Handshake: 4 # Handshake time limit, Second
-  ConnIdle: 30 # Connection idle time limit, Second
-  UplinkOnly: 2 # Time limit when the connection downstream is closed, Second
-  DownlinkOnly: 4 # Time limit when the connection is closed after the uplink is closed, Second
-  BufferSize: 64 # The internal cache size of each connection, kB
+  ConnIdle: 120 # 3000连接与频繁重连实测CPU最低；静默连接最长保留120秒
+  UplinkOnly: 0 # CPU最低；下行关闭后立即结束连接，不保留半关闭等待窗口
+  DownlinkOnly: 0 # CPU最低；上行关闭后立即结束连接，不保留半关闭等待窗口
+  BufferSize: 8 # 1C/1GiB、3000 TCP实测CPU最低，单位kB
 Nodes:
   -
-    PanelType: "SSpanel" # Panel type: SSpanel, V2board, NewV2board, PMpanel, Proxypanel, V2RaySocks
+    PanelType: "V2board" # 默认兼容V2Board 1.6.0；也支持SSpanel、NewV2board、PMpanel、Proxypanel、V2RaySocks
     ApiConfig:
       ApiHost: "http://127.0.0.1:667"
       ApiKey: "123"
       NodeID: 41
       NodeType: V2ray # Node type: V2ray, Shadowsocks, Trojan, Shadowsocks-Plugin
-      Timeout: 30 # Timeout for the api request
+      Timeout: 5 # 面板请求超时，单位秒
       EnableVless: false # Enable Vless for V2ray Type
       EnableXTLS: false # Enable XTLS for V2ray and Trojan
       SpeedLimit: 0 # Mbps, Local settings will replace remote settings, 0 means disable
@@ -32,6 +34,10 @@ Nodes:
       UpdatePeriodic: 60 # Time to update the nodeinfo, how many sec.
       EnableDNS: false # Use custom DNS config, Please ensure that you set the dns.json well
       DNSType: AsIs # AsIs, UseIP, UseIPv4, UseIPv6, DNS strategy
+      DisableUploadTraffic: false # 保留流量上报与失败重试
+      DisableGetRule: false # 保留面板规则与本地rulelist
+      DisableSniffing: false # 保留域名嗅探和route.json语义
+      DisableIVCheck: false # 保留Shadowsocks replay/IV检查
       EnableProxyProtocol: false # Only works for WebSocket and TCP
       AutoSpeedLimitConfig:
         Limit: 0 # Warned speed. Set to 0 to disable AutoSpeedLimit (mbps)
@@ -54,15 +60,7 @@ Nodes:
           Dest: 80 # Required, Destination of fallback, check https://xtls.github.io/config/features/fallback.html for details.
           ProxyProtocolVer: 0 # Send PROXY protocol version, 0 for dsable
       CertConfig:
-        CertMode: dns # Option about how to get certificate: none, file, http, tls, dns. Choose "none" will forcedly disable the tls config.
-        CertDomain: "node1.test.com" # Domain to cert
-        CertFile: /etc/XrayR/cert/node1.test.com.cert # Provided if the CertMode is file
-        KeyFile: /etc/XrayR/cert/node1.test.com.key
-        Provider: alidns # DNS cert provider, Get the full support list here: https://go-acme.github.io/lego/dns/
-        Email: test@me.com
-        DNSEnv: # DNS ENV option used by DNS provider
-          ALICLOUD_ACCESS_KEY: aaa
-          ALICLOUD_SECRET_KEY: bbb
+        CertMode: none # VMess+TCP与Shadowsocks无TLS时不申请或加载证书
   # -
   #   PanelType: "NewV2board" # Panel type: SSpanel, V2board, NewV2board, PMpanel, Proxypanel, V2RaySocks
   #   ApiConfig:
@@ -80,12 +78,4 @@ Nodes:
   #     UpdatePeriodic: 10 # Time to update the nodeinfo, how many sec.
   #     EnableDNS: false # Use custom DNS config, Please ensure that you set the dns.json well
   #     CertConfig:
-  #       CertMode: dns # Option about how to get certificate: none, file, http, dns
-  #       CertDomain: "node1.test.com" # Domain to cert
-  #       CertFile: /etc/XrayR/cert/node1.test.com.cert # Provided if the CertMode is file
-  #       KeyFile: /etc/XrayR/cert/node1.test.com.pem
-  #       Provider: alidns # DNS cert provider, Get the full support list here: https://go-acme.github.io/lego/dns/
-  #       Email: test@me.com
-  #       DNSEnv: # DNS ENV option used by DNS provider
-  #         ALICLOUD_ACCESS_KEY: aaa
-  #         ALICLOUD_SECRET_KEY: bbb
+  #       CertMode: none # 无TLS节点不需要证书
