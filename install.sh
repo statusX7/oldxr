@@ -9,10 +9,10 @@ yellow='\033[0;33m'
 plain='\033[0m'
 
 REPO="statusX7/oldxr"
-CURRENT_V1="v1.0.2"
+CURRENT_V1="v1.0.3"
 RELEASE_BASE="${OLDXR_RELEASE_BASE:-https://github.com/${REPO}/releases/download}"
-DEFAULT_CONFIG_COMMIT="be6995621ea95229e2674bd5575f21852d96e00a"
-DEFAULT_CONFIG_SHA256="52c98378453b227412f8d59df4d144cf750172a629a5ea6d98c940ece3633849"
+DEFAULT_CONFIG_COMMIT="422cc1cb04fc7b16385c3844c6823e8ace0e64eb"
+DEFAULT_CONFIG_SHA256="c2ebd3eb095e615c195ef7db5fbca256ff2cc17554294ea8cd1f7731054cb6ec"
 DEFAULT_CONFIG_URL="${OLDXR_DEFAULT_CONFIG_URL:-https://raw.githubusercontent.com/${REPO}/${DEFAULT_CONFIG_COMMIT}/main/config.yml.example}"
 INSTALL_ROOT="${OLDXR_INSTALL_ROOT:-}"
 SYSTEMCTL_BIN="${OLDXR_SYSTEMCTL_BIN:-systemctl}"
@@ -351,6 +351,38 @@ verify_user_paths() {
     return 0
 }
 
+migrate_v102_unstable_default_config() {
+    local temporary
+
+    [[ "${resolved_version}" == "v1.0.3" ]] || return 0
+    [[ "${existing_source}" == "oldxr" && "${existing_version}" == "v1.0.2" ]] || return 0
+    [[ -f "${active_config_file}" && ! -L "${active_config_file}" ]] || return 0
+    grep -Fq '# oldxr 1C/1GiB高连接默认模板' "${active_config_file}" || return 0
+
+    [[ "$(grep -Ec '^[[:space:]]*Handshake:[[:space:]]*4([[:space:]]|$)' "${active_config_file}")" == 1 ]] || return 0
+    [[ "$(grep -Ec '^[[:space:]]*ConnIdle:[[:space:]]*120([[:space:]]|$)' "${active_config_file}")" == 1 ]] || return 0
+    [[ "$(grep -Ec '^[[:space:]]*UplinkOnly:[[:space:]]*0([[:space:]]|$)' "${active_config_file}")" == 1 ]] || return 0
+    [[ "$(grep -Ec '^[[:space:]]*DownlinkOnly:[[:space:]]*0([[:space:]]|$)' "${active_config_file}")" == 1 ]] || return 0
+    [[ "$(grep -Ec '^[[:space:]]*BufferSize:[[:space:]]*8([[:space:]]|$)' "${active_config_file}")" == 1 ]] || return 0
+
+    temporary="$(mktemp "${active_config_file}.oldxr-v1.0.3.XXXXXX")"
+    if ! sed -E \
+        -e 's/^([[:space:]]*Handshake:)[[:space:]]*4([[:space:]]|$)/\1 8\2/' \
+        -e 's/^([[:space:]]*ConnIdle:)[[:space:]]*120([[:space:]]|$)/\1 21600\2/' \
+        -e 's/^([[:space:]]*UplinkOnly:)[[:space:]]*0([[:space:]]|$)/\1 2\2/' \
+        -e 's/^([[:space:]]*DownlinkOnly:)[[:space:]]*0([[:space:]]|$)/\1 4\2/' \
+        -e 's/^([[:space:]]*BufferSize:)[[:space:]]*8([[:space:]]|$)/\1 256\2/' \
+        -e 's/^([[:space:]]{6}Timeout:)[[:space:]]*5([[:space:]]|$)/\1 30\2/' \
+        "${active_config_file}" > "${temporary}"; then
+        rm -f -- "${temporary}"
+        return 1
+    fi
+    chmod --reference="${active_config_file}" "${temporary}"
+    chown --reference="${active_config_file}" "${temporary}"
+    mv -f -- "${temporary}" "${active_config_file}"
+    echo -e "${yellow}已将v1.0.2旧默认连接参数安全迁移为v1.0.3稳定值；原文件已保留在升级备份中。${plain}"
+}
+
 backup_existing_install() {
     local timestamp
     local index
@@ -395,7 +427,7 @@ backup_existing_install() {
 resolve_version() {
     local requested="${1:-}"
     case "${requested}" in
-        ""|1.0.2|v1.0.2)
+        ""|1.0.3|v1.0.3)
             resolved_version="${CURRENT_V1}"
             ;;
         1.0.[0-9]*|v1.0.[0-9]*)
@@ -407,7 +439,7 @@ resolve_version() {
             }
             ;;
         *)
-            echo -e "${red}错误：${plain}此安装器仅支持 oldxr v1.0.x；正式版本为 1.0.2。" >&2
+            echo -e "${red}错误：${plain}此安装器仅支持 oldxr v1.0.x；正式版本为 1.0.3。" >&2
             exit 2
             ;;
     esac
@@ -539,6 +571,7 @@ activate_install() {
         install_missing_user_file "${file}" "${active_config_dir}/${file}" || return 1
     done
     verify_user_paths || return 1
+    migrate_v102_unstable_default_config || return 1
 
     run_systemctl daemon-reload || return 1
     run_systemctl enable XrayR || return 1
