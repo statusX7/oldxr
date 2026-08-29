@@ -2,10 +2,47 @@ package mydispatcher
 
 import (
 	"io"
+	"os"
 	"testing"
 
 	"github.com/xtls/xray-core/common/buf"
 )
+
+func TestDirectDataPathDefaultsOffAndRequiresExplicitOptIn(t *testing.T) {
+	original, existed := os.LookupEnv("XRAYR_DIRECT_DATAPATH")
+	t.Cleanup(func() {
+		if existed {
+			_ = os.Setenv("XRAYR_DIRECT_DATAPATH", original)
+		} else {
+			_ = os.Unsetenv("XRAYR_DIRECT_DATAPATH")
+		}
+	})
+
+	for _, testCase := range []struct {
+		value string
+		want  bool
+	}{
+		{"", false},
+		{"0", false},
+		{"false", false},
+		{"off", false},
+		{"unexpected", false},
+		{"1", true},
+		{"true", true},
+		{"on", true},
+	} {
+		t.Run(testCase.value, func(t *testing.T) {
+			if testCase.value == "" {
+				_ = os.Unsetenv("XRAYR_DIRECT_DATAPATH")
+			} else {
+				_ = os.Setenv("XRAYR_DIRECT_DATAPATH", testCase.value)
+			}
+			if got := directDataPathEnabledFromEnvironment(); got != testCase.want {
+				t.Fatalf("directDataPathEnabledFromEnvironment()=%v, want %v", got, testCase.want)
+			}
+		})
+	}
+}
 
 type sequenceReader struct {
 	payloads [][]byte

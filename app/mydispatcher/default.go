@@ -40,14 +40,16 @@ var (
 	directDispatchFailures = expvar.NewMap("oldxr_direct_dispatch_failures")
 )
 
-var directDataPathEnabled = func() bool {
+func directDataPathEnabledFromEnvironment() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("XRAYR_DIRECT_DATAPATH"))) {
-	case "0", "false", "off":
-		return false
-	default:
+	case "1", "true", "on":
 		return true
+	default:
+		return false
 	}
-}()
+}
+
+var directDataPathEnabled = directDataPathEnabledFromEnvironment()
 
 type cachedReader struct {
 	sync.Mutex

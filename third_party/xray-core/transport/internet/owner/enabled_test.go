@@ -2,18 +2,19 @@ package owner
 
 import "testing"
 
-func TestEnabledDefaultsOnAndHonorsExplicitDisable(t *testing.T) {
+func TestEnabledDefaultsOffAndHonorsExplicitOptIn(t *testing.T) {
 	for _, testCase := range []struct {
 		value string
 		want  bool
 	}{
-		{"", true},
+		{"", false},
 		{"1", true},
 		{"true", true},
 		{"on", true},
 		{"0", false},
 		{"false", false},
 		{"off", false},
+		{"unexpected", false},
 	} {
 		t.Run(testCase.value, func(t *testing.T) {
 			t.Setenv("XRAYR_SOCKET_OWNER", testCase.value)
