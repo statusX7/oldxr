@@ -28,7 +28,7 @@ func TestProductionExampleConfig(t *testing.T) {
 		t.Fatal("ConnectionConfig is missing")
 	}
 	connection := config.ConnectionConfig
-	if connection.Handshake != 8 || connection.ConnIdle != 21600 || connection.UplinkOnly != 2 || connection.DownlinkOnly != 4 {
+	if connection.Handshake != 8 || connection.ConnIdle != 21600 || connection.UplinkOnly != 300 || connection.DownlinkOnly != 300 {
 		t.Fatalf("unexpected connection timeouts: %+v", *connection)
 	}
 	if connection.BufferSize != 256 {
@@ -65,5 +65,12 @@ func TestProductionExampleConfig(t *testing.T) {
 	}
 	if node.ControllerConfig.DisableIVCheck {
 		t.Fatal("DisableIVCheck must remain false")
+	}
+}
+
+func TestDefaultConnectionConfigMatchesProductionExample(t *testing.T) {
+	connection := getDefaultConnectionConfig()
+	if connection.Handshake != 8 || connection.ConnIdle != 21600 || connection.UplinkOnly != 300 || connection.DownlinkOnly != 300 || connection.BufferSize != 256 {
+		t.Fatalf("unexpected default connection config: %+v", *connection)
 	}
 }

@@ -11,8 +11,8 @@ plain='\033[0m'
 REPO="statusX7/oldxr"
 CURRENT_V1="v1.0.3"
 RELEASE_BASE="${OLDXR_RELEASE_BASE:-https://github.com/${REPO}/releases/download}"
-DEFAULT_CONFIG_COMMIT="422cc1cb04fc7b16385c3844c6823e8ace0e64eb"
-DEFAULT_CONFIG_SHA256="c2ebd3eb095e615c195ef7db5fbca256ff2cc17554294ea8cd1f7731054cb6ec"
+DEFAULT_CONFIG_COMMIT="f2664f7cfa1170b8b5e09309c6e5b3408925ce43"
+DEFAULT_CONFIG_SHA256="bfc17dd92fdbb87e7680b6cc2ac735277c1f4da8230317195ceed850e63a02de"
 DEFAULT_CONFIG_URL="${OLDXR_DEFAULT_CONFIG_URL:-https://raw.githubusercontent.com/${REPO}/${DEFAULT_CONFIG_COMMIT}/main/config.yml.example}"
 INSTALL_ROOT="${OLDXR_INSTALL_ROOT:-}"
 SYSTEMCTL_BIN="${OLDXR_SYSTEMCTL_BIN:-systemctl}"
@@ -351,28 +351,35 @@ verify_user_paths() {
     return 0
 }
 
-migrate_v102_unstable_default_config() {
+migrate_connectivity_defaults() {
     local temporary
+    local source_tuple=""
 
     [[ "${resolved_version}" == "v1.0.3" ]] || return 0
-    [[ "${existing_source}" == "oldxr" && "${existing_version}" == "v1.0.2" ]] || return 0
+    [[ "${existing_source}" == "oldxr" ]] || return 0
+    case "${existing_version}" in
+        v1.0.2|v1.0.3) ;;
+        *) return 0 ;;
+    esac
     [[ -f "${active_config_file}" && ! -L "${active_config_file}" ]] || return 0
-    grep -Fq '# oldxr 1C/1GiB高连接默认模板' "${active_config_file}" || return 0
 
-    [[ "$(grep -Ec '^[[:space:]]*Handshake:[[:space:]]*4([[:space:]]|$)' "${active_config_file}")" == 1 ]] || return 0
-    [[ "$(grep -Ec '^[[:space:]]*ConnIdle:[[:space:]]*120([[:space:]]|$)' "${active_config_file}")" == 1 ]] || return 0
-    [[ "$(grep -Ec '^[[:space:]]*UplinkOnly:[[:space:]]*0([[:space:]]|$)' "${active_config_file}")" == 1 ]] || return 0
-    [[ "$(grep -Ec '^[[:space:]]*DownlinkOnly:[[:space:]]*0([[:space:]]|$)' "${active_config_file}")" == 1 ]] || return 0
-    [[ "$(grep -Ec '^[[:space:]]*BufferSize:[[:space:]]*8([[:space:]]|$)' "${active_config_file}")" == 1 ]] || return 0
+    if connection_config_matches 4 30 2 4 64; then
+        source_tuple="v1.0.2-source-default"
+    elif connection_config_matches 4 120 0 0 8; then
+        source_tuple="v1.0.2-installer-default"
+    elif connection_config_matches 8 21600 2 4 256; then
+        source_tuple="v1.0.3-prior-default"
+    else
+        return 0
+    fi
 
     temporary="$(mktemp "${active_config_file}.oldxr-v1.0.3.XXXXXX")"
     if ! sed -E \
-        -e 's/^([[:space:]]*Handshake:)[[:space:]]*4([[:space:]]|$)/\1 8\2/' \
-        -e 's/^([[:space:]]*ConnIdle:)[[:space:]]*120([[:space:]]|$)/\1 21600\2/' \
-        -e 's/^([[:space:]]*UplinkOnly:)[[:space:]]*0([[:space:]]|$)/\1 2\2/' \
-        -e 's/^([[:space:]]*DownlinkOnly:)[[:space:]]*0([[:space:]]|$)/\1 4\2/' \
-        -e 's/^([[:space:]]*BufferSize:)[[:space:]]*8([[:space:]]|$)/\1 256\2/' \
-        -e 's/^([[:space:]]{6}Timeout:)[[:space:]]*5([[:space:]]|$)/\1 30\2/' \
+        -e 's/^([[:space:]]*Handshake:)[[:space:]]*(4|8)([[:space:]]|$)/\1 8\3/' \
+        -e 's/^([[:space:]]*ConnIdle:)[[:space:]]*(30|120|21600)([[:space:]]|$)/\1 21600\3/' \
+        -e 's/^([[:space:]]*UplinkOnly:)[[:space:]]*(0|2)([[:space:]]|$)/\1 300\3/' \
+        -e 's/^([[:space:]]*DownlinkOnly:)[[:space:]]*(0|4)([[:space:]]|$)/\1 300\3/' \
+        -e 's/^([[:space:]]*BufferSize:)[[:space:]]*(8|64|256)([[:space:]]|$)/\1 256\3/' \
         "${active_config_file}" > "${temporary}"; then
         rm -f -- "${temporary}"
         return 1
@@ -380,7 +387,21 @@ migrate_v102_unstable_default_config() {
     chmod --reference="${active_config_file}" "${temporary}"
     chown --reference="${active_config_file}" "${temporary}"
     mv -f -- "${temporary}" "${active_config_file}"
-    echo -e "${yellow}已将v1.0.2旧默认连接参数安全迁移为v1.0.3稳定值；原文件已保留在升级备份中。${plain}"
+    echo -e "${yellow}已将${source_tuple}连接参数迁移为v1.0.3稳定值；原文件已保留在升级备份中。${plain}"
+}
+
+connection_config_matches() {
+    local handshake="$1"
+    local idle="$2"
+    local uplink="$3"
+    local downlink="$4"
+    local buffer="$5"
+
+    [[ "$(grep -Ec "^[[:space:]]*Handshake:[[:space:]]*${handshake}([[:space:]]|$)" "${active_config_file}")" == 1 ]] &&
+        [[ "$(grep -Ec "^[[:space:]]*ConnIdle:[[:space:]]*${idle}([[:space:]]|$)" "${active_config_file}")" == 1 ]] &&
+        [[ "$(grep -Ec "^[[:space:]]*UplinkOnly:[[:space:]]*${uplink}([[:space:]]|$)" "${active_config_file}")" == 1 ]] &&
+        [[ "$(grep -Ec "^[[:space:]]*DownlinkOnly:[[:space:]]*${downlink}([[:space:]]|$)" "${active_config_file}")" == 1 ]] &&
+        [[ "$(grep -Ec "^[[:space:]]*BufferSize:[[:space:]]*${buffer}([[:space:]]|$)" "${active_config_file}")" == 1 ]]
 }
 
 backup_existing_install() {
@@ -571,7 +592,7 @@ activate_install() {
         install_missing_user_file "${file}" "${active_config_dir}/${file}" || return 1
     done
     verify_user_paths || return 1
-    migrate_v102_unstable_default_config || return 1
+    migrate_connectivity_defaults || return 1
 
     run_systemctl daemon-reload || return 1
     run_systemctl enable XrayR || return 1
