@@ -4,7 +4,7 @@
 
 ## 产品身份与源码基线
 
-- `1.0.x` 是单一 Go 二进制产品线；当前补丁版本为 `v1.0.2`，binary version 显示 `XrayR 1.0.2`。
+- `1.0.x` 是单一 Go 二进制产品线；当前补丁版本为 `v1.0.3`，binary version 显示 `XrayR 1.0.3`。
 - 开发基线必须是官方 `XrayR v0.9.0` commit `f95825395d192498adfc533ab925943088408cb4`；不得从 r3/r4 删除 Rust 后伪装成官方基线。
 - 历史 `v0.9.0`、`v0.9.0-r1`、`v0.9.0-r2`、`v0.9.0-r3`、`v0.9.0-r4` tags 不移动、不删除、不覆盖。
 - `v1.0.x` production package只包含一个主要运行二进制 `XrayR`。禁止依赖 `XrayR-fastengine`、`XrayR-legacy`、Rust runtime或三二进制 selector。
@@ -37,7 +37,7 @@
 - RAM硬目标：candidate RSS `<=50%` official，并记录heap、objects、goroutines、FD和时间斜率。
 - 筛选至少3轮、warmup至少30秒、measurement至少60秒；正式结果至少10轮交叉/随机顺序且measurement至少180秒，不得挑最好一次。
 - 主测试必须开启traffic accounting、online IP/device、SpeedLimit、DeviceLimit、route/outbound/rulelist、panel polling/submit与UDP support。
-- 任一CPU、RAM、功能、OS、soak、安全、升级或rollback Gate失败时，不得发布`v1.0.x`、不得更新master安装入口、不得宣称完成；用户明确接受且在Release notes完整披露的特定安全例外除外，该例外不得自动延伸到其他版本。
+- 任一CPU、RAM、功能、OS、soak、安全、升级或rollback Gate失败时，不得发布`v1.0.x`、不得更新master安装入口、不得宣称完成。用户明确接受的特定风险只能记录在对应版本的本地内部报告中，不能通过公开披露或模糊表述把内部FAIL改写成PASS；公开Release notes仍只写高层维护结论。
 
 ## 证据驱动开发
 
