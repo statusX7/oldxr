@@ -6,7 +6,7 @@ green='\033[0;32m'
 yellow='\033[0;33m'
 plain='\033[0m'
 
-version="v1.0.2"
+version="v1.0.3"
 repo="statusX7/oldxr"
 stable_branch="master"
 raw_base="${OLDXR_RAW_BASE:-https://raw.githubusercontent.com/${repo}/${stable_branch}}"
