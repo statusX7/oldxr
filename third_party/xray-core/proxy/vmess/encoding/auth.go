@@ -77,14 +77,20 @@ func GenerateChacha20Poly1305Key(b []byte) []byte {
 
 type ShakeSizeParser struct {
 	shake  sha3.ShakeHash
-	buffer [2]byte
+	buffer [shakeSizeParserBufferSize]byte
+	offset int
 }
+
+// SHAKE128 has a 168-byte rate. Refilling one complete rate amortizes the
+// wrapper and FIPS bookkeeping while preserving the exact XOF byte stream.
+const shakeSizeParserBufferSize = 168
 
 func NewShakeSizeParser(nonce []byte) *ShakeSizeParser {
 	shake := sha3.NewShake128()
 	common.Must2(shake.Write(nonce))
 	return &ShakeSizeParser{
-		shake: shake,
+		shake:  shake,
+		offset: shakeSizeParserBufferSize,
 	}
 }
 
@@ -93,8 +99,13 @@ func (*ShakeSizeParser) SizeBytes() int32 {
 }
 
 func (s *ShakeSizeParser) next() uint16 {
-	common.Must2(s.shake.Read(s.buffer[:]))
-	return binary.BigEndian.Uint16(s.buffer[:])
+	if s.offset == len(s.buffer) {
+		common.Must2(s.shake.Read(s.buffer[:]))
+		s.offset = 0
+	}
+	value := binary.BigEndian.Uint16(s.buffer[s.offset : s.offset+2])
+	s.offset += 2
+	return value
 }
 
 func (s *ShakeSizeParser) Decode(b []byte) (uint16, error) {
