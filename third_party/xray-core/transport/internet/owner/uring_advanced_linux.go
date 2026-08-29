@@ -1389,7 +1389,8 @@ func (conn *advancedUringOwnerConn) Wake(callback gnet.AsyncCallback) error {
 	if conn.loop.stopping.Load() {
 		return net.ErrClosed
 	}
-	if callback == nil && conn.state().resumeWakeNoop.Swap(false) {
+	resumeWakeNoop := conn.state().resumeWakeNoop.Swap(false)
+	if callback == nil && resumeWakeNoop {
 		advancedUringOwnerSkippedWakes.Add(1)
 		return nil
 	}
