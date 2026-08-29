@@ -325,6 +325,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	var requestWriter buf.Writer
 	var closeRequestWriter bool
 	var closeDirect func() error
+	var closeDirectWrite func() error
 
 	if request.Command == protocol.RequestCommandTCP {
 		if directDispatcher, ok := dispatcher.(routing.DirectDispatcher); ok {
@@ -368,6 +369,7 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 					responseReader = directLink.Reader
 					requestWriter = directLink.Writer
 					closeDirect = directLink.Close
+					closeDirectWrite = directLink.CloseWrite
 					defer closeDirect()
 				}
 			} else {
@@ -413,6 +415,8 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	requestDonePost := requestDone
 	if closeRequestWriter {
 		requestDonePost = task.OnSuccess(requestDone, task.Close(requestWriter))
+	} else if closeDirectWrite != nil {
+		requestDonePost = task.OnSuccess(requestDone, closeDirectWrite)
 	}
 	if err := task.Run(ctx, requestDonePost, responseDone); err != nil {
 		if closeDirect != nil {

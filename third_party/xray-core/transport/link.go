@@ -59,6 +59,17 @@ func (l *DirectLink) SetConnection(conn *net.TCPConn, readCounters, writeCounter
 	l.WriteCounters = writeCounters
 }
 
+// CloseWrite forwards a completed logical upload to the direct target while
+// preserving the reverse TCP stream. Generic pipe outbounds already receive
+// this half-close when their request writer completes; direct sockets must do
+// the same explicitly.
+func (l *DirectLink) CloseWrite() error {
+	if l == nil || l.Connection == nil {
+		return nil
+	}
+	return l.Connection.CloseWrite()
+}
+
 // SetFlow transfers one connection-lifetime flow reference to the link. The
 // reference is released by Close unless TakeFlow transfers it to a socket
 // owner first.

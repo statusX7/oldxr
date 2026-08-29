@@ -244,6 +244,7 @@ func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dis
 	var requestWriter buf.Writer
 	var closeRequestWriter bool
 	var closeDirect func() error
+	var closeDirectWrite func() error
 
 	if directDispatcher, ok := dispatcher.(routing.DirectDispatcher); ok {
 		if err := conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err == nil {
@@ -283,6 +284,7 @@ func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dis
 				responseReader = directLink.Reader
 				requestWriter = directLink.Writer
 				closeDirect = directLink.Close
+				closeDirectWrite = directLink.CloseWrite
 				defer closeDirect()
 			}
 		} else {
@@ -343,6 +345,8 @@ func (s *Server) handleConnection(ctx context.Context, conn stat.Connection, dis
 	requestDoneAndCloseWriter := requestDone
 	if closeRequestWriter {
 		requestDoneAndCloseWriter = task.OnSuccess(requestDone, task.Close(requestWriter))
+	} else if closeDirectWrite != nil {
+		requestDoneAndCloseWriter = task.OnSuccess(requestDone, closeDirectWrite)
 	}
 	if err := task.Run(ctx, requestDoneAndCloseWriter, responseDone); err != nil {
 		if closeDirect != nil {

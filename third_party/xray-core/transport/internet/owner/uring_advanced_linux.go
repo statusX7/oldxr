@@ -90,13 +90,14 @@ type advancedUringOwnerEndpoint struct {
 	readNotified   bool
 	resumeWakeNoop atomic.Bool
 
-	sendBuffer     []byte
-	sendPending    bool
-	sendCompletion bool
-	sendN          int
-	sendErr        error
-	writeArmed     bool
-	writeShutdown  bool
+	sendBuffer             []byte
+	sendPending            bool
+	sendCompletion         bool
+	sendN                  int
+	sendErr                error
+	writeArmed             bool
+	writeShutdown          bool
+	writeShutdownRequested bool
 }
 
 type advancedUringOwnerSession struct {
@@ -1100,10 +1101,11 @@ func (loop *advancedUringOwnerLoop) maybeShutdownWrites(session *advancedUringOw
 		reader := &session.endpoint[readSide]
 		writeSide := 1 - readSide
 		writer := &session.endpoint[writeSide]
-		if !reader.readNotified || writer.writeShutdown || writer.sendPending || writer.sendCompletion {
+		if (!reader.readNotified && !writer.writeShutdownRequested) || writer.writeShutdown || writer.sendPending || writer.sendCompletion {
 			continue
 		}
 		writer.writeShutdown = true
+		writer.writeShutdownRequested = false
 		_ = unix.Shutdown(session.fds[writeSide], unix.SHUT_WR)
 	}
 }
@@ -1382,6 +1384,19 @@ func (conn *advancedUringOwnerConn) DisarmWrite() error {
 		return net.ErrClosed
 	}
 	conn.state().writeArmed = false
+	return nil
+}
+
+func (conn *advancedUringOwnerConn) ShutdownWrite() error {
+	if conn.session.closing || conn.session.closed {
+		return net.ErrClosed
+	}
+	endpoint := conn.state()
+	if endpoint.writeShutdown {
+		return nil
+	}
+	endpoint.writeShutdownRequested = true
+	conn.loop.maybeShutdownWrites(conn.session)
 	return nil
 }
 

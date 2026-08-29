@@ -25,6 +25,11 @@ type OwnerBodyCodec struct {
 	requestSize    crypto.ChunkSizeDecoder
 	requestPadding crypto.PaddingLengthGenerator
 
+	requestSizePrefix []byte
+	requestWire       []byte
+	requestWireSize   int
+	requestWirePad    int
+
 	responseAuth    crypto.Authenticator
 	responseSize    crypto.ChunkSizeEncoder
 	responsePadding crypto.PaddingLengthGenerator
@@ -116,22 +121,54 @@ func (s *ServerSession) NewOwnerBodyCodec(request *protocol.RequestHeader, reade
 }
 
 func (c *OwnerBodyCodec) readRequestRecord() ([]byte, error) {
-	sizeBytes := make([]byte, c.requestSize.SizeBytes())
-	if _, err := io.ReadFull(c.reader, sizeBytes); err != nil {
-		return nil, err
+	if c.requestWireSize == 0 {
+		sizeBytes, err := c.fillRequestWire(&c.requestSizePrefix, int(c.requestSize.SizeBytes()))
+		if err != nil {
+			return nil, err
+		}
+		wireSize, padding, done, err := c.DecodeRequestSize(sizeBytes)
+		c.requestSizePrefix = c.requestSizePrefix[:0]
+		if err != nil {
+			return nil, err
+		}
+		if done {
+			return nil, io.EOF
+		}
+		c.requestWireSize = wireSize
+		c.requestWirePad = padding
 	}
-	wireSize, padding, done, err := c.DecodeRequestSize(sizeBytes)
+
+	wire, err := c.fillRequestWire(&c.requestWire, c.requestWireSize)
 	if err != nil {
 		return nil, err
 	}
-	if done {
-		return nil, io.EOF
+	plaintext, err := c.OpenRequest(wire, c.requestWirePad)
+	c.requestWire = nil
+	c.requestWireSize = 0
+	c.requestWirePad = 0
+	return plaintext, err
+}
+
+// fillRequestWire retains bytes already consumed from the encrypted stream if
+// the short direct-dispatch sniff deadline expires between TCP fragments. The
+// next generic or owner-candidate read resumes the same VMess record boundary.
+func (c *OwnerBodyCodec) fillRequestWire(dst *[]byte, size int) ([]byte, error) {
+	if size <= 0 || len(*dst) > size {
+		return nil, io.ErrShortBuffer
 	}
-	wire := make([]byte, wireSize)
-	if _, err := io.ReadFull(c.reader, wire); err != nil {
+	if cap(*dst) < size {
+		grown := make([]byte, len(*dst), size)
+		copy(grown, *dst)
+		*dst = grown
+	}
+	start := len(*dst)
+	*dst = (*dst)[:size]
+	n, err := io.ReadFull(c.reader, (*dst)[start:])
+	*dst = (*dst)[:start+n]
+	if err != nil {
 		return nil, err
 	}
-	return c.OpenRequest(wire, padding)
+	return *dst, nil
 }
 
 // ReadMultiBuffer implements buf.Reader for routing sniffing and for the
@@ -147,6 +184,13 @@ func (c *OwnerBodyCodec) ReadMultiBuffer() (buf.MultiBuffer, error) {
 // RequestSizeBytes returns the exact encrypted record prefix length.
 func (c *OwnerBodyCodec) RequestSizeBytes() int {
 	return int(c.requestSize.SizeBytes())
+}
+
+// RequestTransferReady reports whether request parsing is exactly between
+// encrypted records. A partially consumed record remains on the generic codec
+// so its cryptographic size/nonce state cannot be split across two owners.
+func (c *OwnerBodyCodec) RequestTransferReady() bool {
+	return len(c.requestSizePrefix) == 0 && c.requestWireSize == 0 && len(c.requestWire) == 0
 }
 
 // DecodeRequestSize advances the masking/padding state exactly once. wireSize

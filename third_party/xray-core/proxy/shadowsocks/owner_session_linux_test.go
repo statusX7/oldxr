@@ -149,6 +149,8 @@ func (c *ownerTestConn) DisarmWrite() error {
 	return nil
 }
 
+func (*ownerTestConn) ShutdownWrite() error { return nil }
+
 func (c *ownerTestConn) Next(n int) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

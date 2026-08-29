@@ -36,6 +36,9 @@ func vmessOwnerConnection(conn stat.Connection, dispatcher routing.Dispatcher) (
 }
 
 func takeVMessOwnerPlaintext(reader buf.Reader, codec *encoding.OwnerBodyCodec) ([]byte, bool) {
+	if !codec.RequestTransferReady() {
+		return nil, false
+	}
 	if reader == codec {
 		return nil, true
 	}
@@ -130,6 +133,11 @@ func (s *ownerVMessSession) finishRead(role owner.Role) owner.Action {
 			return owner.None
 		}
 		s.inboundReadDone = true
+		if s.outbound != nil {
+			if err := s.outbound.ShutdownWrite(); err != nil {
+				return owner.Close
+			}
+		}
 		s.idle.SetTimeout(s.timeouts.DownlinkOnly)
 	} else {
 		if s.outboundReadDone {

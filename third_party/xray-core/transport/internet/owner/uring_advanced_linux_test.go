@@ -399,6 +399,184 @@ func TestAdvancedUringOwnerRelayHalfClose(t *testing.T) {
 	}
 }
 
+func TestAdvancedUringOwnerHalfCloseDrainsBackpressuredUploadAndPreservesReverseTraffic(t *testing.T) {
+	reactor, err := newAdvancedUringOwnerReactorSized(2, advancedUringOwnerTestEntries)
+	if advancedUringOwnerUnavailable(err) {
+		t.Skipf("advanced io_uring unavailable: %v", err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reactor.close()
+
+	inboundListener := listenAdvancedUringOwnerTCP(t)
+	defer inboundListener.Close()
+	targetListener := listenAdvancedUringOwnerTCP(t)
+	defer targetListener.Close()
+
+	client, err := net.DialTCP("tcp", nil, inboundListener.Addr().(*net.TCPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	inbound, err := inboundListener.AcceptTCP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbound, err := net.DialTCP("tcp", nil, targetListener.Addr().(*net.TCPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := targetListener.AcceptTCP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+
+	session := newAdvancedUringOwnerRelaySession()
+	if err := reactor.adoptPair(inbound, outbound, session); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-session.opened:
+	case <-time.After(3 * time.Second):
+		t.Fatal("owner session did not open")
+	}
+
+	request := bytes.Repeat([]byte("owner-backpressured-half-close-request-"), (64*1024*1024)/len("owner-backpressured-half-close-request-"))
+	responseChunk := bytes.Repeat([]byte("owner-reverse-stream-after-forward-eof-"), 256)
+	const responseChunks = 64
+	response := bytes.Repeat(responseChunk, responseChunks)
+
+	_ = client.SetDeadline(time.Now().Add(30 * time.Second))
+	_ = target.SetDeadline(time.Now().Add(30 * time.Second))
+	uploadDone := make(chan error, 1)
+	go func() {
+		if _, writeErr := io.Copy(client, bytes.NewReader(request)); writeErr != nil {
+			uploadDone <- writeErr
+			return
+		}
+		uploadDone <- client.CloseWrite()
+	}()
+
+	// Keep the target from reading long enough for the owner's outbound socket
+	// to become write-blocked. The client upload must still be pending here;
+	// otherwise this test did not exercise the intended state transition.
+	time.Sleep(250 * time.Millisecond)
+	select {
+	case writeErr := <-uploadDone:
+		if writeErr != nil {
+			t.Fatalf("upload failed before backpressure was released: %v", writeErr)
+		}
+		t.Fatal("upload completed before target released backpressure")
+	default:
+	}
+
+	targetDone := make(chan error, 1)
+	var targetStage atomic.Int32
+	var targetBytes atomic.Int64
+	go func() {
+		received := make([]byte, len(request))
+		for offset := 0; offset < len(received); {
+			readN, readErr := target.Read(received[offset:])
+			if readN > 0 {
+				offset += readN
+				targetBytes.Add(int64(readN))
+			}
+			if readErr != nil {
+				targetDone <- fmt.Errorf("read request at %d/%d: %w", offset, len(received), readErr)
+				return
+			}
+		}
+		if !bytes.Equal(received, request) {
+			targetDone <- fmt.Errorf("request mismatch: got=%d want=%d", len(received), len(request))
+			return
+		}
+		targetStage.Store(1)
+		var trailing [1]byte
+		if trailingN, trailingErr := target.Read(trailing[:]); trailingN != 0 || !errors.Is(trailingErr, io.EOF) {
+			targetDone <- fmt.Errorf("forward half-close: n=%d err=%v", trailingN, trailingErr)
+			return
+		}
+		targetStage.Store(2)
+		for chunk := 0; chunk < responseChunks; chunk++ {
+			if _, writeErr := target.Write(responseChunk); writeErr != nil {
+				targetDone <- fmt.Errorf("write response chunk %d: %w", chunk, writeErr)
+				return
+			}
+			if chunk%8 == 7 {
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+		targetStage.Store(3)
+		targetDone <- target.CloseWrite()
+	}()
+
+	received, err := io.ReadAll(client)
+	if err != nil {
+		uploadState := "pending"
+		select {
+		case uploadErr := <-uploadDone:
+			uploadState = fmt.Sprintf("complete err=%v", uploadErr)
+		default:
+		}
+		targetState := "pending"
+		select {
+		case targetErr := <-targetDone:
+			targetState = fmt.Sprintf("complete err=%v", targetErr)
+		default:
+		}
+		t.Fatalf(
+			"read reverse stream: %v; target_stage=%d target_bytes=%d/%d upload=%s target=%s owner_close=%v closes=%s recvs=%d sends=%d cancels=%d starvations=%d recoveries=%d inbound={armed:%t paused:%t cancel:%t eof:%t notified:%t buffered:%d send_pending:%t send_completion:%t pending_to_outbound:%d} outbound={armed:%t paused:%t cancel:%t eof:%t notified:%t buffered:%d send_pending:%t send_completion:%t pending_to_inbound:%d}",
+			err,
+			targetStage.Load(),
+			targetBytes.Load(),
+			len(request),
+			uploadState,
+			targetState,
+			session.closeErr,
+			advancedUringOwnerCloses.String(),
+			advancedUringOwnerRecvs.Value(),
+			advancedUringOwnerSends.Value(),
+			advancedUringOwnerCancels.Value(),
+			advancedUringOwnerStarvations.Value(),
+			advancedUringOwnerRecoveries.Value(),
+			session.conn[0].(*advancedUringOwnerConn).state().readArmed,
+			session.conn[0].(*advancedUringOwnerConn).state().readPaused,
+			session.conn[0].(*advancedUringOwnerConn).state().cancelPending,
+			session.conn[0].(*advancedUringOwnerConn).state().readEOF,
+			session.conn[0].(*advancedUringOwnerConn).state().readNotified,
+			session.conn[0].(*advancedUringOwnerConn).state().readBuffered,
+			session.conn[0].(*advancedUringOwnerConn).state().sendPending,
+			session.conn[0].(*advancedUringOwnerConn).state().sendCompletion,
+			len(session.pending[1]),
+			session.conn[1].(*advancedUringOwnerConn).state().readArmed,
+			session.conn[1].(*advancedUringOwnerConn).state().readPaused,
+			session.conn[1].(*advancedUringOwnerConn).state().cancelPending,
+			session.conn[1].(*advancedUringOwnerConn).state().readEOF,
+			session.conn[1].(*advancedUringOwnerConn).state().readNotified,
+			session.conn[1].(*advancedUringOwnerConn).state().readBuffered,
+			session.conn[1].(*advancedUringOwnerConn).state().sendPending,
+			session.conn[1].(*advancedUringOwnerConn).state().sendCompletion,
+			len(session.pending[0]),
+		)
+	}
+	if !bytes.Equal(received, response) {
+		t.Fatalf("reverse stream mismatch: got=%d want=%d", len(received), len(response))
+	}
+	if err := <-uploadDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-targetDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-session.closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("owner session did not close after both directions drained")
+	}
+}
+
 func TestAdvancedUringOwnerRepeatedRoundTrips(t *testing.T) {
 	reactor, err := newAdvancedUringOwnerReactorSized(2, advancedUringOwnerTestEntries)
 	if advancedUringOwnerUnavailable(err) {

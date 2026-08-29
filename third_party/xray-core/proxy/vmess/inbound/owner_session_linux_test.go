@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	stdnet "net"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/proxy/vmess"
 	"github.com/xtls/xray-core/proxy/vmess/encoding"
+	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/owner"
 )
 
@@ -30,6 +32,7 @@ type vmessOwnerTestConn struct {
 	tryLimit int
 	paused   bool
 	armed    bool
+	shutdown int
 	wakes    int
 	forced   int
 }
@@ -76,6 +79,13 @@ func (c *vmessOwnerTestConn) ArmWrite() error {
 func (c *vmessOwnerTestConn) DisarmWrite() error {
 	c.mu.Lock()
 	c.armed = false
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *vmessOwnerTestConn) ShutdownWrite() error {
+	c.mu.Lock()
+	c.shutdown++
 	c.mu.Unlock()
 	return nil
 }
@@ -442,5 +452,220 @@ func TestOwnerVMessSessionFinishesPartialTerminationBeforeClosingReadSide(t *tes
 		length := data.Len()
 		buf.ReleaseMulti(data)
 		t.Fatalf("termination read = (%d bytes, %v), want (0, EOF)", length, err)
+	}
+}
+
+type vmessOwnerIntegrationFlow struct {
+	released chan struct{}
+	once     sync.Once
+}
+
+func newVMessOwnerIntegrationFlow() *vmessOwnerIntegrationFlow {
+	return &vmessOwnerIntegrationFlow{released: make(chan struct{})}
+}
+
+func (*vmessOwnerIntegrationFlow) OwnerEligible() bool               { return true }
+func (*vmessOwnerIntegrationFlow) Acquire(int) (time.Duration, bool) { return 0, true }
+func (*vmessOwnerIntegrationFlow) AddUplink(int64)                   {}
+func (*vmessOwnerIntegrationFlow) AddDownlink(int64)                 {}
+func (f *vmessOwnerIntegrationFlow) Release() {
+	f.once.Do(func() { close(f.released) })
+}
+
+func listenVMessOwnerIntegrationTCP(t *testing.T) *stdnet.TCPListener {
+	t.Helper()
+	listener, err := stdnet.ListenTCP("tcp", &stdnet.TCPAddr{IP: stdnet.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	return listener
+}
+
+func TestOwnerVMessSessionProtocolEOFHalfClosesOutboundAndPreservesReverseTraffic(t *testing.T) {
+	for _, reactor := range []string{"gnet", "uring"} {
+		t.Run(reactor, func(t *testing.T) {
+			t.Setenv("XRAYR_SOCKET_OWNER_REACTOR", reactor)
+
+			inboundListener := listenVMessOwnerIntegrationTCP(t)
+			targetListener := listenVMessOwnerIntegrationTCP(t)
+			client, err := stdnet.DialTCP("tcp", nil, inboundListener.Addr().(*stdnet.TCPAddr))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			inbound, err := inboundListener.AcceptTCP()
+			if err != nil {
+				t.Fatal(err)
+			}
+			outbound, err := stdnet.DialTCP("tcp", nil, targetListener.Addr().(*stdnet.TCPAddr))
+			if err != nil {
+				t.Fatal(err)
+			}
+			target, err := targetListener.AcceptTCP()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer target.Close()
+
+			id := uuid.New()
+			account, err := (&vmess.Account{Id: id.String()}).AsAccount()
+			if err != nil {
+				t.Fatal(err)
+			}
+			user := &protocol.MemoryUser{Email: "owner-integration@example.com", Account: account}
+			request := &protocol.RequestHeader{
+				Version:  1,
+				User:     user,
+				Command:  protocol.RequestCommandTCP,
+				Address:  net.DomainAddress("example.com"),
+				Port:     443,
+				Security: protocol.SecurityType_AES128_GCM,
+				Option: protocol.RequestOptionChunkStream |
+					protocol.RequestOptionChunkMasking |
+					protocol.RequestOptionGlobalPadding |
+					protocol.RequestOptionAuthenticatedLength,
+			}
+
+			clientSession := encoding.NewClientSession(context.Background(), true, protocol.DefaultIDHash, 0)
+			var header bytes.Buffer
+			if err := clientSession.EncodeRequestHeader(request, &header); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.Write(header.Bytes()); err != nil {
+				t.Fatal(err)
+			}
+
+			validator := vmess.NewTimedUserValidator(protocol.DefaultIDHash)
+			defer common.Close(validator)
+			if err := validator.Add(user); err != nil {
+				t.Fatal(err)
+			}
+			history := encoding.NewSessionHistory()
+			defer common.Close(history)
+			serverSession := encoding.NewServerSession(validator, history)
+			serverSession.SetAEADForced(true)
+			requestReader := &buf.BufferedReader{Reader: buf.NewReader(inbound)}
+			decoded, err := serverSession.DecodeRequestHeader(requestReader, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			codec, err := serverSession.NewOwnerBodyCodec(decoded, requestReader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := codec.PrepareResponse(&protocol.ResponseHeader{}); err != nil {
+				t.Fatal(err)
+			}
+
+			flow := newVMessOwnerIntegrationFlow()
+			link := transport.NewDirectLink(nil, nil, nil)
+			ownerSession := newOwnerVMessSession(
+				codec,
+				link,
+				flow,
+				policy.Timeout{ConnectionIdle: 300 * time.Millisecond, UplinkOnly: 2 * time.Second, DownlinkOnly: 2 * time.Second},
+				nil,
+				codec.TakeEncryptedBuffered(),
+				nil,
+				nil,
+			)
+			if err := owner.AdoptPair(inbound, outbound, ownerSession); err != nil {
+				t.Fatalf("adopt %s owner: %v", reactor, err)
+			}
+
+			requestWriter, err := clientSession.EncodeRequestBody(request, client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var responseReader buf.Reader
+			gaps := []time.Duration{25 * time.Millisecond, 75 * time.Millisecond, 150 * time.Millisecond, 40 * time.Millisecond}
+			for iteration := 0; iteration < 16; iteration++ {
+				requestPayload := bytes.Repeat([]byte{byte(iteration + 1)}, 257+iteration*131)
+				if err := requestWriter.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(requestPayload)}); err != nil {
+					t.Fatalf("request burst %d: %v", iteration, err)
+				}
+				_ = target.SetReadDeadline(time.Now().Add(3 * time.Second))
+				received := make([]byte, len(requestPayload))
+				if _, err := io.ReadFull(target, received); err != nil {
+					t.Fatalf("target request burst %d: %v", iteration, err)
+				}
+				if !bytes.Equal(received, requestPayload) {
+					t.Fatalf("owner request burst %d mismatch", iteration)
+				}
+
+				responsePayload := bytes.Repeat([]byte{byte(255 - iteration)}, 193+iteration*97)
+				if _, err := target.Write(responsePayload); err != nil {
+					t.Fatalf("target response burst %d: %v", iteration, err)
+				}
+				_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+				if responseReader == nil {
+					if _, err := clientSession.DecodeResponseHeader(client); err != nil {
+						t.Fatal(err)
+					}
+					responseReader, err = clientSession.DecodeResponseBody(request, client)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				var response []byte
+				for len(response) < len(responsePayload) {
+					mb, readErr := responseReader.ReadMultiBuffer()
+					for _, part := range mb {
+						response = append(response, part.Bytes()...)
+					}
+					buf.ReleaseMulti(mb)
+					if readErr != nil {
+						t.Fatalf("client response burst %d: %v", iteration, readErr)
+					}
+				}
+				if !bytes.Equal(response, responsePayload) {
+					t.Fatalf("owner response burst %d mismatch: got %d want %d", iteration, len(response), len(responsePayload))
+				}
+				time.Sleep(gaps[iteration%len(gaps)])
+			}
+
+			// A VMess termination record ends the logical upload even though the
+			// client keeps its TCP read half open for the final response. The
+			// target must observe EOF exactly as it does through the stock pipe.
+			if err := requestWriter.WriteMultiBuffer(nil); err != nil {
+				t.Fatal(err)
+			}
+			_ = target.SetReadDeadline(time.Now().Add(time.Second))
+			one := make([]byte, 1)
+			if n, err := target.Read(one); n != 0 || err != io.EOF {
+				t.Fatalf("target read after VMess protocol EOF = (%d, %v), want (0, EOF)", n, err)
+			}
+
+			finalResponse := bytes.Repeat([]byte("reverse-after-upload-eof-"), 193)
+			if _, err := target.Write(finalResponse); err != nil {
+				t.Fatal(err)
+			}
+			if err := target.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			var response []byte
+			for {
+				mb, readErr := responseReader.ReadMultiBuffer()
+				for _, part := range mb {
+					response = append(response, part.Bytes()...)
+				}
+				buf.ReleaseMulti(mb)
+				if readErr != nil {
+					if readErr != io.EOF {
+						t.Fatal(readErr)
+					}
+					break
+				}
+			}
+			if !bytes.Equal(response, finalResponse) {
+				t.Fatalf("reverse payload mismatch: got %d want %d", len(response), len(finalResponse))
+			}
+			select {
+			case <-flow.released:
+			case <-time.After(3 * time.Second):
+				t.Fatal("owner VMess flow was not released")
+			}
+		})
 	}
 }

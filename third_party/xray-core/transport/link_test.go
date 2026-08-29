@@ -1,6 +1,8 @@
 package transport
 
 import (
+	"io"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -55,5 +57,48 @@ func TestDirectLinkTakeFlowTransfersRelease(t *testing.T) {
 	taken.Release()
 	if got := flow.releases.Load(); got != 1 {
 		t.Fatalf("transferred flow releases = %d, want 1", got)
+	}
+}
+
+func TestDirectLinkCloseWritePreservesReverseTraffic(t *testing.T) {
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	peer, err := net.DialTCP("tcp", nil, listener.Addr().(*net.TCPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	direct, err := listener.AcceptTCP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer direct.Close()
+
+	link := NewDirectLink(nil, nil, direct.Close)
+	link.SetConnection(direct, nil, nil)
+	if err := link.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+	buffer := make([]byte, 1)
+	if n, err := peer.Read(buffer); n != 0 || err != io.EOF {
+		t.Fatalf("peer read after direct half-close = (%d, %v), want (0, EOF)", n, err)
+	}
+
+	response := []byte("reverse-remains-open")
+	if _, err := peer.Write(response); err != nil {
+		t.Fatal(err)
+	}
+	_ = direct.SetReadDeadline(time.Now().Add(time.Second))
+	received := make([]byte, len(response))
+	if _, err := io.ReadFull(direct, received); err != nil {
+		t.Fatal(err)
+	}
+	if string(received) != string(response) {
+		t.Fatalf("reverse payload = %q, want %q", received, response)
 	}
 }

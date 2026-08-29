@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 
 	"github.com/panjf2000/gnet/v2"
+	"golang.org/x/sys/unix"
 )
 
 // Role identifies one endpoint of an owned relay pair.
@@ -47,8 +48,56 @@ type Conn interface {
 	ResumeRead() error
 	ArmWrite() error
 	DisarmWrite() error
+	ShutdownWrite() error
 	Wake(gnet.AsyncCallback) error
 	Close() error
+}
+
+type gnetOwnerConn struct {
+	gnet.Conn
+	control interface {
+		TryWrite([]byte) (int, error)
+		SuspendRead() error
+		ResumeRead() error
+		ArmWrite() error
+		DisarmWrite() error
+	}
+}
+
+func (c *gnetOwnerConn) TryWrite(payload []byte) (int, error) {
+	return c.control.TryWrite(payload)
+}
+
+func (c *gnetOwnerConn) SuspendRead() error { return c.control.SuspendRead() }
+func (c *gnetOwnerConn) ResumeRead() error  { return c.control.ResumeRead() }
+func (c *gnetOwnerConn) ArmWrite() error    { return c.control.ArmWrite() }
+func (c *gnetOwnerConn) DisarmWrite() error { return c.control.DisarmWrite() }
+
+func (c *gnetOwnerConn) ShutdownWrite() error {
+	if c == nil || c.Conn == nil {
+		return net.ErrClosed
+	}
+	if err := unix.Shutdown(c.Fd(), unix.SHUT_WR); err != nil {
+		return os.NewSyscallError("shutdown", err)
+	}
+	return nil
+}
+
+func wrapGnetOwnerConn(conn gnet.Conn) Conn {
+	if conn == nil {
+		return nil
+	}
+	control, ok := conn.(interface {
+		TryWrite([]byte) (int, error)
+		SuspendRead() error
+		ResumeRead() error
+		ArmWrite() error
+		DisarmWrite() error
+	})
+	if !ok {
+		return nil
+	}
+	return &gnetOwnerConn{Conn: conn, control: control}
 }
 
 var protocolPendingWakeCallback gnet.AsyncCallback = func(gnet.Conn, error) error { return nil }
@@ -90,12 +139,9 @@ type eventHandler struct {
 }
 
 func (eventHandler) OnOpen(conn gnet.Conn) ([]byte, gnet.Action) {
-	owned, ok := conn.(Conn)
-	if !ok {
-		return nil, gnet.Close
-	}
+	owned := wrapGnetOwnerConn(conn)
 	endpoint, ok := conn.Context().(*endpoint)
-	if !ok || endpoint.session == nil {
+	if owned == nil || !ok || endpoint.session == nil {
 		return nil, gnet.Close
 	}
 	endpoint.session.OnOpen(endpoint.role, owned)
@@ -103,45 +149,36 @@ func (eventHandler) OnOpen(conn gnet.Conn) ([]byte, gnet.Action) {
 }
 
 func (eventHandler) OnTraffic(conn gnet.Conn) gnet.Action {
-	owned, ok := conn.(Conn)
-	if !ok {
-		return gnet.Close
-	}
+	owned := wrapGnetOwnerConn(conn)
 	endpoint, ok := conn.Context().(*endpoint)
-	if !ok || endpoint.session == nil {
+	if owned == nil || !ok || endpoint.session == nil {
 		return gnet.Close
 	}
 	return endpoint.session.OnTraffic(endpoint.role, owned)
 }
 
 func (eventHandler) OnReadClosed(conn gnet.Conn) gnet.Action {
-	owned, ok := conn.(Conn)
-	if !ok {
-		return gnet.Close
-	}
+	owned := wrapGnetOwnerConn(conn)
 	endpoint, ok := conn.Context().(*endpoint)
-	if !ok || endpoint.session == nil {
+	if owned == nil || !ok || endpoint.session == nil {
 		return gnet.Close
 	}
 	return endpoint.session.OnReadClosed(endpoint.role, owned)
 }
 
 func (eventHandler) OnWritable(conn gnet.Conn) gnet.Action {
-	owned, ok := conn.(Conn)
-	if !ok {
-		return gnet.Close
-	}
+	owned := wrapGnetOwnerConn(conn)
 	endpoint, ok := conn.Context().(*endpoint)
-	if !ok || endpoint.session == nil {
+	if owned == nil || !ok || endpoint.session == nil {
 		return gnet.Close
 	}
 	return endpoint.session.OnWritable(endpoint.role, owned)
 }
 
 func (eventHandler) OnClose(conn gnet.Conn, err error) gnet.Action {
-	owned, ownedOK := conn.(Conn)
+	owned := wrapGnetOwnerConn(conn)
 	endpoint, ok := conn.Context().(*endpoint)
-	if ownedOK && ok && endpoint.session != nil {
+	if owned != nil && ok && endpoint.session != nil {
 		endpoint.session.OnClose(endpoint.role, owned, err)
 	}
 	return gnet.None
