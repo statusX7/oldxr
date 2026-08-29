@@ -189,15 +189,21 @@ stop_count_after="$(grep -c '^stop XrayR$' "${systemctl_log}" || true)"
 }
 cp "${pristine_archive}" "${release_root}/${release_version}/${archive_name}"
 
-prepare_v102_legacy_default() {
+prepare_known_connectivity_default() {
     local root="$1"
+    local installed_version="${2:-v1.0.2}"
+    local handshake="${3:-4}"
+    local idle="${4:-30}"
+    local uplink="${5:-2}"
+    local downlink="${6:-4}"
+    local buffer="${7:-64}"
     mkdir -p "${root}/usr/local/XrayR" "${root}/etc/XrayR" "${root}/etc/systemd/system" "${root}/usr/bin"
-    cat > "${root}/usr/local/XrayR/XrayR" <<'OLD_BINARY'
+    cat > "${root}/usr/local/XrayR/XrayR" <<OLD_BINARY
 #!/usr/bin/env bash
-echo 'XrayR 1.0.2'
+echo 'XrayR ${installed_version#v}'
 OLD_BINARY
     chmod +x "${root}/usr/local/XrayR/XrayR"
-    printf 'v1.0.2\n' > "${root}/usr/local/XrayR/.oldxr-release"
+    printf '%s\n' "${installed_version}" > "${root}/usr/local/XrayR/.oldxr-release"
     cat > "${root}/usr/bin/XrayR" <<'OLD_MANAGER'
 #!/usr/bin/env bash
 # statusX7/oldxr
@@ -208,14 +214,14 @@ OLD_MANAGER
 [Service]
 ExecStart=/usr/local/XrayR/XrayR --config /etc/XrayR/config.yml
 OLD_SERVICE
-    cat > "${root}/etc/XrayR/config.yml" <<'OLD_CONFIG'
-# oldxr 1C/1GiB高连接默认模板：10000配置用户、1000在线、3000 TCP实测。
+    cat > "${root}/etc/XrayR/config.yml" <<OLD_CONFIG
+# known oldxr connectivity default
 ConnectionConfig:
-  Handshake: 4 # legacy
-  ConnIdle: 120 # legacy
-  UplinkOnly: 0 # legacy
-  DownlinkOnly: 0 # legacy
-  BufferSize: 8 # legacy
+  Handshake: ${handshake} # legacy
+  ConnIdle: ${idle} # legacy
+  UplinkOnly: ${uplink} # legacy
+  DownlinkOnly: ${downlink} # legacy
+  BufferSize: ${buffer} # legacy
 Nodes:
   - PanelType: V2board
     ApiConfig:
@@ -223,7 +229,7 @@ Nodes:
       ApiKey: USER-PRESERVED
       NodeID: 41
       NodeType: V2ray
-      Timeout: 5 # legacy
+      Timeout: 5 # user value must remain unchanged
     ControllerConfig:
       CertConfig:
         CertMode: none
@@ -233,7 +239,7 @@ OLD_CONFIG
     touch "${root}/systemctl-active"
 }
 
-run_v102_migration() {
+run_connectivity_migration() {
     local root="$1"
     local fail_once="${2:-}"
     env \
@@ -252,39 +258,54 @@ run_v102_migration() {
 
 echo "执行v1.0.2旧默认连接参数定向迁移"
 migration_root="${test_root}/migration-root"
-prepare_v102_legacy_default "${migration_root}"
+prepare_known_connectivity_default "${migration_root}"
 migration_mode_before="$(stat -c '%a' "${migration_root}/etc/XrayR/config.yml")"
 migration_owner_before="$(stat -c '%u:%g' "${migration_root}/etc/XrayR/config.yml")"
 route_hash_before="$(sha256sum "${migration_root}/etc/XrayR/route.json" | awk '{print $1}')"
-migration_output="$(run_v102_migration "${migration_root}")"
-grep -F '已将v1.0.2旧默认连接参数安全迁移为v1.0.3稳定值' <<<"${migration_output}" >/dev/null
+migration_output="$(run_connectivity_migration "${migration_root}")"
+grep -F '已将v1.0.2-source-default连接参数迁移为v1.0.3稳定值' <<<"${migration_output}" >/dev/null
 grep -Eq '^[[:space:]]*Handshake:[[:space:]]*8([[:space:]]|$)' "${migration_root}/etc/XrayR/config.yml"
 grep -Eq '^[[:space:]]*ConnIdle:[[:space:]]*21600([[:space:]]|$)' "${migration_root}/etc/XrayR/config.yml"
-grep -Eq '^[[:space:]]*UplinkOnly:[[:space:]]*2([[:space:]]|$)' "${migration_root}/etc/XrayR/config.yml"
-grep -Eq '^[[:space:]]*DownlinkOnly:[[:space:]]*4([[:space:]]|$)' "${migration_root}/etc/XrayR/config.yml"
+grep -Eq '^[[:space:]]*UplinkOnly:[[:space:]]*300([[:space:]]|$)' "${migration_root}/etc/XrayR/config.yml"
+grep -Eq '^[[:space:]]*DownlinkOnly:[[:space:]]*300([[:space:]]|$)' "${migration_root}/etc/XrayR/config.yml"
 grep -Eq '^[[:space:]]*BufferSize:[[:space:]]*256([[:space:]]|$)' "${migration_root}/etc/XrayR/config.yml"
-grep -Eq '^[[:space:]]{6}Timeout:[[:space:]]*30([[:space:]]|$)' "${migration_root}/etc/XrayR/config.yml"
+grep -Eq '^[[:space:]]{6}Timeout:[[:space:]]*5([[:space:]]|$)' "${migration_root}/etc/XrayR/config.yml"
 grep -F 'ApiKey: USER-PRESERVED' "${migration_root}/etc/XrayR/config.yml" >/dev/null
 [[ "${migration_mode_before}" == "$(stat -c '%a' "${migration_root}/etc/XrayR/config.yml")" ]]
 [[ "${migration_owner_before}" == "$(stat -c '%u:%g' "${migration_root}/etc/XrayR/config.yml")" ]]
 [[ "${route_hash_before}" == "$(sha256sum "${migration_root}/etc/XrayR/route.json" | awk '{print $1}')" ]]
 migration_backup="$(find "${migration_root}/etc/XrayR/backups" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
-grep -Eq '^[[:space:]]*ConnIdle:[[:space:]]*120([[:space:]]|$)' "${migration_backup}/files/etc/XrayR/config.yml"
+grep -Eq '^[[:space:]]*ConnIdle:[[:space:]]*30([[:space:]]|$)' "${migration_backup}/files/etc/XrayR/config.yml"
+
+echo "执行v1.0.2安装器旧默认连接参数定向迁移"
+migration_installer_root="${test_root}/migration-installer-root"
+prepare_known_connectivity_default "${migration_installer_root}" v1.0.2 4 120 0 0 8
+migration_installer_output="$(run_connectivity_migration "${migration_installer_root}")"
+grep -F '已将v1.0.2-installer-default连接参数迁移为v1.0.3稳定值' <<<"${migration_installer_output}" >/dev/null
+grep -Eq '^[[:space:]]*UplinkOnly:[[:space:]]*300([[:space:]]|$)' "${migration_installer_root}/etc/XrayR/config.yml"
+
+echo "执行既有v1.0.3默认连接参数替换迁移"
+migration_v103_root="${test_root}/migration-v103-root"
+prepare_known_connectivity_default "${migration_v103_root}" v1.0.3 8 21600 2 4 256
+migration_v103_output="$(run_connectivity_migration "${migration_v103_root}")"
+grep -F '已将v1.0.3-prior-default连接参数迁移为v1.0.3稳定值' <<<"${migration_v103_output}" >/dev/null
+grep -Eq '^[[:space:]]*UplinkOnly:[[:space:]]*300([[:space:]]|$)' "${migration_v103_root}/etc/XrayR/config.yml"
+grep -Eq '^[[:space:]]*DownlinkOnly:[[:space:]]*300([[:space:]]|$)' "${migration_v103_root}/etc/XrayR/config.yml"
 
 echo "执行v1.0.2自定义配置不迁移保护"
 migration_custom_root="${test_root}/migration-custom-root"
-prepare_v102_legacy_default "${migration_custom_root}"
-sed -i '1s/.*/# USER-MANAGED-CONFIG/' "${migration_custom_root}/etc/XrayR/config.yml"
+prepare_known_connectivity_default "${migration_custom_root}"
+sed -i -E 's/^([[:space:]]*ConnIdle:)[[:space:]]*30/\1 31/' "${migration_custom_root}/etc/XrayR/config.yml"
 migration_custom_hash="$(sha256sum "${migration_custom_root}/etc/XrayR/config.yml" | awk '{print $1}')"
-run_v102_migration "${migration_custom_root}" >/dev/null
+run_connectivity_migration "${migration_custom_root}" >/dev/null
 [[ "${migration_custom_hash}" == "$(sha256sum "${migration_custom_root}/etc/XrayR/config.yml" | awk '{print $1}')" ]]
 
 echo "执行v1.0.2迁移后启动失败自动回滚"
 migration_rollback_root="${test_root}/migration-rollback-root"
-prepare_v102_legacy_default "${migration_rollback_root}"
+prepare_known_connectivity_default "${migration_rollback_root}"
 migration_hash_before="$(sha256sum "${migration_rollback_root}/etc/XrayR/config.yml" | awk '{print $1}')"
 touch "${migration_rollback_root}/fail-once"
-if run_v102_migration "${migration_rollback_root}" "${migration_rollback_root}/fail-once" >/dev/null 2>&1; then
+if run_connectivity_migration "${migration_rollback_root}" "${migration_rollback_root}/fail-once" >/dev/null 2>&1; then
     echo "错误：迁移后启动失败未触发回滚。" >&2
     exit 1
 fi
