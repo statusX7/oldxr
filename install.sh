@@ -11,6 +11,9 @@ plain='\033[0m'
 REPO="statusX7/oldxr"
 CURRENT_V1="v1.0.2"
 RELEASE_BASE="${OLDXR_RELEASE_BASE:-https://github.com/${REPO}/releases/download}"
+DEFAULT_CONFIG_COMMIT="be6995621ea95229e2674bd5575f21852d96e00a"
+DEFAULT_CONFIG_SHA256="52c98378453b227412f8d59df4d144cf750172a629a5ea6d98c940ece3633849"
+DEFAULT_CONFIG_URL="${OLDXR_DEFAULT_CONFIG_URL:-https://raw.githubusercontent.com/${REPO}/${DEFAULT_CONFIG_COMMIT}/main/config.yml.example}"
 INSTALL_ROOT="${OLDXR_INSTALL_ROOT:-}"
 SYSTEMCTL_BIN="${OLDXR_SYSTEMCTL_BIN:-systemctl}"
 SKIP_BASE_INSTALL="${OLDXR_SKIP_BASE_INSTALL:-0}"
@@ -480,6 +483,27 @@ download_and_verify_release() {
     echo "Release SHA256：${actual_sha}"
 }
 
+stage_fresh_default_config() {
+    local downloaded_config
+    local actual_sha
+
+    if [[ ${had_runtime} -ne 0 || ${had_config} -ne 0 || ${had_install_dir} -ne 0 ]]; then
+        echo "检测到现有安装或配置，保留用户 config.yml。"
+        return
+    fi
+
+    downloaded_config="${temp_dir}/default-config.yml"
+    echo "下载经过校验的新装默认配置：${DEFAULT_CONFIG_COMMIT}"
+    download_file "${DEFAULT_CONFIG_URL}" "${downloaded_config}"
+    actual_sha="$(sha256sum "${downloaded_config}" | awk '{print $1}')"
+    [[ "${actual_sha}" == "${DEFAULT_CONFIG_SHA256}" ]] || {
+        echo -e "${red}错误：${plain}新装默认配置 SHA256 不匹配，服务尚未停止。" >&2
+        exit 1
+    }
+    cp -f -- "${downloaded_config}" "${stage_dir}/config.yml"
+    echo "新装默认配置 SHA256：${actual_sha}"
+}
+
 prepare_candidate() {
     candidate_dir="${INSTALL_DIR}.new.$$"
     immediate_backup_dir="${INSTALL_DIR}.previous.$$"
@@ -590,6 +614,7 @@ rollback_install() {
 
 install_release() {
     detect_existing_install
+    stage_fresh_default_config
     collect_user_paths
     backup_existing_install
     prepare_candidate

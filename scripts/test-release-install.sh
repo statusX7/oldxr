@@ -8,6 +8,8 @@ fi
 
 archive="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 install_script="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
+repo_root="$(cd "$(dirname "${install_script}")" && pwd)"
+default_config="${repo_root}/main/config.yml.example"
 archive_name="$(basename "${archive}")"
 checksum="${archive}.sha256"
 release_version="$(sed -n 's/^CURRENT_V1="\([^"]*\)"/\1/p' "${install_script}")"
@@ -16,7 +18,7 @@ if [[ ! "${release_version}" =~ ^v1\.0\.[0-9]+$ ]]; then
     echo "错误：无法从 install.sh 解析 v1.0.x Release。" >&2
     exit 1
 fi
-for required in "${archive}" "${checksum}" "${install_script}"; do
+for required in "${archive}" "${checksum}" "${install_script}" "${default_config}"; do
     [[ -f "${required}" ]] || { echo "错误：测试输入不存在：${required}" >&2; exit 1; }
 done
 
@@ -57,9 +59,35 @@ esac
 MOCK
 chmod +x "${mock_systemctl}"
 
+bad_config="${test_root}/bad-default-config.yml"
+bad_install_root="${test_root}/bad-config-root"
+cp "${default_config}" "${bad_config}"
+printf '\n# CHECKSUM-MISMATCH\n' >> "${bad_config}"
+echo "执行新装默认配置 checksum 停服前保护"
+if env \
+    OLDXR_RELEASE_BASE="file://${release_root}" \
+    OLDXR_DEFAULT_CONFIG_URL="file://${bad_config}" \
+    OLDXR_INSTALL_ROOT="${bad_install_root}" \
+    OLDXR_SKIP_BASE_INSTALL=1 \
+    OLDXR_HEALTH_WAIT_SECONDS=0 \
+    OLDXR_SYSTEMCTL_BIN="${mock_systemctl}" \
+    OLDXR_SYSTEMCTL_STATE="${test_root}/bad-config-systemctl-active" \
+    OLDXR_SYSTEMCTL_LOG="${test_root}/bad-config-systemctl.log" \
+    OLDXR_ARCH=amd64 \
+    bash "${install_script}" "${release_version#v}" >/dev/null 2>&1; then
+    echo "错误：被篡改的新装默认配置未被 SHA256 拒绝。" >&2
+    exit 1
+fi
+[[ ! -e "${bad_install_root}/usr/local/XrayR" ]]
+if [[ -f "${test_root}/bad-config-systemctl.log" ]] && grep -Fx "stop XrayR" "${test_root}/bad-config-systemctl.log" >/dev/null; then
+    echo "错误：默认配置校验失败后服务已被停止。" >&2
+    exit 1
+fi
+
 run_installer() {
     env \
         OLDXR_RELEASE_BASE="file://${release_root}" \
+        OLDXR_DEFAULT_CONFIG_URL="file://${default_config}" \
         OLDXR_INSTALL_ROOT="${install_root}" \
         OLDXR_SKIP_BASE_INSTALL=1 \
         OLDXR_HEALTH_WAIT_SECONDS=0 \
@@ -108,6 +136,12 @@ if grep -Fx "start XrayR" "${systemctl_log}" >/dev/null; then
     exit 1
 fi
 
+cmp -s "${default_config}" "${install_root}/etc/XrayR/config.yml" || {
+    echo "错误：fresh install 未采用固定的新装默认配置。" >&2
+    exit 1
+}
+
+printf '\n# USER-PRESERVED-SENTINEL\n' >> "${install_root}/etc/XrayR/config.yml"
 config_hash_before="$(sha256sum "${install_root}/etc/XrayR/config.yml" | awk '{print $1}')"
 touch "${systemctl_state}"
 echo "执行 ${release_version} 事务更新"

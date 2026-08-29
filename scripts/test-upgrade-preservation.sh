@@ -182,6 +182,7 @@ run_installer() {
     local root="${test_root}/${name}"
     env \
         OLDXR_RELEASE_BASE="file://${release_root}" \
+        OLDXR_DEFAULT_CONFIG_URL="file://${test_root}/must-not-be-downloaded" \
         OLDXR_INSTALL_ROOT="${root}" \
         OLDXR_SKIP_BASE_INSTALL=1 \
         OLDXR_HEALTH_WAIT_SECONDS=0 \
