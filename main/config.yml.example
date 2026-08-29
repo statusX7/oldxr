@@ -12,8 +12,8 @@ OutboundConfigPath: # /etc/XrayR/custom_outbound.json # Path to custom outbound 
 ConnectionConfig:
   Handshake: 8 # 极端重连下保留认证余量，单位秒
   ConnIdle: 21600 # 静默长连接至少保留6小时，避免RDP/WebSocket过早回收
-  UplinkOnly: 2 # 下行结束后保留安全的half-close窗口，单位秒
-  DownlinkOnly: 4 # 上行结束后允许尾部响应完整返回，单位秒
+  UplinkOnly: 300 # 下行结束后保留5分钟half-close窗口，避免远程桌面尾部数据被截断
+  DownlinkOnly: 300 # 上行结束后保留5分钟响应窗口，兼容长响应和连接迁移
   BufferSize: 256 # AWS单入口、1C/1GiB、3000 TCP三轮实测CPU最低点，单位kB
 Nodes:
   -
