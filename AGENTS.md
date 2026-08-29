@@ -57,6 +57,12 @@
 - 最终soak最低：Debian 11 6小时、Ubuntu 20.04 2小时、Debian 12 2小时；持续采集RSS/heap/object/goroutine/FD/open connection斜率。
 - Release至少构建`linux/amd64`与`linux/arm64`单Go二进制ZIP；Docker不属于本产品部署、性能或Release Gate。
 
+## 公开安全披露
+
+- GitHub README、Release notes、公开 issue 回复和公开资产说明只写必要的高层安全维护结论。未经用户针对该次披露明确授权，不得公开列出具体漏洞、CVE/CWE、受影响函数或依赖、数量、触发条件、利用方式、PoC、验证过程或风险细节。
+- 完整安全问题、验证过程、修复细节、未解决风险和例外依据必须写入带 `artifact version` 的本地/内部报告，并继续作为 Release Gate；减少公开披露不得弱化内部审计，也不得把内部 FAIL 改写成 PASS。
+- 公开内容需要提示升级时，可使用“包含安全与稳定性维护，请及时升级”等不暴露细节的高层表述。
+
 ## Git、报告与交流
 
 - oldxr 唯一允许使用的 GitHub 仓库是 `https://github.com/statusX7/oldxr`。
@@ -66,6 +72,8 @@
 - 任何与 oldxr 无关的 GitHub 仓库均不在操作范围内，禁止修改、删除、重命名或迁移。
 - 不force push，不重写/删除历史tag；实验只在独立branch，Gate通过前不merge main/master。
 - Git commit message保持英文，每个commit只解决一个逻辑问题。
-- 性能、pprof、perf、内部研究、审计和升级报告只写入`/root/projects/oldxr-reports/go-v1/`，不得提交GitHub。
+- 性能、pprof、perf、内部研究、审计和升级报告只写入`/root/projects/oldxr-reports/`的对应版本化目录，不得提交GitHub。
+- 每个阶段必须先定义唯一 `artifact version`，格式为 `v<产品版本>-r<修订号>-p<提示词号>`，例如 `v1.0.3-r2-p01`。目录、每个 Markdown 文件以及 binary、archive、profile、raw log、fixture manifest 等主要产物的名称都必须包含该完整版本；不得只依赖自然语言标题、时间戳或目录上下文区分。
+- 推荐目录格式为 `/root/projects/oldxr-reports/<artifact-version>-<phase>/`，文件格式为 `<TYPE>-<artifact-version>.md`；同一输入下的重复测试再追加 `-runNN`，不得覆盖旧证据。
 - GitHub只保留production source、必要tests/fixtures、build/install scripts、AGENTS与极简README。
 - 所有用户可见交流和本地人类可读报告使用简体中文；代码标识符、配置key、路径、命令、API字段和commit message保持英文。
