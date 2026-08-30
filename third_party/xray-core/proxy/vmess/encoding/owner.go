@@ -21,19 +21,24 @@ type OwnerBodyCodec struct {
 	request *protocol.RequestHeader
 	reader  *buf.BufferedReader
 
-	requestAuth    crypto.Authenticator
-	requestSize    crypto.ChunkSizeDecoder
-	requestPadding crypto.PaddingLengthGenerator
+	requestAuth      crypto.Authenticator
+	requestSize      crypto.ChunkSizeDecoder
+	requestPadding   crypto.PaddingLengthGenerator
+	requestOverhead  int
+	requestSizeBytes int
 
-	responseAuth    crypto.Authenticator
-	responseSize    crypto.ChunkSizeEncoder
-	responsePadding crypto.PaddingLengthGenerator
-	responseHeader  []byte
-	responseStarted bool
-	responseEnd     bool
-	responsePrefix  [18]byte
-	paddingEntropy  []byte
-	paddingOffset   int
+	responseAuth       crypto.Authenticator
+	responseSize       crypto.ChunkSizeEncoder
+	responsePadding    crypto.PaddingLengthGenerator
+	responseOverhead   int
+	responseSizeBytes  int
+	responseMaxPayload int
+	responseHeader     []byte
+	responseStarted    bool
+	responseEnd        bool
+	responsePrefix     [18]byte
+	paddingEntropy     []byte
+	paddingOffset      int
 }
 
 const ownerPaddingEntropySize = 4 * 1024
@@ -105,18 +110,20 @@ func (s *ServerSession) NewOwnerBodyCodec(request *protocol.RequestHeader, reade
 		return nil, newError("invalid VMess owner account")
 	}
 	return &OwnerBodyCodec{
-		session:        s,
-		request:        request,
-		reader:         reader,
-		requestAuth:    auth,
-		requestSize:    sizeParser,
-		requestPadding: padding,
-		responseEnd:    !account.NoTerminationSignal,
+		session:          s,
+		request:          request,
+		reader:           reader,
+		requestAuth:      auth,
+		requestSize:      sizeParser,
+		requestPadding:   padding,
+		requestOverhead:  auth.Overhead(),
+		requestSizeBytes: int(sizeParser.SizeBytes()),
+		responseEnd:      !account.NoTerminationSignal,
 	}, nil
 }
 
 func (c *OwnerBodyCodec) readRequestRecord() ([]byte, error) {
-	sizeBytes := make([]byte, c.requestSize.SizeBytes())
+	sizeBytes := make([]byte, c.requestSizeBytes)
 	if _, err := io.ReadFull(c.reader, sizeBytes); err != nil {
 		return nil, err
 	}
@@ -146,13 +153,13 @@ func (c *OwnerBodyCodec) ReadMultiBuffer() (buf.MultiBuffer, error) {
 
 // RequestSizeBytes returns the exact encrypted record prefix length.
 func (c *OwnerBodyCodec) RequestSizeBytes() int {
-	return int(c.requestSize.SizeBytes())
+	return c.requestSizeBytes
 }
 
 // DecodeRequestSize advances the masking/padding state exactly once. wireSize
 // includes ciphertext authentication overhead and clear-text padding.
 func (c *OwnerBodyCodec) DecodeRequestSize(sizeBytes []byte) (wireSize int, padding int, done bool, err error) {
-	if len(sizeBytes) != int(c.requestSize.SizeBytes()) {
+	if len(sizeBytes) != c.requestSizeBytes {
 		return 0, 0, false, io.ErrUnexpectedEOF
 	}
 	if c.requestPadding != nil {
@@ -162,10 +169,10 @@ func (c *OwnerBodyCodec) DecodeRequestSize(sizeBytes []byte) (wireSize int, padd
 	if err != nil {
 		return 0, 0, false, err
 	}
-	if int(size) == c.requestAuth.Overhead()+padding {
+	if int(size) == c.requestOverhead+padding {
 		return int(size), padding, true, nil
 	}
-	if int(size) <= c.requestAuth.Overhead()+padding || int(size) > buf.Size {
+	if int(size) <= c.requestOverhead+padding || int(size) > buf.Size {
 		return 0, 0, false, io.ErrUnexpectedEOF
 	}
 	return int(size), padding, false, nil
@@ -173,7 +180,7 @@ func (c *OwnerBodyCodec) DecodeRequestSize(sizeBytes []byte) (wireSize int, padd
 
 // OpenRequest authenticates one complete encrypted VMess record.
 func (c *OwnerBodyCodec) OpenRequest(wire []byte, padding int) ([]byte, error) {
-	if padding < 0 || len(wire) <= padding+c.requestAuth.Overhead() {
+	if padding < 0 || len(wire) <= padding+c.requestOverhead {
 		return nil, io.ErrUnexpectedEOF
 	}
 	return c.requestAuth.Open(wire[:0], wire[:len(wire)-padding])
@@ -235,15 +242,18 @@ func (c *OwnerBodyCodec) PrepareResponse(response *protocol.ResponseHeader) erro
 	c.responseAuth = auth
 	c.responseSize = sizeParser
 	c.responsePadding = padding
+	c.responseOverhead = auth.Overhead()
+	c.responseSizeBytes = int(sizeParser.SizeBytes())
+	maxPadding := 0
+	if padding != nil {
+		maxPadding = int(padding.MaxPaddingLen())
+	}
+	c.responseMaxPayload = buf.Size - c.responseOverhead - c.responseSizeBytes - maxPadding
 	return nil
 }
 
 func (c *OwnerBodyCodec) responsePayloadLimit() int {
-	maxPadding := 0
-	if c.responsePadding != nil {
-		maxPadding = int(c.responsePadding.MaxPaddingLen())
-	}
-	return buf.Size - c.responseAuth.Overhead() - int(c.responseSize.SizeBytes()) - maxPadding
+	return c.responseMaxPayload
 }
 
 func (c *OwnerBodyCodec) startResponse(dst []byte) []byte {
@@ -280,8 +290,8 @@ func (c *OwnerBodyCodec) SealResponseRecord(dst, plaintext []byte) ([]byte, erro
 	if c.responsePadding != nil {
 		padding = int(c.responsePadding.NextPaddingLen())
 	}
-	wireSize := len(plaintext) + c.responseAuth.Overhead() + padding
-	prefix := c.responsePrefix[:c.responseSize.SizeBytes()]
+	wireSize := len(plaintext) + c.responseOverhead + padding
+	prefix := c.responsePrefix[:c.responseSizeBytes]
 	c.responseSize.Encode(uint16(wireSize), prefix)
 	dst = append(dst, prefix...)
 	var err error
@@ -337,9 +347,9 @@ func (c *OwnerBodyCodec) SealResponseEnd(dst []byte) ([]byte, error) {
 	if c.responsePadding != nil {
 		padding = int(c.responsePadding.NextPaddingLen())
 	}
-	wireSize := c.responseAuth.Overhead() + padding
+	wireSize := c.responseOverhead + padding
 	var prefixBuffer [18]byte
-	prefix := prefixBuffer[:c.responseSize.SizeBytes()]
+	prefix := prefixBuffer[:c.responseSizeBytes]
 	c.responseSize.Encode(uint16(wireSize), prefix)
 	dst = append(dst, prefix...)
 	var err error
