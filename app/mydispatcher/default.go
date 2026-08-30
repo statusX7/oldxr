@@ -716,8 +716,6 @@ func recordAccess(ctx context.Context, selection *outboundSelection) {
 }
 
 func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.Link, destination net.Destination) {
-	defer common.Close(link.Writer)
-	defer common.Interrupt(link.Reader)
 	selection, err := d.selectOutbound(ctx, destination)
 	if err != nil {
 		common.Close(link.Writer)
