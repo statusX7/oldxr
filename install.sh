@@ -9,10 +9,10 @@ yellow='\033[0;33m'
 plain='\033[0m'
 
 REPO="statusX7/oldxr"
-CURRENT_V1="v1.0.2"
+CURRENT_V1="v1.0.3"
 RELEASE_BASE="${OLDXR_RELEASE_BASE:-https://github.com/${REPO}/releases/download}"
-DEFAULT_CONFIG_COMMIT="be6995621ea95229e2674bd5575f21852d96e00a"
-DEFAULT_CONFIG_SHA256="52c98378453b227412f8d59df4d144cf750172a629a5ea6d98c940ece3633849"
+DEFAULT_CONFIG_COMMIT="3280c9ff53544df90d5934a0eeff94578d70bdd8"
+DEFAULT_CONFIG_SHA256="bfc17dd92fdbb87e7680b6cc2ac735277c1f4da8230317195ceed850e63a02de"
 DEFAULT_CONFIG_URL="${OLDXR_DEFAULT_CONFIG_URL:-https://raw.githubusercontent.com/${REPO}/${DEFAULT_CONFIG_COMMIT}/main/config.yml.example}"
 INSTALL_ROOT="${OLDXR_INSTALL_ROOT:-}"
 SYSTEMCTL_BIN="${OLDXR_SYSTEMCTL_BIN:-systemctl}"
@@ -395,7 +395,7 @@ backup_existing_install() {
 resolve_version() {
     local requested="${1:-}"
     case "${requested}" in
-        ""|1.0.2|v1.0.2)
+        ""|1.0.3|v1.0.3)
             resolved_version="${CURRENT_V1}"
             ;;
         1.0.[0-9]*|v1.0.[0-9]*)
@@ -407,7 +407,7 @@ resolve_version() {
             }
             ;;
         *)
-            echo -e "${red}错误：${plain}此安装器仅支持 oldxr v1.0.x；正式版本为 1.0.2。" >&2
+            echo -e "${red}错误：${plain}此安装器仅支持 oldxr v1.0.x；正式版本为 1.0.3。" >&2
             exit 2
             ;;
     esac
