@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	advancedUringOwnerLoops            = 2
+	advancedUringOwnerLoops            = 1
 	advancedUringOwnerEntries          = 4096
 	advancedUringOwnerCQBatch          = 64
 	advancedUringOwnerSetupQueue       = 2048
