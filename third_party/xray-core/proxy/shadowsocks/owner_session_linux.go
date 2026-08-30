@@ -270,6 +270,7 @@ type ownerSSSession struct {
 	pendingDownload  []byte
 	pendingWire      []byte
 	pendingWirePlain int
+	uploadReceipt    owner.WriteReceipt
 	uploadReserved   bool
 	downloadReserved bool
 	uploadCredit     owner.Reservation
@@ -503,6 +504,29 @@ func (s *ownerSSSession) resumeDownload() bool {
 }
 
 func (s *ownerSSSession) flushUpload() bool {
+	if s.uploadReceipt.Valid() {
+		if s.outbound == nil || len(s.pendingUpload) != 0 {
+			return false
+		}
+		writer, ok := s.outbound.(owner.OwnedWriteConn)
+		if !ok {
+			return false
+		}
+		written, done, err := writer.CompleteOwnedWrite(s.uploadReceipt)
+		addOwnerCounters(s.outboundWriteCounters, written)
+		if written > 0 {
+			s.flow.AddUplink(int64(written))
+		}
+		if err != nil {
+			return false
+		}
+		if !done {
+			return s.pauseUpload(true)
+		}
+		s.uploadReceipt = owner.WriteReceipt{}
+		s.uploadReserved = false
+		return s.resumeUpload()
+	}
 	if len(s.pendingUpload) == 0 {
 		s.uploadReserved = false
 		return s.resumeUpload()
@@ -556,6 +580,22 @@ func (s *ownerSSSession) writeUpload(plaintext []byte) bool {
 	if s.uploadWaiting.Load() {
 		s.pendingUpload = append(s.pendingUpload, plaintext...)
 		return s.pauseUpload(false)
+	}
+	if writer, ok := s.outbound.(owner.OwnedWriteConn); ok {
+		written, receipt, err := writer.BeginOwnedWrite(plaintext)
+		addOwnerCounters(s.outboundWriteCounters, written)
+		if written > 0 {
+			s.flow.AddUplink(int64(written))
+		}
+		if err != nil {
+			return false
+		}
+		if receipt.Valid() {
+			s.uploadReceipt = receipt
+			s.uploadReserved = true
+			return s.pauseUpload(true)
+		}
+		return written == len(plaintext)
 	}
 	written, err := s.outbound.TryWrite(plaintext)
 	addOwnerCounters(s.outboundWriteCounters, written)
@@ -875,6 +915,7 @@ func (s *ownerSSSession) OnClose(role owner.Role, _ owner.Conn, err error) {
 	s.pendingUpload = nil
 	s.pendingDownload = nil
 	s.pendingWire = nil
+	s.uploadReceipt = owner.WriteReceipt{}
 	s.lengthWire = nil
 	s.recordWire = nil
 	s.responseWire = nil

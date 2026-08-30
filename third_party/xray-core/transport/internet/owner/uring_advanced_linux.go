@@ -96,6 +96,9 @@ type advancedUringOwnerEndpoint struct {
 	sendCompletion bool
 	sendN          int
 	sendErr        error
+	sendOwned      bool
+	sendGeneration uint64
+	sendRemaining  int
 	writeArmed     bool
 	writeShutdown  bool
 }
@@ -560,9 +563,7 @@ func (loop *advancedUringOwnerLoop) completeDeferredSends() {
 		endpoint.sendDeferred = false
 		endpoint.sendPending = false
 		if session.closing {
-			endpoint.sendBuffer = endpoint.sendBuffer[:0]
-			endpoint.sendN = 0
-			endpoint.sendErr = nil
+			clearAdvancedUringOwnedSend(endpoint)
 			loop.maybeCloseSession(session)
 			continue
 		}
@@ -1093,13 +1094,13 @@ func (loop *advancedUringOwnerLoop) handleSend(session *advancedUringOwnerSessio
 	}
 	endpoint.sendPending = false
 	if session.closing {
-		endpoint.sendBuffer = endpoint.sendBuffer[:0]
+		clearAdvancedUringOwnedSend(endpoint)
 		loop.maybeCloseSession(session)
 		return
 	}
 	if result < 0 {
 		errno := unix.Errno(-result)
-		if errors.Is(errno, unix.EAGAIN) || errors.Is(errno, unix.EINTR) {
+		if retryAdvancedUringOwnerSend(errno) {
 			if err := loop.resubmitSend(session, side); err != nil {
 				loop.beginClose(session, roleForSide(side), err)
 			}
@@ -1283,8 +1284,10 @@ func (loop *advancedUringOwnerLoop) forceCloseSession(session *advancedUringOwne
 	session.closing = true
 	session.closed = true
 	for side := range session.endpoint {
-		loop.clearRecvStarved(&session.endpoint[side])
-		loop.recycleReadQueue(&session.endpoint[side])
+		endpoint := &session.endpoint[side]
+		loop.clearRecvStarved(endpoint)
+		loop.recycleReadQueue(endpoint)
+		clearAdvancedUringOwnedSend(endpoint)
 		_, _ = loop.ring.RegisterFilesUpdate(uint(session.slots[side]), []int{-1})
 		_ = unix.Close(session.fds[side])
 	}
@@ -1316,6 +1319,9 @@ func (conn *advancedUringOwnerConn) TryWrite(payload []byte) (int, error) {
 		return 0, net.ErrClosed
 	}
 	endpoint := conn.state()
+	if endpoint.sendOwned {
+		return 0, errors.New("owner: owned write receipt is active")
+	}
 	if endpoint.sendCompletion {
 		written, completionErr := endpoint.sendN, endpoint.sendErr
 		endpoint.sendCompletion = false
@@ -1342,7 +1348,7 @@ func (conn *advancedUringOwnerConn) TryWrite(payload []byte) (int, error) {
 	if written < 0 || written > len(payload) {
 		return 0, errors.New("owner: direct send returned an invalid length")
 	}
-	if err != nil && !errors.Is(err, unix.EAGAIN) && !errors.Is(err, unix.EINTR) {
+	if err != nil && !retryAdvancedUringOwnerSend(err) {
 		return written, os.NewSyscallError("sendmsg", err)
 	}
 	if written == len(payload) {
@@ -1358,6 +1364,132 @@ func (conn *advancedUringOwnerConn) TryWrite(payload []byte) (int, error) {
 		return written, submitErr
 	}
 	return written, nil
+}
+
+func clearAdvancedUringOwnedSend(endpoint *advancedUringOwnerEndpoint) {
+	endpoint.sendBuffer = endpoint.sendBuffer[:0]
+	endpoint.sendPending = false
+	endpoint.sendDeferred = false
+	endpoint.sendCompletion = false
+	endpoint.sendN = 0
+	endpoint.sendErr = nil
+	endpoint.sendOwned = false
+	endpoint.sendRemaining = 0
+}
+
+func (conn *advancedUringOwnerConn) startOwnedWriteReceipt(remaining int) WriteReceipt {
+	endpoint := conn.state()
+	endpoint.sendGeneration++
+	if endpoint.sendGeneration == 0 {
+		endpoint.sendGeneration++
+	}
+	endpoint.sendOwned = true
+	endpoint.sendRemaining = remaining
+	return WriteReceipt{
+		session:    conn.session,
+		side:       uint8(conn.side),
+		generation: endpoint.sendGeneration,
+	}
+}
+
+func retryAdvancedUringOwnerSend(err error) bool {
+	return errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR)
+}
+
+// BeginOwnedWrite starts one logical write without retaining payload. A full
+// synchronous send preserves the existing next-generation acknowledgement by
+// returning zero progress plus a receipt. A partial synchronous prefix is
+// returned immediately; the owner copies only the unsent tail before this
+// method returns.
+func (conn *advancedUringOwnerConn) BeginOwnedWrite(payload []byte) (int, WriteReceipt, error) {
+	var receipt WriteReceipt
+	if conn.session.closing || conn.session.closed {
+		return 0, receipt, net.ErrClosed
+	}
+	endpoint := conn.state()
+	if endpoint.sendOwned || endpoint.sendPending || endpoint.sendCompletion || endpoint.sendDeferred {
+		return 0, receipt, errors.New("owner: advanced io_uring owned send state is busy")
+	}
+	if len(payload) == 0 {
+		return 0, receipt, nil
+	}
+	if len(payload) > advancedUringOwnerMaxWrite {
+		return 0, receipt, fmt.Errorf("owner: advanced io_uring write exceeds %d bytes", advancedUringOwnerMaxWrite)
+	}
+	written, err := sendmsgNonblockingRaw(conn.session.fds[conn.side], payload, unix.MSG_NOSIGNAL)
+	if written < 0 || written > len(payload) {
+		return 0, receipt, errors.New("owner: direct send returned an invalid length")
+	}
+	if err != nil && !retryAdvancedUringOwnerSend(err) {
+		return written, receipt, os.NewSyscallError("sendmsg", err)
+	}
+	if written == len(payload) {
+		if deferErr := conn.loop.queueDeferredSend(conn.session, conn.side, written); deferErr != nil {
+			return written, receipt, deferErr
+		}
+		return 0, conn.startOwnedWriteReceipt(written), nil
+	}
+	if submitErr := conn.loop.submitSend(conn.session, conn.side, payload[written:]); submitErr != nil {
+		return written, receipt, submitErr
+	}
+	return written, conn.startOwnedWriteReceipt(len(payload) - written), nil
+}
+
+// CompleteOwnedWrite consumes completion progress for exactly one receipt.
+// The protocol never supplies the payload again: partial tails are compacted
+// and resubmitted from endpoint.sendBuffer, which is owned by this endpoint.
+func (conn *advancedUringOwnerConn) CompleteOwnedWrite(receipt WriteReceipt) (int, bool, error) {
+	if conn.session.closing || conn.session.closed {
+		return 0, false, net.ErrClosed
+	}
+	endpoint := conn.state()
+	if !receipt.Valid() || receipt.session != conn.session || int(receipt.side) != conn.side ||
+		!endpoint.sendOwned || receipt.generation != endpoint.sendGeneration {
+		return 0, false, errors.New("owner: invalid or stale owned write receipt")
+	}
+	if !endpoint.sendCompletion {
+		return 0, false, nil
+	}
+	return completeAdvancedUringOwnedWrite(endpoint, func() error {
+		return conn.loop.resubmitSend(conn.session, conn.side)
+	})
+}
+
+func completeAdvancedUringOwnedWrite(endpoint *advancedUringOwnerEndpoint, resubmit func() error) (int, bool, error) {
+	written, completionErr := endpoint.sendN, endpoint.sendErr
+	endpoint.sendCompletion = false
+	endpoint.sendN = 0
+	endpoint.sendErr = nil
+	if written < 0 || written > endpoint.sendRemaining || (len(endpoint.sendBuffer) > 0 && written > len(endpoint.sendBuffer)) {
+		clearAdvancedUringOwnedSend(endpoint)
+		return 0, true, errors.New("owner: owned send completion exceeds pending payload")
+	}
+	endpoint.sendRemaining -= written
+	if len(endpoint.sendBuffer) > 0 && written > 0 {
+		copy(endpoint.sendBuffer, endpoint.sendBuffer[written:])
+		endpoint.sendBuffer = endpoint.sendBuffer[:len(endpoint.sendBuffer)-written]
+	}
+	if completionErr != nil {
+		clearAdvancedUringOwnedSend(endpoint)
+		return written, true, completionErr
+	}
+	if len(endpoint.sendBuffer) > 0 {
+		if endpoint.sendRemaining != len(endpoint.sendBuffer) {
+			clearAdvancedUringOwnedSend(endpoint)
+			return written, true, errors.New("owner: owned send tail length mismatch")
+		}
+		if err := resubmit(); err != nil {
+			clearAdvancedUringOwnedSend(endpoint)
+			return written, true, err
+		}
+		return written, false, nil
+	}
+	if endpoint.sendRemaining != 0 {
+		clearAdvancedUringOwnedSend(endpoint)
+		return written, true, errors.New("owner: owned send completed before all bytes were acknowledged")
+	}
+	clearAdvancedUringOwnedSend(endpoint)
+	return written, true, nil
 }
 
 func (conn *advancedUringOwnerConn) Next(length int) ([]byte, error) {

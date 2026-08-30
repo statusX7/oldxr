@@ -51,6 +51,29 @@ type Conn interface {
 	Close() error
 }
 
+// WriteReceipt identifies one advanced-owner write whose source bytes have
+// already been consumed by the socket or copied into owner-owned storage. It
+// intentionally contains no payload pointer, so callback-scoped receive
+// storage can be recycled as soon as the protocol callback returns.
+type WriteReceipt struct {
+	session    *advancedUringOwnerSession
+	side       uint8
+	generation uint64
+}
+
+// Valid reports whether a receipt represents an owner-managed write.
+func (receipt WriteReceipt) Valid() bool {
+	return receipt.session != nil && receipt.generation != 0
+}
+
+// OwnedWriteConn is an optional advanced-owner extension. Generic and gnet
+// connections continue to use Conn.TryWrite and retain the existing copy
+// fallback.
+type OwnedWriteConn interface {
+	BeginOwnedWrite([]byte) (int, WriteReceipt, error)
+	CompleteOwnedWrite(WriteReceipt) (int, bool, error)
+}
+
 const (
 	None  = gnet.None
 	Close = gnet.Close
