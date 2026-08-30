@@ -162,7 +162,7 @@ func (c *conn) enableWritePoll() error {
 // concrete connection so owner protocols can retain bounded queue ownership.
 func (c *conn) TryWrite(p []byte) (int, error) {
 	for len(p) > 0 {
-		n, err := unix.Write(c.fd, p)
+		n, err := writeNonblocking(c.fd, p)
 		if err == unix.EINTR {
 			continue
 		}

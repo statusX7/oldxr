@@ -290,7 +290,7 @@ func (el *eventloop) read(c *conn) error {
 	isET := el.engine.opts.EdgeTriggeredIO
 	chunk := el.engine.opts.EdgeTriggeredIOChunk
 loop:
-	n, err := unix.Read(c.fd, el.buffer)
+	n, err := readNonblocking(c.fd, el.buffer)
 	if err != nil || n == 0 {
 		if err == unix.EAGAIN {
 			return nil
