@@ -4,9 +4,7 @@ package mydispatcher
 
 import (
 	"context"
-	"expvar"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -32,22 +30,6 @@ import (
 )
 
 var errSniffingTimeout = newError("timeout on sniffing")
-
-var (
-	directDispatchAttempts = expvar.NewInt("oldxr_direct_dispatch_attempts")
-	directDispatchFallback = expvar.NewInt("oldxr_direct_dispatch_fallback")
-	directDispatchSuccess  = expvar.NewInt("oldxr_direct_dispatch_success")
-	directDispatchFailures = expvar.NewMap("oldxr_direct_dispatch_failures")
-)
-
-var directDataPathEnabled = func() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("XRAYR_DIRECT_DATAPATH"))) {
-	case "0", "false", "off":
-		return false
-	default:
-		return true
-	}
-}()
 
 type cachedReader struct {
 	sync.Mutex
@@ -731,98 +713,6 @@ func recordAccess(ctx context.Context, selection *outboundSelection) {
 		}
 		log.Record(accessMessage)
 	}
-}
-
-// DispatchDirect performs sniffing and routing synchronously, then transfers
-// ownership of a supported direct outbound socket to the protocol handler. Any
-// bytes consumed while sniffing are returned through the replay reader so the
-// regular dispatcher remains a lossless fallback.
-func (d *DefaultDispatcher) DispatchDirect(ctx context.Context, destination net.Destination, input buf.Reader) (*transport.DirectLink, buf.Reader, error) {
-	if !directDataPathEnabled {
-		return nil, input, nil
-	}
-	directDispatchAttempts.Add(1)
-	if !destination.IsValid() {
-		directDispatchFailures.Add("invalid_destination", 1)
-		return nil, input, newError("Dispatcher: Invalid destination.")
-	}
-	if destination.Network != net.Network_TCP {
-		return nil, input, nil
-	}
-
-	ob := &session.Outbound{Target: destination}
-	ctx = session.ContextWithOutbound(ctx, ob)
-	content := session.ContentFromContext(ctx)
-	if content == nil {
-		content = new(session.Content)
-		ctx = session.ContextWithContent(ctx, content)
-	}
-	userIO, err := d.getUserIO(ctx)
-	if err != nil {
-		directDispatchFailures.Add("user_io", 1)
-		return nil, input, err
-	}
-
-	replayReader := input
-	sniffingRequest := content.SniffingRequest
-	if sniffingRequest.Enabled {
-		cReader := &cachedReader{reader: input}
-		result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
-		if err == nil {
-			content.Protocol = result.Protocol()
-		}
-		if err == nil && d.shouldOverride(ctx, result, sniffingRequest, destination) {
-			domain := result.Domain()
-			newError("sniffed domain: ", domain).WriteToLog(session.ExportIDToError(ctx))
-			destination.Address = net.ParseAddress(domain)
-			if sniffingRequest.RouteOnly && result.Protocol() != "fakedns" {
-				ob.RouteTarget = destination
-			} else {
-				ob.Target = destination
-			}
-		}
-		replayReader = cReader.ReplayReader()
-	}
-
-	selection, err := d.selectOutbound(ctx, destination)
-	if err != nil {
-		directDispatchFailures.Add("select_outbound", 1)
-		userIO.Release()
-		return nil, replayReader, err
-	}
-	directHandler, ok := selection.handler.(outbound.DirectHandler)
-	if !ok {
-		directDispatchFallback.Add(1)
-		userIO.Release()
-		return nil, replayReader, nil
-	}
-
-	directLink, supported, err := directHandler.OpenDirect(ctx, selection.destination)
-	if err != nil {
-		directDispatchFailures.Add("open_direct", 1)
-		userIO.Release()
-		return nil, replayReader, err
-	}
-	if !supported {
-		directDispatchFallback.Add(1)
-		userIO.Release()
-		return nil, replayReader, nil
-	}
-	if directLink == nil || directLink.Reader == nil || directLink.Writer == nil {
-		directDispatchFailures.Add("invalid_link", 1)
-		if directLink != nil {
-			_ = directLink.Close()
-		}
-		userIO.Release()
-		return nil, replayReader, newError("direct outbound returned an invalid link")
-	}
-
-	directLink.SetFlow(userIO)
-	directLink.Writer = d.wrapUserWriter(ctx, directLink.Writer, userIO.bucket, userIO.speedLimited, userIO.uplinkCounter)
-	directLink.Reader = d.wrapUserReader(ctx, directLink.Reader, userIO.bucket, userIO.speedLimited, userIO.downlinkCounter)
-	recordAccess(ctx, selection)
-	directDispatchSuccess.Add(1)
-	return directLink, replayReader, nil
 }
 
 func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.Link, destination net.Destination) {

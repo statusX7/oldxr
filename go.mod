@@ -122,7 +122,6 @@ require (
 	github.com/oracle/oci-go-sdk v24.3.0+incompatible // indirect
 	github.com/ovh/go-ovh v1.1.0 // indirect
 	github.com/panjf2000/ants/v2 v2.12.1 // indirect
-	github.com/panjf2000/gnet/v2 v2.10.0 // indirect
 	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
 	github.com/pawelgaczynski/giouring v0.0.0-20230826085535-69588b89acb9 // indirect
 	github.com/pelletier/go-toml v1.9.5 // indirect
@@ -198,7 +197,3 @@ require (
 	gvisor.dev/gvisor v0.0.0-20220901235040-6ca97ef2ce1c // indirect
 	lukechampine.com/blake3 v1.1.7 // indirect
 )
-
-replace github.com/xtls/xray-core => ./third_party/xray-core
-
-replace github.com/panjf2000/gnet/v2 => ./third_party/gnet

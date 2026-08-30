@@ -9,8 +9,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-
-	"github.com/xtls/xray-core/transport/internet/owner"
 )
 
 var (
@@ -21,7 +19,7 @@ var (
 )
 
 func applyRuntimePolicy() {
-	ownerEnabled := owner.Enabled()
+	ownerEnabled := false
 	effectiveCPUs := effectiveCPUCount()
 	// Go's default scheduler width preserves throughput headroom across the
 	// supported CPU matrix. Operators can still set GOMAXPROCS explicitly.
