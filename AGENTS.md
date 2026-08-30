@@ -4,7 +4,7 @@
 
 ## 产品身份与源码基线
 
-- `1.0.x` 是单一 Go 二进制产品线；当前补丁版本为 `v1.0.2`，binary version 显示 `XrayR 1.0.2`。
+- `1.0.x` 是单一 Go 二进制产品线；当前补丁版本为 `v1.0.3`，binary version 显示 `XrayR 1.0.3`。
 - 开发基线必须是官方 `XrayR v0.9.0` commit `f95825395d192498adfc533ab925943088408cb4`；不得从 r3/r4 删除 Rust 后伪装成官方基线。
 - 历史 `v0.9.0`、`v0.9.0-r1`、`v0.9.0-r2`、`v0.9.0-r3`、`v0.9.0-r4` tags 不移动、不删除、不覆盖。
 - `v1.0.x` production package只包含一个主要运行二进制 `XrayR`。禁止依赖 `XrayR-fastengine`、`XrayR-legacy`、Rust runtime或三二进制 selector。
@@ -37,7 +37,7 @@
 - RAM硬目标：candidate RSS `<=50%` official，并记录heap、objects、goroutines、FD和时间斜率。
 - 筛选至少3轮、warmup至少30秒、measurement至少60秒；正式结果至少10轮交叉/随机顺序且measurement至少180秒，不得挑最好一次。
 - 主测试必须开启traffic accounting、online IP/device、SpeedLimit、DeviceLimit、route/outbound/rulelist、panel polling/submit与UDP support。
-- 任一CPU、RAM、功能、OS、soak、安全、升级或rollback Gate失败时，不得发布`v1.0.x`、不得更新master安装入口、不得宣称完成；用户明确接受且在Release notes完整披露的特定安全例外除外，该例外不得自动延伸到其他版本。
+- 任一适用于当前发布范围的功能、稳定性、安全、升级或 rollback Gate 失败时，不得发布 `v1.0.x`、不得更新 master 安装入口、不得宣称完成。安全问题的分析、验证、风险和可利用细节只保留在本地版本化内部报告；公开 Release notes 仅写稳定性、兼容性和用户可执行的升级信息。
 
 ## 证据驱动开发
 
@@ -66,6 +66,6 @@
 - 任何与 oldxr 无关的 GitHub 仓库均不在操作范围内，禁止修改、删除、重命名或迁移。
 - 不force push，不重写/删除历史tag；实验只在独立branch，Gate通过前不merge main/master。
 - Git commit message保持英文，每个commit只解决一个逻辑问题。
-- 性能、pprof、perf、内部研究、审计和升级报告只写入`/root/projects/oldxr-reports/go-v1/`，不得提交GitHub。
+- 性能、pprof、perf、内部研究、审计和升级报告只写入 `/root/projects/oldxr-reports/` 下明确包含目标版本和阶段版本号的目录；完整报告、主要 Markdown、日志索引与产物名称也必须包含对应版本号，不得提交 GitHub。
 - GitHub只保留production source、必要tests/fixtures、build/install scripts、AGENTS与极简README。
 - 所有用户可见交流和本地人类可读报告使用简体中文；代码标识符、配置key、路径、命令、API字段和commit message保持英文。
