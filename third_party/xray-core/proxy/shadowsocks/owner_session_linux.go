@@ -343,7 +343,6 @@ func newOwnerSSSession(reader *ownerTCPReader, request *protocol.RequestHeader, 
 		lengthWire:            append([]byte(nil), reader.lengthWire...),
 		recordWire:            append([]byte(nil), reader.recordWire...),
 		pendingUpload:         pending,
-		responseWire:          make([]byte, 0, 64*1024),
 	}
 }
 

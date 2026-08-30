@@ -76,6 +76,32 @@ func TestOwnerSSSessionReleasesFlowExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestNewOwnerSSSessionLazilyAllocatesResponseWire(t *testing.T) {
+	account, err := (&Account{
+		Password:   "owner-lazy-response-password",
+		CipherType: CipherType_AES_128_GCM,
+	}).AsAccount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := &protocol.RequestHeader{
+		User: &protocol.MemoryUser{Account: account},
+	}
+	session := newOwnerSSSession(
+		new(ownerTCPReader),
+		request,
+		new(transport.DirectLink),
+		nil,
+		policy.Timeout{},
+		nil,
+		nil,
+		nil,
+	)
+	if cap(session.responseWire) != 0 {
+		t.Fatalf("response wire capacity = %d, want 0 before first response", cap(session.responseWire))
+	}
+}
+
 func ownerTestEncryptedRecord(t *testing.T, plaintext []byte) (cipher.AEAD, []byte) {
 	t.Helper()
 	block, err := aes.NewCipher(make([]byte, 16))
@@ -482,11 +508,10 @@ func TestOwnerSSSessionDownloadBackpressureCountsCompletedRecord(t *testing.T) {
 	user := &protocol.MemoryUser{Email: "owner-response@example.com", Account: account}
 	flow := new(ownerTestFlow)
 	session := &ownerSSSession{
-		account:      account.(*MemoryAccount),
-		flow:         flow,
-		timeouts:     policy.Timeout{ConnectionIdle: time.Minute},
-		wantLength:   true,
-		responseWire: make([]byte, 0, 1024),
+		account:    account.(*MemoryAccount),
+		flow:       flow,
+		timeouts:   policy.Timeout{ConnectionIdle: time.Minute},
+		wantLength: true,
 	}
 	inbound := &ownerTestConn{tryLimit: 7}
 	outbound := new(ownerTestConn)
@@ -566,11 +591,10 @@ func TestOwnerSSSessionDownloadDeferredLogicalAckDoesNotCopyOrRetransmit(t *test
 	user := &protocol.MemoryUser{Email: "owner-deferred-ack@example.com", Account: account}
 	flow := new(ownerTestFlow)
 	session := &ownerSSSession{
-		account:      account.(*MemoryAccount),
-		flow:         flow,
-		timeouts:     policy.Timeout{ConnectionIdle: time.Minute},
-		wantLength:   true,
-		responseWire: make([]byte, 0, 1024),
+		account:    account.(*MemoryAccount),
+		flow:       flow,
+		timeouts:   policy.Timeout{ConnectionIdle: time.Minute},
+		wantLength: true,
 	}
 	inbound := &ownerTestConn{deferLogicalAck: true}
 	outbound := new(ownerTestConn)

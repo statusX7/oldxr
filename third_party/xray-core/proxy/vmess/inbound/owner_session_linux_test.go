@@ -19,6 +19,7 @@ import (
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/proxy/vmess"
 	"github.com/xtls/xray-core/proxy/vmess/encoding"
+	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet/owner"
 )
 
@@ -174,6 +175,23 @@ func TestOwnerVMessSessionReleasesFlowExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestNewOwnerVMessSessionLazilyAllocatesResponseWire(t *testing.T) {
+	codec, _, _ := newVMessOwnerCodecForResponseTest(t)
+	session := newOwnerVMessSession(
+		codec,
+		new(transport.DirectLink),
+		nil,
+		policy.Timeout{},
+		nil,
+		nil,
+		nil,
+		nil,
+	)
+	if cap(session.responseWire) != 0 {
+		t.Fatalf("response wire capacity = %d, want 0 before first response", cap(session.responseWire))
+	}
+}
+
 func TestConsumeVMessOwnerPendingRetainsCapacity(t *testing.T) {
 	pending := append(make([]byte, 0, 16), []byte("abcdefgh")...)
 	base := &pending[:cap(pending)][0]
@@ -262,9 +280,8 @@ func newVMessOwnerCodecForResponseTest(t *testing.T) (*encoding.OwnerBodyCodec, 
 func TestOwnerVMessSessionSendsTerminationAfterOutboundReadClose(t *testing.T) {
 	codec, client, request := newVMessOwnerCodecForResponseTest(t)
 	session := &ownerVMessSession{
-		codec:        codec,
-		timeouts:     policy.Timeout{ConnectionIdle: time.Minute, UplinkOnly: time.Minute, DownlinkOnly: time.Minute},
-		responseWire: make([]byte, 0, 1024),
+		codec:    codec,
+		timeouts: policy.Timeout{ConnectionIdle: time.Minute, UplinkOnly: time.Minute, DownlinkOnly: time.Minute},
 	}
 	inbound, outbound := new(vmessOwnerTestConn), new(vmessOwnerTestConn)
 	session.OnOpen(owner.Outbound, outbound)
@@ -372,10 +389,9 @@ func TestOwnerVMessSessionDownloadBackpressureCountsCompletedRecords(t *testing.
 	codec, client, request := newVMessOwnerCodecForResponseTest(t)
 	flow := new(vmessOwnerTestFlow)
 	session := &ownerVMessSession{
-		codec:        codec,
-		flow:         flow,
-		timeouts:     policy.Timeout{ConnectionIdle: time.Minute},
-		responseWire: make([]byte, 0, 64*1024),
+		codec:    codec,
+		flow:     flow,
+		timeouts: policy.Timeout{ConnectionIdle: time.Minute},
 	}
 	inbound := &vmessOwnerTestConn{tryLimit: 9}
 	outbound := new(vmessOwnerTestConn)
@@ -455,10 +471,9 @@ func TestOwnerVMessSessionDownloadDeferredLogicalAckDoesNotCopyOrRetransmit(t *t
 	codec, client, request := newVMessOwnerCodecForResponseTest(t)
 	flow := new(vmessOwnerTestFlow)
 	session := &ownerVMessSession{
-		codec:        codec,
-		flow:         flow,
-		timeouts:     policy.Timeout{ConnectionIdle: time.Minute},
-		responseWire: make([]byte, 0, 64*1024),
+		codec:    codec,
+		flow:     flow,
+		timeouts: policy.Timeout{ConnectionIdle: time.Minute},
 	}
 	inbound := &vmessOwnerTestConn{deferLogicalAck: true}
 	outbound := new(vmessOwnerTestConn)
@@ -517,9 +532,8 @@ func TestOwnerVMessSessionDownloadDeferredLogicalAckDoesNotCopyOrRetransmit(t *t
 func TestOwnerVMessSessionFinishesPartialTerminationBeforeClosingReadSide(t *testing.T) {
 	codec, client, request := newVMessOwnerCodecForResponseTest(t)
 	session := &ownerVMessSession{
-		codec:        codec,
-		timeouts:     policy.Timeout{ConnectionIdle: time.Minute, UplinkOnly: time.Minute, DownlinkOnly: time.Minute},
-		responseWire: make([]byte, 0, 1024),
+		codec:    codec,
+		timeouts: policy.Timeout{ConnectionIdle: time.Minute, UplinkOnly: time.Minute, DownlinkOnly: time.Minute},
 	}
 	inbound := &vmessOwnerTestConn{tryLimit: 5}
 	outbound := new(vmessOwnerTestConn)

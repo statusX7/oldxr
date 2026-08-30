@@ -112,7 +112,6 @@ func newOwnerVMessSession(codec *encoding.OwnerBodyCodec, link *transport.Direct
 		sizePrefix:            make([]byte, 0, codec.RequestSizeBytes()),
 		cachedWire:            cachedWire,
 		pendingUpload:         pendingPlaintext,
-		responseWire:          make([]byte, 0, 64*1024),
 	}
 }
 
@@ -464,6 +463,7 @@ func (s *ownerVMessSession) writeReservedDownload(plaintext []byte) bool {
 		if err != nil {
 			return false
 		}
+		s.responseWire = wire[:0]
 		written, err := s.inbound.TryWrite(wire)
 		addVMessOwnerCounters(s.inboundWriteCounters, written)
 		if err != nil {
@@ -627,6 +627,7 @@ func (s *ownerVMessSession) finishResponse() owner.Action {
 	if err != nil {
 		return owner.Close
 	}
+	s.responseWire = wire[:0]
 	if len(wire) > 0 {
 		written, err := s.inbound.TryWrite(wire)
 		addVMessOwnerCounters(s.inboundWriteCounters, written)
