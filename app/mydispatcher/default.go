@@ -300,9 +300,9 @@ func getOrRegisterCounter(manager stats.Manager, name string) (stats.Counter, er
 	return counter, err
 }
 
-func (d *DefaultDispatcher) wrapUserWriter(ctx context.Context, writer buf.Writer, bucket *rate.Limiter, speedLimited bool, counter stats.Counter) buf.Writer {
+func (d *DefaultDispatcher) wrapUserWriter(_ context.Context, writer buf.Writer, bucket *rate.Limiter, speedLimited bool, counter stats.Counter) buf.Writer {
 	if speedLimited {
-		writer = d.Limiter.RateWriterContext(ctx, writer, bucket)
+		writer = d.Limiter.RateWriter(writer, bucket)
 	}
 	if counter != nil {
 		writer = &SizeStatWriter{Counter: counter, Writer: writer}
