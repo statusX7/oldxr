@@ -20,6 +20,47 @@ import (
 
 const advancedUringOwnerTestEntries = 1024
 
+func TestAdvancedUringOwnerProtocolPendingWakeBypassesResumeNoop(t *testing.T) {
+	wakeFD, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(wakeFD)
+
+	loop := &advancedUringOwnerLoop{
+		wakeFD: wakeFD,
+		tasks:  make(chan advancedUringOwnerTask, 1),
+		done:   make(chan struct{}),
+	}
+	session := &advancedUringOwnerSession{id: 1}
+	conn := &advancedUringOwnerConn{loop: loop, session: session, side: 0}
+	session.endpoint[0].conn = conn
+	session.endpoint[0].resumeWakeNoop.Store(true)
+
+	if err := conn.Wake(nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(loop.tasks) != 0 {
+		t.Fatal("ordinary resume wake was not skipped")
+	}
+
+	session.endpoint[0].resumeWakeNoop.Store(true)
+	if err := WakeProtocolPending(conn); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case task := <-loop.tasks:
+		if task.callback == nil {
+			t.Fatal("protocol-pending wake lost its forcing callback")
+		}
+	default:
+		t.Fatal("protocol-pending wake was incorrectly skipped")
+	}
+	if session.endpoint[0].resumeWakeNoop.Load() {
+		t.Fatal("protocol-pending wake left a stale resume skip token")
+	}
+}
+
 type advancedUringOwnerRelaySession struct {
 	conn      [2]Conn
 	pending   [2][]byte

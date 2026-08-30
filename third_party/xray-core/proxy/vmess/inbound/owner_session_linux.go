@@ -247,7 +247,11 @@ func (s *ownerVMessSession) resumeUpload() bool {
 			return false
 		}
 		s.uploadPaused = false
-		_ = s.inbound.Wake(nil)
+		if len(s.cachedWire) > 0 {
+			_ = owner.WakeProtocolPending(s.inbound)
+		} else {
+			_ = s.inbound.Wake(nil)
+		}
 	}
 	return true
 }

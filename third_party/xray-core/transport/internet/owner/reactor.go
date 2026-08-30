@@ -51,6 +51,20 @@ type Conn interface {
 	Close() error
 }
 
+var protocolPendingWakeCallback gnet.AsyncCallback = func(gnet.Conn, error) error { return nil }
+
+// WakeProtocolPending forces a traffic callback for work buffered by a
+// protocol state machine rather than by the socket owner itself. In
+// particular, ResumeRead may legitimately have no owner-buffered bytes while
+// a protocol has retained the next encrypted record in connection-local
+// storage.
+func WakeProtocolPending(conn Conn) error {
+	if conn == nil {
+		return net.ErrClosed
+	}
+	return conn.Wake(protocolPendingWakeCallback)
+}
+
 // WriteReceipt identifies one advanced-owner write whose source bytes have
 // already been consumed by the socket or copied into owner-owned storage. It
 // intentionally contains no payload pointer, so callback-scoped receive

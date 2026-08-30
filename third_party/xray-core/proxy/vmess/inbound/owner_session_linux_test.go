@@ -32,6 +32,8 @@ type vmessOwnerTestConn struct {
 	logicalAck      int
 	paused          bool
 	armed           bool
+	wakes           int
+	forced          int
 }
 
 func (c *vmessOwnerTestConn) Write(p []byte) (int, error) {
@@ -121,7 +123,15 @@ func (c *vmessOwnerTestConn) InboundBuffered() int {
 	return len(c.input)
 }
 
-func (*vmessOwnerTestConn) Wake(gnet.AsyncCallback) error { return nil }
+func (c *vmessOwnerTestConn) Wake(callback gnet.AsyncCallback) error {
+	c.mu.Lock()
+	c.wakes++
+	if callback != nil {
+		c.forced++
+	}
+	c.mu.Unlock()
+	return nil
+}
 
 func (c *vmessOwnerTestConn) Close() error {
 	c.mu.Lock()
@@ -134,6 +144,12 @@ func (c *vmessOwnerTestConn) bytes() []byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]byte(nil), c.output.Bytes()...)
+}
+
+func (c *vmessOwnerTestConn) wakeCounts() (int, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.wakes, c.forced
 }
 
 type vmessOwnerTestFlow struct {
@@ -329,6 +345,26 @@ func TestOwnerVMessSessionUploadBackpressureCountsActualWrites(t *testing.T) {
 	}
 	if inbound.paused || outbound.armed {
 		t.Fatalf("released state = paused %v, armed %v; want false,false", inbound.paused, outbound.armed)
+	}
+}
+
+func TestOwnerVMessSessionForcesWakeForProtocolBufferedRequest(t *testing.T) {
+	session := &ownerVMessSession{
+		timeouts:     policy.Timeout{ConnectionIdle: time.Minute},
+		cachedWire:   []byte("next encrypted VMess record"),
+		uploadPaused: true,
+	}
+	inbound := new(vmessOwnerTestConn)
+	outbound := new(vmessOwnerTestConn)
+	session.inbound = inbound
+	session.outbound = outbound
+
+	if !session.resumeUpload() {
+		t.Fatal("resume upload failed")
+	}
+	wakes, forced := inbound.wakeCounts()
+	if wakes != 1 || forced != 1 {
+		t.Fatalf("wake counts = total %d forced %d, want 1,1", wakes, forced)
 	}
 }
 
