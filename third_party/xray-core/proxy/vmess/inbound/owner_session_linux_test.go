@@ -23,13 +23,19 @@ import (
 )
 
 type vmessOwnerTestConn struct {
-	mu       sync.Mutex
-	input    []byte
-	output   bytes.Buffer
-	closed   int
-	tryLimit int
-	paused   bool
-	armed    bool
+	mu             sync.Mutex
+	input          []byte
+	output         bytes.Buffer
+	closed         int
+	tryLimit       int
+	paused         bool
+	armed          bool
+	wakes          int
+	forced         int
+	delivered      int
+	skipped        int
+	skipResumeWake bool
+	resumeWakeNoop bool
 }
 
 func (c *vmessOwnerTestConn) Write(p []byte) (int, error) {
@@ -60,6 +66,7 @@ func (c *vmessOwnerTestConn) SuspendRead() error {
 func (c *vmessOwnerTestConn) ResumeRead() error {
 	c.mu.Lock()
 	c.paused = false
+	c.resumeWakeNoop = c.skipResumeWake
 	c.mu.Unlock()
 	return nil
 }
@@ -108,7 +115,22 @@ func (c *vmessOwnerTestConn) InboundBuffered() int {
 	return len(c.input)
 }
 
-func (*vmessOwnerTestConn) Wake(gnet.AsyncCallback) error { return nil }
+func (c *vmessOwnerTestConn) Wake(callback gnet.AsyncCallback) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.wakes++
+	resumeWakeNoop := c.resumeWakeNoop
+	c.resumeWakeNoop = false
+	if callback != nil {
+		c.forced++
+	}
+	if callback == nil && resumeWakeNoop {
+		c.skipped++
+		return nil
+	}
+	c.delivered++
+	return nil
+}
 
 func (c *vmessOwnerTestConn) Close() error {
 	c.mu.Lock()
@@ -121,6 +143,12 @@ func (c *vmessOwnerTestConn) bytes() []byte {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]byte(nil), c.output.Bytes()...)
+}
+
+func (c *vmessOwnerTestConn) wakeCounts() (wakes, forced, delivered, skipped int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.wakes, c.forced, c.delivered, c.skipped
 }
 
 type vmessOwnerTestFlow struct {
@@ -299,6 +327,45 @@ func TestOwnerVMessSessionUploadBackpressureCountsActualWrites(t *testing.T) {
 	}
 	if inbound.paused || outbound.armed {
 		t.Fatalf("released state = paused %v, armed %v; want false,false", inbound.paused, outbound.armed)
+	}
+}
+
+func TestOwnerVMessSessionForcesWakeForProtocolBufferedRequest(t *testing.T) {
+	session := &ownerVMessSession{
+		timeouts:     policy.Timeout{ConnectionIdle: time.Minute},
+		cachedWire:   []byte("next encrypted VMess record"),
+		uploadPaused: true,
+	}
+	inbound := &vmessOwnerTestConn{skipResumeWake: true}
+	outbound := new(vmessOwnerTestConn)
+	session.inbound = inbound
+	session.outbound = outbound
+
+	if !session.resumeUpload() {
+		t.Fatal("resume upload failed")
+	}
+	wakes, forced, delivered, skipped := inbound.wakeCounts()
+	if wakes != 1 || forced != 1 || delivered != 1 || skipped != 0 {
+		t.Fatalf("wake counts = total %d forced %d delivered %d skipped %d, want 1,1,1,0", wakes, forced, delivered, skipped)
+	}
+}
+
+func TestOwnerVMessSessionOrdinaryResumeWakeMayBeSkipped(t *testing.T) {
+	session := &ownerVMessSession{
+		timeouts:     policy.Timeout{ConnectionIdle: time.Minute},
+		uploadPaused: true,
+	}
+	inbound := &vmessOwnerTestConn{skipResumeWake: true}
+	outbound := new(vmessOwnerTestConn)
+	session.inbound = inbound
+	session.outbound = outbound
+
+	if !session.resumeUpload() {
+		t.Fatal("resume upload failed")
+	}
+	wakes, forced, delivered, skipped := inbound.wakeCounts()
+	if wakes != 1 || forced != 0 || delivered != 0 || skipped != 1 {
+		t.Fatalf("wake counts = total %d forced %d delivered %d skipped %d, want 1,0,0,1", wakes, forced, delivered, skipped)
 	}
 }
 

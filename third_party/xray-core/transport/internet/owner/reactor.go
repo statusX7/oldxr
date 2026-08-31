@@ -51,6 +51,19 @@ type Conn interface {
 	Close() error
 }
 
+var protocolPendingWakeCallback gnet.AsyncCallback = func(gnet.Conn, error) error { return nil }
+
+// WakeProtocolPending forces a traffic callback for work buffered by a
+// protocol state machine rather than by the socket owner itself. ResumeRead
+// may have no owner-buffered bytes while a protocol retains encrypted input in
+// connection-local storage.
+func WakeProtocolPending(conn Conn) error {
+	if conn == nil {
+		return net.ErrClosed
+	}
+	return conn.Wake(protocolPendingWakeCallback)
+}
+
 const (
 	None  = gnet.None
 	Close = gnet.Close
