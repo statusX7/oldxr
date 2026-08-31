@@ -214,10 +214,11 @@ func benchmarkSSWarmLayeredGlobal(tb testing.TB, validator *Validator, requests 
 
 func benchmarkSSWarmLayeredCandidate(tb testing.TB, validator *Validator, requests []benchmarkSSLayeredRequest, candidatesPerSource int) {
 	tb.Helper()
+	processColdScanBudget.resetForTest()
 	benchmarkSSWarmLayeredGlobal(tb, validator, requests)
 	cache := newSourceCandidateCache(defaultSourceCacheMaxSources, candidatesPerSource, defaultSourceCacheTTL)
 	validator.sourceCache.Store(cache)
-	now := time.Unix(1700000000, 0).UnixNano()
+	now := time.Now().UnixNano()
 	for _, request := range requests {
 		if request.want == nil {
 			continue
@@ -299,26 +300,6 @@ func benchmarkSSLayeredParentStream(b *testing.B, validator *Validator, requests
 }
 
 func benchmarkSSLayeredCandidateStream(b *testing.B, validator *Validator, requests []benchmarkSSLayeredRequest) {
-	totalAttempts := 0
-	valid := 0
-	sourceHits := 0
-	globalHits := 0
-	coldFallbacks := 0
-	for _, request := range requests {
-		totalAttempts += request.attempts
-		if request.want != nil {
-			valid++
-		}
-		if request.sourceHit {
-			sourceHits++
-		}
-		if request.globalHit {
-			globalHits++
-		}
-		if request.coldFallback {
-			coldFallbacks++
-		}
-	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -334,10 +315,18 @@ func benchmarkSSLayeredCandidateStream(b *testing.B, validator *Validator, reque
 		benchmarkSSUser = user
 		benchmarkSSErr = err
 	}
-	b.ReportMetric(float64(totalAttempts)/float64(len(requests)), "attempts/op")
-	b.ReportMetric(float64(sourceHits)*100/float64(valid), "source_hit_pct")
-	b.ReportMetric(float64(globalHits)*100/float64(valid), "global_hit_pct")
-	b.ReportMetric(float64(coldFallbacks)*100/float64(len(requests)), "cold_pct")
+	b.StopTimer()
+	metrics := validator.authMetrics.snapshot()
+	valid := metrics.sourceHits + metrics.globalHits + metrics.coldHits
+	if valid == 0 {
+		valid = 1
+	}
+	b.ReportMetric(float64(metrics.candidateAttempts)/float64(b.N), "attempts/op")
+	b.ReportMetric(float64(metrics.sourceHits)*100/float64(valid), "source_hit_pct")
+	b.ReportMetric(float64(metrics.globalHits)*100/float64(valid), "global_hit_pct")
+	b.ReportMetric(float64(metrics.coldHits)*100/float64(valid), "cold_hit_pct")
+	b.ReportMetric(float64(metrics.coldScans)*100/float64(b.N), "cold_scan_pct")
+	b.ReportMetric(float64(metrics.admissionRejects)*100/float64(b.N), "reject_pct")
 }
 
 func BenchmarkSSLayeredAuthParent(b *testing.B) {

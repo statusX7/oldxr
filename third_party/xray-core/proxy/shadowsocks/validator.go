@@ -42,15 +42,19 @@ type Validator struct {
 	authSnapshot atomic.Pointer[authSnapshot]
 	hotCounters  map[*protocol.MemoryUser]*hotUserCounter
 
-	hotCapacity        int
-	hotRebuildInterval time.Duration
-	hotSuccessEvents   atomic.Uint64
-	hotNextRebuild     atomic.Int64
-	hotRebuildPending  atomic.Bool
-	sourceCache        atomic.Pointer[sourceCandidateCache]
-	sourceMaxSources   int
-	sourceCandidates   int
-	sourceTTL          time.Duration
+	hotCapacity           int
+	hotRebuildInterval    time.Duration
+	hotSuccessEvents      atomic.Uint64
+	hotNextRebuild        atomic.Int64
+	hotRebuildPending     atomic.Bool
+	sourceCache           atomic.Pointer[sourceCandidateCache]
+	sourceMaxSources      int
+	sourceCandidates      int
+	sourceTTL             time.Duration
+	failedAuthDisabled    bool
+	sourceFailureBurst    int
+	sourceFailureCooldown time.Duration
+	authMetrics           validatorAuthMetrics
 
 	behaviorSeed  uint64
 	behaviorFused bool
@@ -386,7 +390,7 @@ func getShadowsocksUser(users []*protocol.MemoryUser, bs []byte, command protoco
 	return nil, nil, nil, 0, ErrNotFound
 }
 
-func getShadowsocksUserLayered(snapshot *authSnapshot, candidates sourceCandidateSet, bs []byte, command protocol.RequestCommand) (u *protocol.MemoryUser, aead cipher.AEAD, ret []byte, ivLen int32, err error) {
+func getShadowsocksUserLayered(snapshot *authSnapshot, candidates sourceCandidateSet, bs []byte, command protocol.RequestCommand, sourceColdAllowed bool, budget *coldScanBudget) (u *protocol.MemoryUser, aead cipher.AEAD, ret []byte, ivLen int32, layer authMatchLayer, attempts uint32, coldScanned bool, err error) {
 	matcher := shadowsocksUserMatcher{bs: bs, command: command}
 	var attemptedRanks [maxSourceCandidates]uint32
 	attemptedCount := 0
@@ -408,13 +412,18 @@ func getShadowsocksUserLayered(snapshot *authSnapshot, candidates sourceCandidat
 		}
 		attemptedRanks[attemptedCount] = rank
 		attemptedCount++
+		attempts++
 		candidateAEAD, candidateRet, candidateIVLen, matched, matchErr := matcher.try(user)
 		if matched {
-			return user, candidateAEAD, candidateRet, candidateIVLen, matchErr
+			return user, candidateAEAD, candidateRet, candidateIVLen, authMatchSource, attempts, false, matchErr
 		}
 	}
 
-	for index, user := range snapshot.ordered {
+	hotCount := snapshot.hotCount
+	if hotCount > len(snapshot.ordered) {
+		hotCount = len(snapshot.ordered)
+	}
+	for index, user := range snapshot.ordered[:hotCount] {
 		rank := uint32(index + 1)
 		skip := false
 		for attemptedIndex := 0; attemptedIndex < attemptedCount; attemptedIndex++ {
@@ -426,12 +435,39 @@ func getShadowsocksUserLayered(snapshot *authSnapshot, candidates sourceCandidat
 		if skip {
 			continue
 		}
+		attempts++
 		candidateAEAD, candidateRet, candidateIVLen, matched, matchErr := matcher.try(user)
 		if matched {
-			return user, candidateAEAD, candidateRet, candidateIVLen, matchErr
+			return user, candidateAEAD, candidateRet, candidateIVLen, authMatchGlobal, attempts, false, matchErr
 		}
 	}
-	return nil, nil, nil, 0, ErrNotFound
+
+	if !sourceColdAllowed || budget != nil && !budget.acquire() {
+		return nil, nil, nil, 0, authMatchNone, attempts, false, ErrNotFound
+	}
+	if budget != nil {
+		defer budget.release()
+	}
+	for index := hotCount; index < len(snapshot.ordered); index++ {
+		user := snapshot.ordered[index]
+		rank := uint32(index + 1)
+		skip := false
+		for attemptedIndex := 0; attemptedIndex < attemptedCount; attemptedIndex++ {
+			if attemptedRanks[attemptedIndex] == rank {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+		attempts++
+		candidateAEAD, candidateRet, candidateIVLen, matched, matchErr := matcher.try(user)
+		if matched {
+			return user, candidateAEAD, candidateRet, candidateIVLen, authMatchCold, attempts, true, matchErr
+		}
+	}
+	return nil, nil, nil, 0, authMatchNone, attempts, true, ErrNotFound
 }
 
 // Get a Shadowsocks user.
@@ -440,7 +476,9 @@ func (v *Validator) Get(bs []byte, command protocol.RequestCommand) (u *protocol
 }
 
 // GetWithSource uses a source address only as an ordered authentication hint.
-// A miss always falls back to the complete immutable user snapshot.
+// Every accepted user is still selected by complete cryptographic verification.
+// After source and active candidates miss, failed-auth admission may defer the
+// expensive cold remainder for a bounded cooldown; it never accepts a user.
 func (v *Validator) GetWithSource(bs []byte, command protocol.RequestCommand, source xraynet.Address) (u *protocol.MemoryUser, aead cipher.AEAD, ret []byte, ivLen int32, err error) {
 	sourceKey, hasSource := authSourceKeyFromAddress(source)
 	return v.get(bs, command, sourceKey, hasSource)
@@ -455,11 +493,46 @@ func (v *Validator) get(bs []byte, command protocol.RequestCommand, sourceKey au
 			now = time.Now().UnixNano()
 			candidates = cache.lookup(sourceKey, now)
 		}
-		u, aead, ret, ivLen, err = getShadowsocksUserLayered(snapshot, candidates, bs, command)
+		protectionEnabled := hasSource && !v.failedAuthDisabled
+		sourceColdAllowed := !protectionEnabled || candidates.blockedUntil <= now
+		var budget *coldScanBudget
+		if protectionEnabled {
+			budget = processColdScanBudget
+		}
+		var layer authMatchLayer
+		var attempts uint32
+		var coldScanned bool
+		u, aead, ret, ivLen, layer, attempts, coldScanned, err = getShadowsocksUserLayered(snapshot, candidates, bs, command, sourceColdAllowed, budget)
+		v.authMetrics.candidateAttempts.Add(uint64(attempts))
+		if coldScanned {
+			v.authMetrics.coldScans.Add(1)
+		}
 		if err == nil && u != nil {
+			switch layer {
+			case authMatchSource:
+				v.authMetrics.sourceHits.Add(1)
+			case authMatchGlobal:
+				v.authMetrics.globalHits.Add(1)
+			case authMatchCold:
+				v.authMetrics.coldHits.Add(1)
+			}
 			v.recordHotSuccess(snapshot.counters[u])
 			if hasSource && cache != nil {
-				cache.recordSuccess(sourceKey, u, now)
+				eventNow := time.Now().UnixNano()
+				cache.recordSuccess(sourceKey, u, eventNow)
+				if layer == authMatchCold {
+					cache.clearFailures(sourceKey, eventNow)
+				}
+			}
+		} else if protectionEnabled && err == ErrNotFound {
+			if coldScanned {
+				eventNow := time.Now().UnixNano()
+				if cache != nil {
+					cache.recordFailure(sourceKey, eventNow, v.effectiveSourceFailureBurst(), v.effectiveSourceFailureCooldown())
+				}
+				processColdScanBudget.recordFailure(eventNow)
+			} else {
+				v.authMetrics.admissionRejects.Add(1)
 			}
 		}
 		return

@@ -43,16 +43,19 @@ func authSourceKeyFromAddress(address xraynet.Address) (authSourceKey, bool) {
 }
 
 type sourceCandidateSet struct {
-	users [maxSourceCandidates]*protocol.MemoryUser
-	count int
+	users        [maxSourceCandidates]*protocol.MemoryUser
+	count        int
+	blockedUntil int64
 }
 
 type sourceCandidateEntry struct {
-	key      authSourceKey
-	users    [maxSourceCandidates]*protocol.MemoryUser
-	lastSeen int64
-	count    uint8
-	occupied bool
+	key          authSourceKey
+	users        [maxSourceCandidates]*protocol.MemoryUser
+	lastSeen     int64
+	blockedUntil int64
+	count        uint8
+	failures     uint8
+	occupied     bool
 }
 
 type sourceCandidateBucket struct {
@@ -60,9 +63,10 @@ type sourceCandidateBucket struct {
 	entries [sourceCacheWays]sourceCandidateEntry
 }
 
-// sourceCandidateCache is a fixed-size, set-associative hint table. A cache
-// miss can only make authentication slower; it never changes the complete
-// cryptographic fallback or the set of valid users.
+// sourceCandidateCache is a fixed-size, set-associative hint table. Its user
+// entries only change candidate order and never establish identity. A separate
+// failed-auth admission decision may defer the cold remainder after the hint
+// and active sets miss; every accepted user still passes full verification.
 type sourceCandidateCache struct {
 	seed                maphash.Seed
 	buckets             []sourceCandidateBucket
@@ -112,20 +116,14 @@ func (c *sourceCandidateCache) lookup(key authSourceKey, now int64) sourceCandid
 		}
 		var candidates sourceCandidateSet
 		candidates.count = int(entry.count)
+		candidates.blockedUntil = entry.blockedUntil
 		copy(candidates.users[:candidates.count], entry.users[:candidates.count])
 		return candidates
 	}
 	return sourceCandidateSet{}
 }
 
-func (c *sourceCandidateCache) recordSuccess(key authSourceKey, user *protocol.MemoryUser, now int64) {
-	if c == nil || user == nil {
-		return
-	}
-	bucket := c.bucketFor(key)
-	bucket.Lock()
-	defer bucket.Unlock()
-
+func (c *sourceCandidateCache) findOrReplaceEntryLocked(bucket *sourceCandidateBucket, key authSourceKey, now int64) *sourceCandidateEntry {
 	entryIndex := -1
 	replaceIndex := 0
 	oldestSeen := int64(^uint64(0) >> 1)
@@ -151,6 +149,17 @@ func (c *sourceCandidateCache) recordSuccess(key authSourceKey, user *protocol.M
 	}
 	entry := &bucket.entries[entryIndex]
 	entry.lastSeen = now
+	return entry
+}
+
+func (c *sourceCandidateCache) recordSuccess(key authSourceKey, user *protocol.MemoryUser, now int64) {
+	if c == nil || user == nil {
+		return
+	}
+	bucket := c.bucketFor(key)
+	bucket.Lock()
+	defer bucket.Unlock()
+	entry := c.findOrReplaceEntryLocked(bucket, key, now)
 
 	userIndex := -1
 	for index := 0; index < int(entry.count); index++ {
@@ -173,4 +182,38 @@ func (c *sourceCandidateCache) recordSuccess(key authSourceKey, user *protocol.M
 	}
 	copy(entry.users[1:int(entry.count)], entry.users[:int(entry.count)-1])
 	entry.users[0] = user
+}
+
+func (c *sourceCandidateCache) recordFailure(key authSourceKey, now int64, burst uint8, cooldown time.Duration) {
+	if c == nil || burst == 0 || cooldown <= 0 {
+		return
+	}
+	bucket := c.bucketFor(key)
+	bucket.Lock()
+	defer bucket.Unlock()
+	entry := c.findOrReplaceEntryLocked(bucket, key, now)
+	if entry.failures < burst {
+		entry.failures++
+	}
+	if entry.failures >= burst {
+		entry.blockedUntil = now + int64(cooldown)
+	}
+}
+
+func (c *sourceCandidateCache) clearFailures(key authSourceKey, now int64) {
+	if c == nil {
+		return
+	}
+	bucket := c.bucketFor(key)
+	bucket.Lock()
+	defer bucket.Unlock()
+	for index := range bucket.entries {
+		entry := &bucket.entries[index]
+		if !entry.occupied || entry.key != key || now-entry.lastSeen > c.ttlNanos {
+			continue
+		}
+		entry.failures = 0
+		entry.blockedUntil = 0
+		return
+	}
 }
