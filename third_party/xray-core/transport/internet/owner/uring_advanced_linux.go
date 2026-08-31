@@ -74,6 +74,16 @@ type advancedUringOwnerReadChunk struct {
 	offset int
 }
 
+// advancedUringOwnerFilesUpdate mirrors Linux's io_uring_files_update ABI.
+// giouring's convenience method accepts []int, but the kernel consumes a
+// packed int32 array; using it for more than one descriptor on 64-bit systems
+// would interleave each descriptor with its upper zero word.
+type advancedUringOwnerFilesUpdate struct {
+	offset   uint32
+	reserved uint32
+	fds      uint64
+}
+
 type advancedUringOwnerEndpoint struct {
 	conn *advancedUringOwnerConn
 
@@ -662,20 +672,11 @@ func (loop *advancedUringOwnerLoop) addSession(request advancedUringOwnerSetup) 
 	session := &advancedUringOwnerSession{id: uint64(id), fds: request.fds, handler: request.handler}
 	session.slots[0] = uint32(id-1) * 2
 	session.slots[1] = session.slots[0] + 1
-	registered := 0
-	for side := range session.fds {
-		// giouring exposes []int while Linux consumes an int32 array. Updating
-		// one slot at a time avoids the 64-bit multi-element ABI mismatch.
-		if _, err := loop.ring.RegisterFilesUpdate(uint(session.slots[side]), []int{session.fds[side]}); err != nil {
-			for previous := 0; previous < registered; previous++ {
-				_, _ = loop.ring.RegisterFilesUpdate(uint(session.slots[previous]), []int{-1})
-			}
-			_ = unix.Close(request.fds[0])
-			_ = unix.Close(request.fds[1])
-			loop.freeIDs = append(loop.freeIDs, id)
-			return fmt.Errorf("owner: register fixed file %d: %w", side, err)
-		}
-		registered++
+	if err := registerAdvancedUringOwnerFilePair(loop.ring, session.slots[0], [2]int32{int32(session.fds[0]), int32(session.fds[1])}); err != nil {
+		_ = unix.Close(request.fds[0])
+		_ = unix.Close(request.fds[1])
+		loop.freeIDs = append(loop.freeIDs, id)
+		return fmt.Errorf("owner: register fixed file pair: %w", err)
 	}
 	for side := range session.endpoint {
 		conn := &advancedUringOwnerConn{loop: loop, session: session, side: side}
@@ -696,8 +697,8 @@ func (loop *advancedUringOwnerLoop) addSession(request advancedUringOwnerSetup) 
 }
 
 func (loop *advancedUringOwnerLoop) rollbackSession(session *advancedUringOwnerSession) {
-	for side := range session.slots {
-		_, _ = loop.ring.RegisterFilesUpdate(uint(session.slots[side]), []int{-1})
+	_ = unregisterAdvancedUringOwnerFilePair(loop.ring, session.slots[0])
+	for side := range session.fds {
 		_ = unix.Close(session.fds[side])
 	}
 	loop.sessions[session.id] = nil
@@ -1195,16 +1196,58 @@ func (loop *advancedUringOwnerLoop) forceCloseSession(session *advancedUringOwne
 	}
 	session.closing = true
 	session.closed = true
+	_ = unregisterAdvancedUringOwnerFilePair(loop.ring, session.slots[0])
 	for side := range session.endpoint {
 		loop.clearRecvStarved(&session.endpoint[side])
 		loop.recycleReadQueue(&session.endpoint[side])
-		_, _ = loop.ring.RegisterFilesUpdate(uint(session.slots[side]), []int{-1})
 		_ = unix.Close(session.fds[side])
 	}
 	if session.id < uint64(len(loop.sessions)) && loop.sessions[session.id] == session {
 		loop.sessions[session.id] = nil
 		loop.freeIDs = append(loop.freeIDs, uint32(session.id))
 	}
+}
+
+func updateAdvancedUringOwnerFiles(ring *giouring.Ring, offset uint32, files [2]int32) (uint, error) {
+	update := advancedUringOwnerFilesUpdate{
+		offset: offset,
+		fds:    uint64(uintptr(unsafe.Pointer(&files[0]))),
+	}
+	updated, errno := ring.Register(
+		ring.RingFd(),
+		giouring.RegisterFilesUpdate,
+		unsafe.Pointer(&update),
+		uint32(len(files)),
+	)
+	runtime.KeepAlive(files)
+	if errno != 0 {
+		return updated, os.NewSyscallError("io_uring_register files update", errno)
+	}
+	return updated, nil
+}
+
+func validateAdvancedUringOwnerFilesUpdate(updated uint, err error) error {
+	if err != nil {
+		return err
+	}
+	if updated != 2 {
+		return fmt.Errorf("updated=%d want=2", updated)
+	}
+	return nil
+}
+
+func registerAdvancedUringOwnerFilePair(ring *giouring.Ring, offset uint32, files [2]int32) error {
+	updated, err := updateAdvancedUringOwnerFiles(ring, offset, files)
+	if validationErr := validateAdvancedUringOwnerFilesUpdate(updated, err); validationErr != nil {
+		_, _ = updateAdvancedUringOwnerFiles(ring, offset, [2]int32{-1, -1})
+		return validationErr
+	}
+	return nil
+}
+
+func unregisterAdvancedUringOwnerFilePair(ring *giouring.Ring, offset uint32) error {
+	updated, err := updateAdvancedUringOwnerFiles(ring, offset, [2]int32{-1, -1})
+	return validateAdvancedUringOwnerFilesUpdate(updated, err)
 }
 
 func (loop *advancedUringOwnerLoop) storeError(err error) {

@@ -14,7 +14,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
+	"github.com/pawelgaczynski/giouring"
 	"golang.org/x/sys/unix"
 )
 
@@ -206,6 +208,87 @@ func listenAdvancedUringOwnerTCP(t *testing.T) *net.TCPListener {
 
 func advancedUringOwnerUnavailable(err error) bool {
 	return errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) || errors.Is(err, unix.EINVAL)
+}
+
+func TestAdvancedUringOwnerFilesUpdateABI(t *testing.T) {
+	var update advancedUringOwnerFilesUpdate
+	if got, want := unsafe.Sizeof(update), uintptr(16); got != want {
+		t.Fatalf("files update size: got=%d want=%d", got, want)
+	}
+	if got, want := unsafe.Offsetof(update.offset), uintptr(0); got != want {
+		t.Fatalf("offset field position: got=%d want=%d", got, want)
+	}
+	if got, want := unsafe.Offsetof(update.reserved), uintptr(4); got != want {
+		t.Fatalf("reserved field position: got=%d want=%d", got, want)
+	}
+	if got, want := unsafe.Offsetof(update.fds), uintptr(8); got != want {
+		t.Fatalf("fds field position: got=%d want=%d", got, want)
+	}
+	if got, want := unsafe.Sizeof([2]int32{}), uintptr(8); got != want {
+		t.Fatalf("packed descriptor pair size: got=%d want=%d", got, want)
+	}
+}
+
+func TestAdvancedUringOwnerFilesUpdateValidation(t *testing.T) {
+	if err := validateAdvancedUringOwnerFilesUpdate(2, nil); err != nil {
+		t.Fatalf("complete update: %v", err)
+	}
+	if err := validateAdvancedUringOwnerFilesUpdate(1, nil); err == nil || !strings.Contains(err.Error(), "updated=1 want=2") {
+		t.Fatalf("partial update error: %v", err)
+	}
+	sentinel := errors.New("register failure")
+	if err := validateAdvancedUringOwnerFilesUpdate(0, sentinel); !errors.Is(err, sentinel) {
+		t.Fatalf("register error was not preserved: %v", err)
+	}
+}
+
+func TestAdvancedUringOwnerFixedFilePairLifecycle(t *testing.T) {
+	ring := giouring.NewRing()
+	if err := ring.QueueInit(8, 0); advancedUringOwnerUnavailable(err) {
+		t.Skipf("io_uring unavailable: %v", err)
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	defer ring.QueueExit()
+	if _, err := ring.RegisterFilesSparse(2); advancedUringOwnerUnavailable(err) {
+		t.Skipf("sparse fixed files unavailable: %v", err)
+	} else if err != nil {
+		t.Fatal(err)
+	}
+
+	registerAndRelease := func() {
+		pair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer unix.Close(pair[0])
+		defer unix.Close(pair[1])
+		if err := registerAdvancedUringOwnerFilePair(ring, 0, [2]int32{int32(pair[0]), int32(pair[1])}); err != nil {
+			t.Fatalf("register pair: %v", err)
+		}
+		if err := unregisterAdvancedUringOwnerFilePair(ring, 0); err != nil {
+			t.Fatalf("unregister pair: %v", err)
+		}
+	}
+	registerAndRelease()
+	registerAndRelease()
+
+	badPair, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Close(badPair[1]); err != nil {
+		t.Fatal(err)
+	}
+	if err := registerAdvancedUringOwnerFilePair(ring, 0, [2]int32{int32(badPair[0]), int32(badPair[1])}); err == nil {
+		unix.Close(badPair[0])
+		t.Fatal("closed descriptor pair unexpectedly registered")
+	}
+	if err := unix.Close(badPair[0]); err != nil {
+		t.Fatal(err)
+	}
+	// A fresh pair must be able to reuse both slots after the failed update.
+	registerAndRelease()
 }
 
 func TestAdvancedUringOwnerRejectsPartialInitialRecvSetup(t *testing.T) {
