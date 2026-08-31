@@ -21,23 +21,26 @@ import (
 )
 
 const (
-	advancedUringOwnerLoops            = 2
-	advancedUringOwnerEntries          = 4096
-	advancedUringOwnerCQBatch          = 64
-	advancedUringOwnerSetupQueue       = 2048
-	advancedUringOwnerTaskQueue        = 8192
-	advancedUringOwnerMaxSessions      = 2048
-	advancedUringOwnerBuffers          = 2048
-	advancedUringOwnerBufferSize       = 16 * 1024
-	advancedUringOwnerRetainReadBytes  = 64 * 1024
-	advancedUringOwnerRetainReadChunks = 8
-	advancedUringOwnerStarvedFanout    = 8
-	advancedUringOwnerMaxWrite         = 64 * 1024
-	advancedUringOwnerRecvMultishot    = true
-	advancedUringOwnerBufferGroup      = 0
-	advancedUringOwnerWakeUserData     = ^uint64(0)
-	advancedUringOwnerOperationBits    = 3
-	advancedUringOwnerSideShift        = 2
+	advancedUringOwnerLoops             = 2
+	advancedUringOwnerEntries           = 4096
+	advancedUringOwnerCQBatch           = 64
+	advancedUringOwnerSetupQueue        = 2048
+	advancedUringOwnerTaskQueue         = 8192
+	advancedUringOwnerMaxSessions       = 2048
+	advancedUringOwnerBuffers           = 2048
+	advancedUringOwnerSingleMaxSessions = advancedUringOwnerMaxSessions * advancedUringOwnerLoops
+	advancedUringOwnerSingleBuffers     = advancedUringOwnerBuffers * advancedUringOwnerLoops
+	advancedUringOwnerSingleSetupQueue  = advancedUringOwnerSetupQueue * advancedUringOwnerLoops
+	advancedUringOwnerBufferSize        = 16 * 1024
+	advancedUringOwnerRetainReadBytes   = 64 * 1024
+	advancedUringOwnerRetainReadChunks  = 8
+	advancedUringOwnerStarvedFanout     = 8
+	advancedUringOwnerMaxWrite          = 64 * 1024
+	advancedUringOwnerRecvMultishot     = true
+	advancedUringOwnerBufferGroup       = 0
+	advancedUringOwnerWakeUserData      = ^uint64(0)
+	advancedUringOwnerOperationBits     = 3
+	advancedUringOwnerSideShift         = 2
 )
 
 const (
@@ -152,6 +155,7 @@ type advancedUringOwnerLoop struct {
 	starvedCount  int
 	rearmBudget   int
 	starvedCursor uint32
+	maxSessions   uint32
 	probeEpoch    uint64
 	probeUsed     bool
 	stopping      atomic.Bool
@@ -180,9 +184,23 @@ var defaultAdvancedUringOwner struct {
 
 func advancedUringOwnerClient() (*advancedUringOwnerReactor, error) {
 	defaultAdvancedUringOwner.once.Do(func() {
-		defaultAdvancedUringOwner.reactor, defaultAdvancedUringOwner.err = newAdvancedUringOwnerReactor(advancedUringOwnerLoops)
+		loops, buffers, maxSessions, setupQueue := advancedUringOwnerDefaultSizing(runtime.GOMAXPROCS(0))
+		defaultAdvancedUringOwner.reactor, defaultAdvancedUringOwner.err = newAdvancedUringOwnerReactorCapacity(
+			loops,
+			advancedUringOwnerEntries,
+			buffers,
+			maxSessions,
+			setupQueue,
+		)
 	})
 	return defaultAdvancedUringOwner.reactor, defaultAdvancedUringOwner.err
+}
+
+func advancedUringOwnerDefaultSizing(gomaxprocs int) (loops, buffers, maxSessions, setupQueue int) {
+	if gomaxprocs <= 1 {
+		return 1, advancedUringOwnerSingleBuffers, advancedUringOwnerSingleMaxSessions, advancedUringOwnerSingleSetupQueue
+	}
+	return advancedUringOwnerLoops, advancedUringOwnerBuffers, advancedUringOwnerMaxSessions, advancedUringOwnerSetupQueue
 }
 
 func adoptAdvancedUringPair(inbound, outbound *net.TCPConn, session Session) error {
@@ -216,6 +234,16 @@ func newAdvancedUringOwnerReactorSized(loopCount, entries int) (*advancedUringOw
 }
 
 func newAdvancedUringOwnerReactorConfigured(loopCount, entries, bufferCount int) (*advancedUringOwnerReactor, error) {
+	return newAdvancedUringOwnerReactorCapacity(
+		loopCount,
+		entries,
+		bufferCount,
+		advancedUringOwnerMaxSessions,
+		advancedUringOwnerSetupQueue,
+	)
+}
+
+func newAdvancedUringOwnerReactorCapacity(loopCount, entries, bufferCount, maxSessions, setupQueue int) (*advancedUringOwnerReactor, error) {
 	if loopCount <= 0 {
 		return nil, errors.New("owner: advanced io_uring requires at least one loop")
 	}
@@ -225,9 +253,15 @@ func newAdvancedUringOwnerReactorConfigured(loopCount, entries, bufferCount int)
 	if bufferCount <= 0 || bufferCount > 1<<15 || bufferCount&(bufferCount-1) != 0 {
 		return nil, errors.New("owner: advanced io_uring buffer count must be a power of two no greater than 32768")
 	}
+	if maxSessions <= 0 || maxSessions > 1<<15 {
+		return nil, errors.New("owner: advanced io_uring requires a session capacity no greater than 32768")
+	}
+	if setupQueue <= 0 {
+		return nil, errors.New("owner: advanced io_uring requires a positive setup queue size")
+	}
 	reactor := &advancedUringOwnerReactor{loops: make([]*advancedUringOwnerLoop, loopCount)}
 	for index := range reactor.loops {
-		loop, err := startAdvancedUringOwnerLoop(entries, bufferCount)
+		loop, err := startAdvancedUringOwnerLoop(entries, bufferCount, maxSessions, setupQueue)
 		if err != nil {
 			for previous := 0; previous < index; previous++ {
 				reactor.loops[previous].close()
@@ -244,11 +278,11 @@ type advancedUringOwnerLoopResult struct {
 	err  error
 }
 
-func startAdvancedUringOwnerLoop(entries, bufferCount int) (*advancedUringOwnerLoop, error) {
+func startAdvancedUringOwnerLoop(entries, bufferCount, maxSessions, setupQueue int) (*advancedUringOwnerLoop, error) {
 	result := make(chan advancedUringOwnerLoopResult, 1)
 	go func() {
 		runtime.LockOSThread()
-		loop, err := newAdvancedUringOwnerLoop(entries, bufferCount)
+		loop, err := newAdvancedUringOwnerLoop(entries, bufferCount, maxSessions, setupQueue)
 		if err != nil {
 			runtime.UnlockOSThread()
 			result <- advancedUringOwnerLoopResult{err: err}
@@ -262,13 +296,13 @@ func startAdvancedUringOwnerLoop(entries, bufferCount int) (*advancedUringOwnerL
 	return started.loop, started.err
 }
 
-func newAdvancedUringOwnerLoop(entries, bufferCount int) (*advancedUringOwnerLoop, error) {
+func newAdvancedUringOwnerLoop(entries, bufferCount, maxSessions, setupQueue int) (*advancedUringOwnerLoop, error) {
 	ring := giouring.NewRing()
 	flags := giouring.SetupSingleIssuer | giouring.SetupCoopTaskrun | giouring.SetupDeferTaskrun
 	if err := ring.QueueInit(uint32(entries), flags); err != nil {
 		return nil, fmt.Errorf("queue init: %w", err)
 	}
-	if _, err := ring.RegisterFilesSparse(advancedUringOwnerMaxSessions * 2); err != nil {
+	if _, err := ring.RegisterFilesSparse(uint32(maxSessions * 2)); err != nil {
 		ring.QueueExit()
 		return nil, fmt.Errorf("register sparse files: %w", err)
 	}
@@ -309,15 +343,16 @@ func newAdvancedUringOwnerLoop(entries, bufferCount int) (*advancedUringOwnerLoo
 	loop := &advancedUringOwnerLoop{
 		ring:         ring,
 		wakeFD:       wakeFD,
-		setup:        make(chan advancedUringOwnerSetup, advancedUringOwnerSetupQueue),
+		setup:        make(chan advancedUringOwnerSetup, setupQueue),
 		tasks:        make(chan advancedUringOwnerTask, advancedUringOwnerTaskQueue),
-		sessions:     make([]*advancedUringOwnerSession, advancedUringOwnerMaxSessions+1),
+		sessions:     make([]*advancedUringOwnerSession, maxSessions+1),
 		bufferMemory: memory,
 		bufferRing:   bufferRing,
 		bufferBase:   bufferBase,
 		bufferOffset: ringBytes,
 		bufferCount:  bufferCount,
 		bufferMask:   mask,
+		maxSessions:  uint32(maxSessions),
 		done:         make(chan struct{}),
 	}
 	if err := loop.submitWakePoll(); err != nil {
@@ -632,7 +667,7 @@ func (loop *advancedUringOwnerLoop) acquireSessionID() (uint32, error) {
 		loop.freeIDs = loop.freeIDs[:count-1]
 		return id, nil
 	}
-	if loop.nextID >= advancedUringOwnerMaxSessions {
+	if loop.nextID >= loop.maxSessions {
 		return 0, errors.New("owner: advanced io_uring session capacity reached")
 	}
 	loop.nextID++

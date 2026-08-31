@@ -22,6 +22,96 @@ import (
 
 const advancedUringOwnerTestEntries = 1024
 
+func TestAdvancedUringOwnerDefaultSizing(t *testing.T) {
+	tests := []struct {
+		name        string
+		gomaxprocs  int
+		loops       int
+		buffers     int
+		maxSessions int
+		setupQueue  int
+	}{
+		{
+			name:        "zero quota guarded",
+			gomaxprocs:  0,
+			loops:       1,
+			buffers:     advancedUringOwnerBuffers * advancedUringOwnerLoops,
+			maxSessions: advancedUringOwnerMaxSessions * advancedUringOwnerLoops,
+			setupQueue:  advancedUringOwnerSetupQueue * advancedUringOwnerLoops,
+		},
+		{
+			name:        "single CPU",
+			gomaxprocs:  1,
+			loops:       1,
+			buffers:     advancedUringOwnerBuffers * advancedUringOwnerLoops,
+			maxSessions: advancedUringOwnerMaxSessions * advancedUringOwnerLoops,
+			setupQueue:  advancedUringOwnerSetupQueue * advancedUringOwnerLoops,
+		},
+		{
+			name:        "multi CPU",
+			gomaxprocs:  2,
+			loops:       advancedUringOwnerLoops,
+			buffers:     advancedUringOwnerBuffers,
+			maxSessions: advancedUringOwnerMaxSessions,
+			setupQueue:  advancedUringOwnerSetupQueue,
+		},
+		{
+			name:        "wide quota remains bounded",
+			gomaxprocs:  64,
+			loops:       advancedUringOwnerLoops,
+			buffers:     advancedUringOwnerBuffers,
+			maxSessions: advancedUringOwnerMaxSessions,
+			setupQueue:  advancedUringOwnerSetupQueue,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			loops, buffers, maxSessions, setupQueue := advancedUringOwnerDefaultSizing(test.gomaxprocs)
+			if loops != test.loops || buffers != test.buffers || maxSessions != test.maxSessions || setupQueue != test.setupQueue {
+				t.Fatalf(
+					"sizing = (%d, %d, %d, %d), want (%d, %d, %d, %d)",
+					loops, buffers, maxSessions, setupQueue,
+					test.loops, test.buffers, test.maxSessions, test.setupQueue,
+				)
+			}
+			if got, want := loops*buffers, advancedUringOwnerLoops*advancedUringOwnerBuffers; got != want {
+				t.Fatalf("total buffers = %d, want %d", got, want)
+			}
+			if got, want := loops*maxSessions, advancedUringOwnerLoops*advancedUringOwnerMaxSessions; got != want {
+				t.Fatalf("total session capacity = %d, want %d", got, want)
+			}
+			if got, want := loops*setupQueue, advancedUringOwnerLoops*advancedUringOwnerSetupQueue; got != want {
+				t.Fatalf("total setup capacity = %d, want %d", got, want)
+			}
+		})
+	}
+}
+
+func TestAdvancedUringOwnerCapacityValidationFailsBeforeCapabilityProbe(t *testing.T) {
+	tests := []struct {
+		name        string
+		loops       int
+		entries     int
+		buffers     int
+		maxSessions int
+		setupQueue  int
+	}{
+		{name: "no loops", loops: 0, entries: 8, buffers: 8, maxSessions: 8, setupQueue: 8},
+		{name: "no entries", loops: 1, entries: 0, buffers: 8, maxSessions: 8, setupQueue: 8},
+		{name: "no sessions", loops: 1, entries: 8, buffers: 8, maxSessions: 0, setupQueue: 8},
+		{name: "too many sessions", loops: 1, entries: 8, buffers: 8, maxSessions: 1<<15 + 1, setupQueue: 8},
+		{name: "no setup queue", loops: 1, entries: 8, buffers: 8, maxSessions: 8, setupQueue: 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if reactor, err := newAdvancedUringOwnerReactorCapacity(test.loops, test.entries, test.buffers, test.maxSessions, test.setupQueue); err == nil {
+				reactor.close()
+				t.Fatal("invalid sizing unexpectedly reached the capability probe")
+			}
+		})
+	}
+}
+
 type advancedUringOwnerRelaySession struct {
 	conn      [2]Conn
 	pending   [2][]byte
