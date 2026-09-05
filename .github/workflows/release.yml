@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Release version (v1.0.N)
+        description: Release version (v1.x.y)
         required: true
-        default: v1.0.2
+        default: v1.1.0
 
 permissions:
   contents: write
@@ -78,7 +78,7 @@ jobs:
           else
             release_version="${GITHUB_REF_NAME}"
           fi
-          [[ "${release_version}" =~ ^v1\.0\.[0-9]+$ ]]
+          [[ "${release_version}" =~ ^v1\.[0-9]+\.[0-9]+$ ]]
           echo "version=${release_version}" >> "${GITHUB_OUTPUT}"
       - name: Build deterministic archive
         run: >-

@@ -12,8 +12,8 @@ archive_name="$(basename "${archive}")"
 checksum="${archive}.sha256"
 release_version="$(sed -n 's/^CURRENT_V1="\([^"]*\)"/\1/p' "${install_script}")"
 
-if [[ ! "${release_version}" =~ ^v1\.0\.[0-9]+$ ]]; then
-    echo "错误：无法从 install.sh 解析 v1.0.x Release。" >&2
+if [[ ! "${release_version}" =~ ^v1\.[0-9]+\.[0-9]+$ ]]; then
+    echo "错误：无法从 install.sh 解析 v1.x Release。" >&2
     exit 1
 fi
 for required in "${archive}" "${checksum}" "${install_script}"; do

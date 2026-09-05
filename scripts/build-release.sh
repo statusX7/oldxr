@@ -16,7 +16,7 @@ output_dir="${6:-dist}"
 go_bin="${GO_BIN:-go}"
 
 if [[ "${target_os}" != "linux" || ! "${target_arch}" =~ ^(amd64|arm64)$ ]]; then
-    echo "错误：oldxr v1.0.x Release 仅支持 linux/amd64 与 linux/arm64。" >&2
+    echo "错误：oldxr v1.x Release 仅支持 linux/amd64 与 linux/arm64。" >&2
     exit 2
 fi
 if [[ -n "${target_arm}" ]]; then
@@ -27,8 +27,8 @@ if [[ ! "${asset_name}" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "错误：无效的 asset name。" >&2
     exit 2
 fi
-if [[ ! "${release_version}" =~ ^v?1\.0\.[0-9]+$ ]]; then
-    echo "错误：版本必须匹配 v1.0.N。" >&2
+if [[ ! "${release_version}" =~ ^v?1\.[0-9]+\.[0-9]+$ ]]; then
+    echo "错误：版本必须匹配 v1.x.y。" >&2
     exit 2
 fi
 for tool in "${go_bin}" file readelf zip sha256sum; do

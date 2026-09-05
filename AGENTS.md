@@ -1,4 +1,4 @@
-# oldxr 1.0.x 项目规则
+# oldxr 1.x 项目规则
 
 本文件适用于本仓库及其所有子目录。若与最新用户要求冲突，以最新用户要求为准。
 
@@ -13,10 +13,10 @@
 
 ## 产品身份与源码基线
 
-- `1.0.x` 是单一 Go 二进制产品线；当前补丁版本为 `v1.0.2`，binary version 显示 `XrayR 1.0.2`。
+- `1.x` 是单一 Go 二进制产品线；当前收尾发布版本为 `v1.1.0`，binary version 显示 `XrayR 1.1.0`。
 - 开发基线必须是官方 `XrayR v0.9.0` commit `f95825395d192498adfc533ab925943088408cb4`；不得从 r3/r4 删除 Rust 后伪装成官方基线。
 - 历史 `v0.9.0`、`v0.9.0-r1`、`v0.9.0-r2`、`v0.9.0-r3`、`v0.9.0-r4` tags 不移动、不删除、不覆盖。
-- `v1.0.x` production package只包含一个主要运行二进制 `XrayR`。禁止依赖 `XrayR-fastengine`、`XrayR-legacy`、Rust runtime或三二进制 selector。
+- `v1.x` production package只包含一个主要运行二进制 `XrayR`。禁止依赖 `XrayR-fastengine`、`XrayR-legacy`、Rust runtime或三二进制 selector。
 
 ## 不可破坏的兼容合同
 
@@ -24,7 +24,7 @@
 - 必须保持 VMess、Shadowsocks、TCP、UDP、traffic accounting、online IP、SpeedLimit、DeviceLimit、rule、ETag与用户生命周期语义。
 - 必须保持 DNS、routing、`RouteConfigPath`、`OutboundConfigPath`、`InboundConfigPath`、custom files、ProxyProtocol、fallback、TLS/cert等官方 v0.9.0功能。
 - 用户的 `config.yml`、`route.json`、`custom_outbound.json`、`custom_inbound.json`、`dns.json`、`rulelist` 和 cert/key 默认只读保留；升级不得重写或迁移其内容。
-- Debian 11与Ubuntu 20.04是硬兼容目标；优先使用 `CGO_ENABLED=0`，禁止 `target-cpu=native`等不可移植构建。
+- Debian 11与Ubuntu 22.04是硬兼容目标；Ubuntu 20.04不得主动破坏，但不再阻断本次发布。优先使用 `CGO_ENABLED=0`，禁止 `target-cpu=native`等不可移植构建。
 - 正式 installer 必须支持 fresh install与官方 XrayR v0.9.0无损升级；启动/健康检查失败必须自动回滚。
 
 ## 实现边界

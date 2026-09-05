@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if [[ $# -ne 3 ]]; then
-    echo "用法：$0 RELEASE_ARCHIVE INSTALL_SCRIPT OFFICIAL_V0_9_0_BINARY" >&2
+if [[ $# -lt 3 || $# -gt 4 ]]; then
+    echo "用法：$0 RELEASE_ARCHIVE INSTALL_SCRIPT OFFICIAL_V0_9_0_BINARY [OLDXR_V1_BINARY]" >&2
     exit 2
 fi
 
 archive="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 install_script="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
 official_binary="$(cd "$(dirname "$3")" && pwd)/$(basename "$3")"
+oldxr_binary=""
+if [[ $# -eq 4 ]]; then
+    oldxr_binary="$(cd "$(dirname "$4")" && pwd)/$(basename "$4")"
+fi
 archive_name="$(basename "${archive}")"
 checksum="${archive}.sha256"
 release_version="$(sed -n 's/^CURRENT_V1="\([^"]*\)"/\1/p' "${install_script}")"
 
-if [[ ! "${release_version}" =~ ^v1\.0\.[0-9]+$ ]]; then
-    echo "错误：无法从 install.sh 解析 v1.0.x Release。" >&2
+if [[ ! "${release_version}" =~ ^v1\.[0-9]+\.[0-9]+$ ]]; then
+    echo "错误：无法从 install.sh 解析 v1.x Release。" >&2
     exit 1
 fi
 for required in "${archive}" "${checksum}" "${install_script}" "${official_binary}"; do
@@ -24,6 +28,13 @@ done
     echo "错误：输入 binary 不是 exact official XrayR v0.9.0。" >&2
     exit 1
 }
+if [[ -n "${oldxr_binary}" ]]; then
+    [[ -f "${oldxr_binary}" ]] || { echo "错误：oldxr v1 binary 不存在：${oldxr_binary}" >&2; exit 1; }
+    "${oldxr_binary}" -version | grep -E '^XrayR 1\.[0-9]+\.[0-9]+' >/dev/null || {
+        echo "错误：输入 binary 不是 oldxr v1.x。" >&2
+        exit 1
+    }
+fi
 
 test_root="$(mktemp -d)"
 trap 'rm -rf "${test_root}"' EXIT
@@ -176,6 +187,24 @@ CONFIG
     touch "${root}/systemctl-active"
 }
 
+prepare_oldxr_layout() {
+    local name="$1"
+    local config_style="$2"
+    local root="${test_root}/${name}"
+
+    prepare_official_layout "${name}" "${config_style}"
+    cp "${oldxr_binary}" "${root}/usr/local/XrayR/XrayR"
+    chmod +x "${root}/usr/local/XrayR/XrayR"
+    "${oldxr_binary}" -version | sed -nE 's/^XrayR ([0-9]+\.[0-9]+\.[0-9]+).*/v\1/p' > "${root}/usr/local/XrayR/.oldxr-release"
+    cat > "${root}/usr/bin/XrayR" <<'MANAGER'
+#!/usr/bin/env bash
+# https://github.com/statusX7/oldxr
+MANAGER
+    chmod +x "${root}/usr/bin/XrayR"
+    sha256sum "${root}/usr/local/XrayR/XrayR" | awk '{print $1}' > "${root}/binary.sha"
+    sha256sum "${root}/usr/bin/XrayR" | awk '{print $1}' > "${root}/manager.sha"
+}
+
 run_installer() {
     local name="$1"
     shift
@@ -195,6 +224,7 @@ run_installer() {
 
 assert_successful_upgrade() {
     local name="$1"
+    local expected_source="${2:-official XrayR}"
     local root="${test_root}/${name}"
     local config_path
     local config_dir
@@ -204,7 +234,7 @@ assert_successful_upgrade() {
     config_path="$(<"${root}/config-path")"
     config_dir="$(dirname "${config_path}")"
     output="$(run_installer "${name}" "${release_version#v}")"
-    grep -F '检测到现有安装：来源=official XrayR' <<<"${output}" >/dev/null
+    grep -F "检测到现有安装：来源=${expected_source}" <<<"${output}" >/dev/null
     grep -F "检测到配置：${config_path}" <<<"${output}" >/dev/null
     grep -F 'XrayR service 已启动' <<<"${output}" >/dev/null
     grep -Fx "ExecStart=/usr/local/XrayR/XrayR --config ${config_path}" "${root}/etc/systemd/system/XrayR.service" >/dev/null
@@ -246,6 +276,12 @@ echo "执行官方 v0.9.0 -config 非默认路径升级"
 prepare_official_layout official-short short
 assert_successful_upgrade official-short
 
+if [[ -n "${oldxr_binary}" ]]; then
+    echo "执行现有 oldxr v1.x 非默认配置路径升级"
+    prepare_oldxr_layout oldxr-v1 space
+    assert_successful_upgrade oldxr-v1 oldxr
+fi
+
 echo "执行 service 启动失败自动回滚"
 prepare_official_layout rollback space
 touch "${test_root}/rollback/systemctl-fail-once"
@@ -275,4 +311,8 @@ done
 [[ ! -e "${rollback_root}${rollback_dir}/geoip.dat" ]]
 [[ ! -e "${rollback_root}${rollback_dir}/geosite.dat" ]]
 
-echo "PASS：官方 XrayR v0.9.0 三种 config flag 布局均无损升级，用户文件元数据与永久备份完整，启动失败自动回滚通过。"
+if [[ -n "${oldxr_binary}" ]]; then
+    echo "PASS：官方 XrayR v0.9.0 三种 config flag 与 oldxr v1.x 均无损升级，用户文件元数据、永久备份及启动失败自动回滚通过。"
+else
+    echo "PASS：官方 XrayR v0.9.0 三种 config flag 布局均无损升级，用户文件元数据与永久备份完整，启动失败自动回滚通过。"
+fi

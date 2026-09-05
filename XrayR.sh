@@ -6,7 +6,7 @@ green='\033[0;32m'
 yellow='\033[0;33m'
 plain='\033[0m'
 
-version="v1.0.2"
+version="v1.1.0"
 repo="statusX7/oldxr"
 stable_branch="master"
 raw_base="${OLDXR_RAW_BASE:-https://raw.githubusercontent.com/${repo}/${stable_branch}}"
@@ -241,8 +241,8 @@ uninstall_xrayr() {
 show_usage() {
     cat <<'USAGE'
 XrayR 管理命令：
-  XrayR install [1.0.x]
-  XrayR update [1.0.x]
+  XrayR install [1.x.y]
+  XrayR update [1.x.y]
   XrayR start|stop|restart|status|log
   XrayR enable|disable
   XrayR config|version|bbr|update_shell|uninstall

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# oldxr v1.0.x single-binary installer.
+# oldxr v1.x single-binary installer.
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -9,7 +9,7 @@ yellow='\033[0;33m'
 plain='\033[0m'
 
 REPO="statusX7/oldxr"
-CURRENT_V1="v1.0.2"
+CURRENT_V1="v1.1.0"
 RELEASE_BASE="${OLDXR_RELEASE_BASE:-https://github.com/${REPO}/releases/download}"
 INSTALL_ROOT="${OLDXR_INSTALL_ROOT:-}"
 SYSTEMCTL_BIN="${OLDXR_SYSTEMCTL_BIN:-systemctl}"
@@ -122,7 +122,7 @@ detect_arch() {
             arch_name="arm64-v8a"
             ;;
         *)
-            echo -e "${red}错误：${plain}oldxr v1.0.x Release 仅支持 linux/amd64 与 linux/arm64；当前为 ${machine}。" >&2
+            echo -e "${red}错误：${plain}oldxr v1.x Release 仅支持 linux/amd64 与 linux/arm64；当前为 ${machine}。" >&2
             exit 2
             ;;
     esac
@@ -392,19 +392,19 @@ backup_existing_install() {
 resolve_version() {
     local requested="${1:-}"
     case "${requested}" in
-        ""|1.0.2|v1.0.2)
+        ""|1.1.0|v1.1.0)
             resolved_version="${CURRENT_V1}"
             ;;
-        1.0.[0-9]*|v1.0.[0-9]*)
+        1.[0-9]*.[0-9]*|v1.[0-9]*.[0-9]*)
             resolved_version="${requested}"
             [[ "${resolved_version}" == v* ]] || resolved_version="v${resolved_version}"
-            [[ "${resolved_version}" =~ ^v1\.0\.[0-9]+$ ]] || {
-                echo -e "${red}错误：${plain}无效的 oldxr v1.0.x 版本：${requested}" >&2
+            [[ "${resolved_version}" =~ ^v1\.[0-9]+\.[0-9]+$ ]] || {
+                echo -e "${red}错误：${plain}无效的 oldxr v1.x 版本：${requested}" >&2
                 exit 2
             }
             ;;
         *)
-            echo -e "${red}错误：${plain}此安装器仅支持 oldxr v1.0.x；正式版本为 1.0.2。" >&2
+            echo -e "${red}错误：${plain}此安装器仅支持 oldxr v1.x；正式版本为 1.1.0。" >&2
             exit 2
             ;;
     esac
@@ -468,7 +468,7 @@ download_and_verify_release() {
         }
     done
     if [[ -e "${stage_dir}/XrayR-fastengine" || -e "${stage_dir}/XrayR-legacy" ]]; then
-        echo -e "${red}错误：${plain}v1.0.x archive 不得包含旧多二进制 sidecar。" >&2
+        echo -e "${red}错误：${plain}v1.x archive 不得包含旧多二进制 sidecar。" >&2
         exit 1
     fi
     chmod +x "${stage_dir}/XrayR" "${stage_dir}/XrayR.sh"
