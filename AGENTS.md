@@ -2,6 +2,15 @@
 
 本文件适用于本仓库及其所有子目录。若与最新用户要求冲突，以最新用户要求为准。
 
+## v1.1.0-closeout-v1 当前覆盖规则
+
+- 当前任务是已有历史成果的发布收尾：`STOP_EXPERIMENTS → SELECT_EXISTING → CONSOLIDATE → RELEASE`。禁止启动新的性能实验、参数枚举、工具链比较、架构探索或参考项目研究。
+- 唯一主工作目录和发布入口是 `/root/projects/oldxr`。历史报告、实验源码、VM、日志、Release 资产与恢复状态统一存放在根目录的 `.local/`，不得提交或打包。
+- 当前恢复入口是 `.local/state/v1.1.0-closeout-v1/v1.1.0-closeout-v1-RESUME.md`。上下文恢复后从其中记录的第一个未完成发布步骤继续，不重跑历史性能阶段。
+- 用户已将旧数值性能 Gate 对本次 `v1.1.0` 发布标记为 `SUPERSEDED_FOR_THIS_RELEASE`；旧报告中的 FAIL、样本、指标和测试条件必须原样保留。连接稳定性、认证安全、流量正确、V2Board/config 兼容、升级和自动回滚仍是硬阻断项。
+- 本次 Tier 0 最低系统为 Debian 11 与 Ubuntu 22.04；Ubuntu 20.04 不得主动破坏，但不再阻断本次发布。
+- 公开 GitHub Release notes 只写高层稳定性、兼容性和升级信息；安全问题、触发条件、验证过程及内部修复细节仅保存在 `.local` 的版本化内部报告。
+
 ## 产品身份与源码基线
 
 - `1.0.x` 是单一 Go 二进制产品线；当前补丁版本为 `v1.0.2`，binary version 显示 `XrayR 1.0.2`。
@@ -66,6 +75,6 @@
 - 任何与 oldxr 无关的 GitHub 仓库均不在操作范围内，禁止修改、删除、重命名或迁移。
 - 不force push，不重写/删除历史tag；实验只在独立branch，Gate通过前不merge main/master。
 - Git commit message保持英文，每个commit只解决一个逻辑问题。
-- 性能、pprof、perf、内部研究、审计和升级报告只写入`/root/projects/oldxr-reports/go-v1/`，不得提交GitHub。
+- 性能、pprof、perf、内部研究、审计和升级报告只写入 `/root/projects/oldxr/.local/reports/`，不得提交GitHub。
 - GitHub只保留production source、必要tests/fixtures、build/install scripts、AGENTS与极简README。
 - 所有用户可见交流和本地人类可读报告使用简体中文；代码标识符、配置key、路径、命令、API字段和commit message保持英文。

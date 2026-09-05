@@ -16,3 +16,4 @@ main/config.yml
 .DS_Store
 *.bak
 go.work*
+/.local/
