@@ -133,6 +133,26 @@ type ownerTestConn struct {
 	armed           bool
 }
 
+func TestOwnerSSSessionRejectsEnrollmentAndCallbacksAfterClose(t *testing.T) {
+	for _, role := range []owner.Role{owner.Inbound, owner.Outbound} {
+		flow := new(ownerTestFlow)
+		session := &ownerSSSession{flow: flow}
+		session.OnClose(owner.Outbound, nil, io.EOF)
+		late := new(ownerTestConn)
+		session.OnOpen(role, late)
+		if late.closed != 1 || session.inbound != nil || session.outbound != nil {
+			t.Fatal("late endpoint survived session close")
+		}
+		if session.OnTraffic(role, late) != owner.Close || session.OnWritable(role, late) != owner.Close || session.OnReadClosed(role, late) != owner.Close {
+			t.Fatal("closed session accepted callback")
+		}
+		session.OnClose(role, late, nil)
+		if flow.released != 1 {
+			t.Fatalf("flow releases = %d", flow.released)
+		}
+	}
+}
+
 func (c *ownerTestConn) Write(p []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

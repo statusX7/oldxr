@@ -5,6 +5,7 @@ package inbound
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -306,6 +307,73 @@ func TestOwnerVMessSessionSendsTerminationAfterOutboundReadClose(t *testing.T) {
 	}
 	if action := session.OnReadClosed(owner.Inbound, inbound); action != owner.Close {
 		t.Fatalf("both read halves closed action = %v, want Close", action)
+	}
+}
+
+func TestOwnerVMessSessionDefersEarlyOutboundEOFUntilInboundOpen(t *testing.T) {
+	for _, limit := range []int{0, 1} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			codec, client, request := newVMessOwnerCodecForResponseTest(t)
+			session := &ownerVMessSession{
+				codec:        codec,
+				timeouts:     policy.Timeout{ConnectionIdle: time.Minute, UplinkOnly: time.Minute, DownlinkOnly: time.Minute},
+				responseWire: make([]byte, 0, 1024),
+			}
+			inbound, outbound := &vmessOwnerTestConn{tryLimit: limit}, new(vmessOwnerTestConn)
+			session.OnOpen(owner.Outbound, outbound)
+			defer session.idle.Stop()
+			if action := session.OnReadClosed(owner.Outbound, outbound); action != owner.None {
+				t.Fatalf("early EOF action = %v", action)
+			}
+			if session.responseEnded || session.outboundReadDone {
+				t.Fatal("response ended before inbound enrollment")
+			}
+			session.OnOpen(owner.Inbound, inbound)
+			for retries := 0; !session.responseEnded && retries < 1024; retries++ {
+				if action := session.OnWritable(owner.Inbound, inbound); action != owner.None {
+					t.Fatalf("termination write action = %v", action)
+				}
+			}
+			if !session.responseEnded || !session.outboundReadDone {
+				t.Fatal("deferred response termination was not drained")
+			}
+			response := bytes.NewReader(inbound.bytes())
+			if _, err := client.DecodeResponseHeader(response); err != nil {
+				t.Fatal(err)
+			}
+			body, err := client.DecodeResponseBody(request, response)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := body.ReadMultiBuffer()
+			defer buf.ReleaseMulti(data)
+			if err != io.EOF || !data.IsEmpty() {
+				t.Fatalf("termination = %d bytes, %v", data.Len(), err)
+			}
+			if action := session.OnReadClosed(owner.Inbound, inbound); action != owner.Close {
+				t.Fatalf("final close = %v", action)
+			}
+		})
+	}
+}
+
+func TestOwnerVMessSessionRejectsEnrollmentAndCallbacksAfterClose(t *testing.T) {
+	for _, role := range []owner.Role{owner.Inbound, owner.Outbound} {
+		flow := new(vmessOwnerTestFlow)
+		session := &ownerVMessSession{flow: flow}
+		session.OnClose(owner.Outbound, nil, io.EOF)
+		late := new(vmessOwnerTestConn)
+		session.OnOpen(role, late)
+		if late.closed != 1 || session.inbound != nil || session.outbound != nil {
+			t.Fatal("late endpoint survived session close")
+		}
+		if session.OnTraffic(role, late) != owner.Close || session.OnWritable(role, late) != owner.Close || session.OnReadClosed(role, late) != owner.Close {
+			t.Fatal("closed session accepted callback")
+		}
+		session.OnClose(role, late, nil)
+		if flow.released != 1 {
+			t.Fatalf("flow releases = %d", flow.released)
+		}
 	}
 }
 

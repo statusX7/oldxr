@@ -376,6 +376,11 @@ func (s *ownerSSSession) finishRead(role owner.Role) owner.Action {
 }
 
 func (s *ownerSSSession) OnOpen(role owner.Role, conn owner.Conn) {
+	// Enrollment callbacks can arrive after the peer has closed the session.
+	if s.closed {
+		_ = conn.Close()
+		return
+	}
 	if role == owner.Inbound {
 		s.inbound = conn
 		s.idle.Start(s.timeouts.ConnectionIdle, s.expire)
@@ -845,6 +850,9 @@ func (s *ownerSSSession) processOutbound(conn owner.Conn) owner.Action {
 }
 
 func (s *ownerSSSession) OnTraffic(role owner.Role, conn owner.Conn) owner.Action {
+	if s.closed {
+		return owner.Close
+	}
 	s.idle.Update()
 	if !s.flushUpload() || !s.flushDownload() {
 		return s.fail("flush-traffic")
@@ -856,6 +864,9 @@ func (s *ownerSSSession) OnTraffic(role owner.Role, conn owner.Conn) owner.Actio
 }
 
 func (s *ownerSSSession) OnWritable(role owner.Role, _ owner.Conn) owner.Action {
+	if s.closed {
+		return owner.Close
+	}
 	if role == owner.Outbound {
 		if !s.flushUpload() {
 			return s.fail("flush-upload-writable")
@@ -869,6 +880,9 @@ func (s *ownerSSSession) OnWritable(role owner.Role, _ owner.Conn) owner.Action 
 }
 
 func (s *ownerSSSession) OnReadClosed(role owner.Role, _ owner.Conn) owner.Action {
+	if s.closed {
+		return owner.Close
+	}
 	s.idle.Update()
 	if role == owner.Inbound && (!s.wantLength || s.want != 0 || len(s.lengthWire) > 0 || len(s.recordWire) > 0) {
 		return s.fail("truncated-record")

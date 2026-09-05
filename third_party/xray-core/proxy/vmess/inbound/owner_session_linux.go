@@ -620,7 +620,10 @@ func (s *ownerVMessSession) finishResponse() owner.Action {
 		}
 		return owner.None
 	}
-	if !s.outboundEOF || len(s.pendingDownload) > 0 || len(s.pendingWire) > 0 || s.downloadWaiting.Load() {
+	// The outbound is enrolled first and can reach EOF before the inbound
+	// OnOpen callback. Do not seal (or consume) the final record until its
+	// destination exists; OnOpen resumes this pending termination.
+	if s.inbound == nil || !s.outboundEOF || len(s.pendingDownload) > 0 || len(s.pendingWire) > 0 || s.downloadWaiting.Load() {
 		return owner.None
 	}
 	wire, err := s.codec.SealResponseEnd(s.responseWire[:0])
@@ -673,6 +676,11 @@ func (s *ownerVMessSession) processOutbound(conn owner.Conn) owner.Action {
 }
 
 func (s *ownerVMessSession) OnOpen(role owner.Role, conn owner.Conn) {
+	// A failed first enrollment may close the session before its peer opens.
+	if s.closed {
+		_ = conn.Close()
+		return
+	}
 	if role == owner.Outbound {
 		s.outbound = conn
 		if len(s.pendingUpload) > 0 && !s.flushUpload() {
@@ -682,12 +690,15 @@ func (s *ownerVMessSession) OnOpen(role owner.Role, conn owner.Conn) {
 	}
 	s.inbound = conn
 	s.idle.Start(s.timeouts.ConnectionIdle, s.expire)
-	if !s.flushDownload() || s.processInbound(conn) == owner.Close {
+	if !s.flushDownload() || s.processInbound(conn) == owner.Close || s.finishResponse() == owner.Close {
 		_ = conn.Close()
 	}
 }
 
 func (s *ownerVMessSession) OnTraffic(role owner.Role, conn owner.Conn) owner.Action {
+	if s.closed {
+		return owner.Close
+	}
 	s.idle.Update()
 	if !s.flushUpload() || !s.flushDownload() {
 		return owner.Close
@@ -704,6 +715,9 @@ func (s *ownerVMessSession) OnTraffic(role owner.Role, conn owner.Conn) owner.Ac
 }
 
 func (s *ownerVMessSession) OnWritable(role owner.Role, _ owner.Conn) owner.Action {
+	if s.closed {
+		return owner.Close
+	}
 	if role == owner.Outbound {
 		if !s.flushUpload() {
 			return owner.Close
@@ -720,6 +734,9 @@ func (s *ownerVMessSession) OnWritable(role owner.Role, _ owner.Conn) owner.Acti
 }
 
 func (s *ownerVMessSession) OnReadClosed(role owner.Role, conn owner.Conn) owner.Action {
+	if s.closed {
+		return owner.Close
+	}
 	s.idle.Update()
 	if role == owner.Inbound {
 		if len(s.sizePrefix) > 0 || s.wantWire > 0 || len(s.recordWire) > 0 || len(s.cachedWire) > 0 {
