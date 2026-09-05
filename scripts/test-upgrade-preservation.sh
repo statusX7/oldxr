@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-if [[ $# -lt 3 || $# -gt 4 ]]; then
-    echo "用法：$0 RELEASE_ARCHIVE INSTALL_SCRIPT OFFICIAL_V0_9_0_BINARY [OLDXR_V1_BINARY]" >&2
+if [[ $# -lt 3 ]]; then
+    echo "用法：$0 RELEASE_ARCHIVE INSTALL_SCRIPT OFFICIAL_V0_9_0_BINARY [OLDXR_V1_BINARY ...]" >&2
     exit 2
 fi
 
 archive="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 install_script="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
 official_binary="$(cd "$(dirname "$3")" && pwd)/$(basename "$3")"
-oldxr_binary=""
-if [[ $# -eq 4 ]]; then
-    oldxr_binary="$(cd "$(dirname "$4")" && pwd)/$(basename "$4")"
+oldxr_binaries=()
+if [[ $# -gt 3 ]]; then
+    for input_binary in "${@:4}"; do
+        oldxr_binaries+=("$(cd "$(dirname "${input_binary}")" && pwd)/$(basename "${input_binary}")")
+    done
 fi
 archive_name="$(basename "${archive}")"
 checksum="${archive}.sha256"
@@ -28,13 +30,13 @@ done
     echo "错误：输入 binary 不是 exact official XrayR v0.9.0。" >&2
     exit 1
 }
-if [[ -n "${oldxr_binary}" ]]; then
+for oldxr_binary in "${oldxr_binaries[@]}"; do
     [[ -f "${oldxr_binary}" ]] || { echo "错误：oldxr v1 binary 不存在：${oldxr_binary}" >&2; exit 1; }
     "${oldxr_binary}" -version | grep -E '^XrayR 1\.[0-9]+\.[0-9]+' >/dev/null || {
         echo "错误：输入 binary 不是 oldxr v1.x。" >&2
         exit 1
     }
-fi
+done
 
 test_root="$(mktemp -d)"
 trap 'rm -rf "${test_root}"' EXIT
@@ -190,12 +192,13 @@ CONFIG
 prepare_oldxr_layout() {
     local name="$1"
     local config_style="$2"
+    local source_binary="$3"
     local root="${test_root}/${name}"
 
     prepare_official_layout "${name}" "${config_style}"
-    cp "${oldxr_binary}" "${root}/usr/local/XrayR/XrayR"
+    cp "${source_binary}" "${root}/usr/local/XrayR/XrayR"
     chmod +x "${root}/usr/local/XrayR/XrayR"
-    "${oldxr_binary}" -version | sed -nE 's/^XrayR ([0-9]+\.[0-9]+\.[0-9]+).*/v\1/p' > "${root}/usr/local/XrayR/.oldxr-release"
+    "${source_binary}" -version | sed -nE 's/^XrayR ([0-9]+\.[0-9]+\.[0-9]+).*/v\1/p' > "${root}/usr/local/XrayR/.oldxr-release"
     cat > "${root}/usr/bin/XrayR" <<'MANAGER'
 #!/usr/bin/env bash
 # https://github.com/statusX7/oldxr
@@ -276,11 +279,14 @@ echo "执行官方 v0.9.0 -config 非默认路径升级"
 prepare_official_layout official-short short
 assert_successful_upgrade official-short
 
-if [[ -n "${oldxr_binary}" ]]; then
-    echo "执行现有 oldxr v1.x 非默认配置路径升级"
-    prepare_oldxr_layout oldxr-v1 space
-    assert_successful_upgrade oldxr-v1 oldxr
-fi
+oldxr_index=0
+for oldxr_binary in "${oldxr_binaries[@]}"; do
+    oldxr_index=$((oldxr_index + 1))
+    oldxr_version="$("${oldxr_binary}" -version | sed -nE 's/^XrayR ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')"
+    echo "执行现有 oldxr ${oldxr_version} 非默认配置路径升级"
+    prepare_oldxr_layout "oldxr-v1-${oldxr_index}" space "${oldxr_binary}"
+    assert_successful_upgrade "oldxr-v1-${oldxr_index}" oldxr
+done
 
 echo "执行 service 启动失败自动回滚"
 prepare_official_layout rollback space
@@ -311,7 +317,7 @@ done
 [[ ! -e "${rollback_root}${rollback_dir}/geoip.dat" ]]
 [[ ! -e "${rollback_root}${rollback_dir}/geosite.dat" ]]
 
-if [[ -n "${oldxr_binary}" ]]; then
+if [[ ${#oldxr_binaries[@]} -gt 0 ]]; then
     echo "PASS：官方 XrayR v0.9.0 三种 config flag 与 oldxr v1.x 均无损升级，用户文件元数据、永久备份及启动失败自动回滚通过。"
 else
     echo "PASS：官方 XrayR v0.9.0 三种 config flag 布局均无损升级，用户文件元数据与永久备份完整，启动失败自动回滚通过。"
