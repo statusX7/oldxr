@@ -278,6 +278,41 @@ func TestOwnerSSSessionPreservesOppositeDirectionAfterReadClose(t *testing.T) {
 	}
 }
 
+func TestOwnerSSSessionEarlyReadCloseKeepsTimeout(t *testing.T) {
+	for _, timeout := range []time.Duration{0, 5 * time.Millisecond} {
+		t.Run(timeout.String(), func(t *testing.T) {
+			flow := new(ownerTestFlow)
+			session := &ownerSSSession{
+				flow:       flow,
+				timeouts:   policy.Timeout{ConnectionIdle: time.Minute, UplinkOnly: timeout},
+				wantLength: true,
+			}
+			inbound, outbound := new(ownerTestConn), new(ownerTestConn)
+			session.OnOpen(owner.Outbound, outbound)
+			defer session.idle.Stop()
+			if action := session.OnReadClosed(owner.Outbound, outbound); action != owner.None {
+				t.Fatalf("early EOF = %v", action)
+			}
+			session.OnOpen(owner.Inbound, inbound)
+			if timeout == 0 && (inbound.closeCount() != 1 || outbound.closeCount() != 1) {
+				t.Fatal("zero half-close timeout did not close both endpoints synchronously")
+			}
+			deadline := time.Now().Add(time.Second)
+			for inbound.closeCount() == 0 || outbound.closeCount() == 0 {
+				if time.Now().After(deadline) {
+					t.Fatal("early half-close lost its expiry callback")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			session.OnClose(owner.Inbound, inbound, nil)
+			session.OnClose(owner.Outbound, outbound, nil)
+			if flow.released != 1 {
+				t.Fatalf("flow releases = %d", flow.released)
+			}
+		})
+	}
+}
+
 func TestConsumeOwnerPendingRetainsCapacity(t *testing.T) {
 	pending := append(make([]byte, 0, 16), []byte("abcdefgh")...)
 	base := &pending[:cap(pending)][0]

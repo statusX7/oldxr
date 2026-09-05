@@ -367,7 +367,11 @@ func (s *ownerSSSession) finishRead(role owner.Role) owner.Action {
 			return owner.None
 		}
 		s.outboundReadDone = true
-		s.idle.SetTimeout(s.timeouts.UplinkOnly)
+		// Outbound EOF can precede inbound enrollment. The timer callback is
+		// installed by OnOpen; defer this policy transition until then.
+		if s.inbound != nil {
+			s.idle.SetTimeout(s.timeouts.UplinkOnly)
+		}
 	}
 	if s.inboundReadDone && s.outboundReadDone {
 		return owner.Close
@@ -384,6 +388,12 @@ func (s *ownerSSSession) OnOpen(role owner.Role, conn owner.Conn) {
 	if role == owner.Inbound {
 		s.inbound = conn
 		s.idle.Start(s.timeouts.ConnectionIdle, s.expire)
+		if s.outboundReadDone {
+			s.idle.SetTimeout(s.timeouts.UplinkOnly)
+			if s.timeouts.UplinkOnly <= 0 {
+				return
+			}
+		}
 		if !s.flushDownload() || s.processInbound(conn) == owner.Close {
 			_ = conn.Close()
 		}
