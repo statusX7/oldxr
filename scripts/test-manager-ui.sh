@@ -107,5 +107,7 @@ bbr_output="$(run_menu 11)"
 grep -F '即将运行原版菜单使用的第三方内核/BBR脚本' <<<"${bbr_output}" >/dev/null
 grep -Fx 'executed' "${bbr_marker}" >/dev/null
 
-grep -F 'version="v1.1.0"' "${repo_root}/XrayR.sh" >/dev/null
-echo "PASS：v1.1.0 管理脚本采用原版 v0.9.0 菜单布局，状态展示与第三方内核脚本菜单路由通过。"
+release_version="$(sed -n 's/^CURRENT_V1="\([^"]*\)"/\1/p' "${repo_root}/install.sh")"
+[[ "${release_version}" =~ ^v1\.[0-9]+\.[0-9]+$ ]]
+grep -Fx "version=\"${release_version}\"" "${repo_root}/XrayR.sh" >/dev/null
+echo "PASS：${release_version} 管理脚本采用原版 v0.9.0 菜单布局，状态展示与第三方内核脚本菜单路由通过。"

@@ -71,7 +71,7 @@ run_installer() {
 }
 
 echo "执行 ${release_version} 单二进制 fresh install"
-fresh_output="$(run_installer "${release_version#v}")"
+fresh_output="$(run_installer)"
 grep -F "目标 oldxr 版本：${release_version}" <<<"${fresh_output}" >/dev/null
 grep -F "oldxr ${release_version} 安装完成" <<<"${fresh_output}" >/dev/null
 
