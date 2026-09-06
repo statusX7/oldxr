@@ -1,13 +1,40 @@
-# oldxr 1.0.x 项目规则
+# oldxr 1.x 项目规则
 
 本文件适用于本仓库及其所有子目录。若与最新用户要求冲突，以最新用户要求为准。
 
+## v1.1.0-historical-release-r1 当前发布规则
+
+- 最新用户只允许发布 `v1.1.0`；其他 GitHub 版本、main/master、默认安装入口均不修改。
+- 选用历史快照 `ae38a9838c75ecec7a92d0201946f909f42debba`，保持 Go1.27.0 和已有运行时代码，不再修复或启动性能实验。
+- 本次以预发布形式提供，不设 latest；不得将未通过的连接样本宣称稳定PASS、性能排名或确定收益。旧报告原样保留。
+- 唯一主工作目录为 `/root/projects/oldxr`；所有证据、资产与状态在 `.local/`，不提交、不打包。
+- 恢复入口：`.local/state/v1.1.0-historical-release-r1/v1.1.0-historical-release-r1-RESUME.md`。只补打包、隔离安装/升级/回滚验证和v1.1.0公开核验。
+- 该tag中的安装入口固定为 `https://raw.githubusercontent.com/statusX7/oldxr/v1.1.0/install.sh`；不改变master安装行为。
+- 下方均为历史取证规则。与本节或最新用户要求冲突时，不重新启动已停止任务。
+
+## v1.1.0-v103-cpu-r1 历史恢复规则（已封存）
+
+- 当前任务是以 exact public v1.0.3 为 CPU 对照复核历史候选，只有性能证据有效且连接稳定的候选才可替换 v1.1.0；旧数值性能目标不自动恢复。
+- v1.1.0 当前暂停公开提供，默认安装版本为 v1.0.3。不得把下方已封存 closeout 结论当作本轮发布资格，也不得自动恢复旧 Release。
+- 唯一工作根目录仍为 `/root/projects/oldxr`；实验源码、结果与二进制全部保存在 `.local/`，不得上传。
+- 恢复时先读 `.local/state/v1.1.0-v103-cpu-r1/v1.1.0-v103-cpu-r1-RESUME.md` 及同目录 STATE/LEDGER，从实际未完成项继续。已完成比较和失败样本不得因上下文压缩重复执行。
+- 当前没有冻结的可发布性能胜出候选。未通过连接验证的实验代码不进入公开运行时；不自动开启新优化架构或参数枚举。
+
+## v1.1.0-closeout-v1 历史覆盖规则（已封存；冲突时以上节为准）
+
+- 当前任务是已有历史成果的发布收尾：`STOP_EXPERIMENTS → SELECT_EXISTING → CONSOLIDATE → RELEASE`。禁止启动新的性能实验、参数枚举、工具链比较、架构探索或参考项目研究。
+- 唯一主工作目录和发布入口是 `/root/projects/oldxr`。历史报告、实验源码、VM、日志、Release 资产与恢复状态统一存放在根目录的 `.local/`，不得提交或打包。
+- 当前恢复入口是 `.local/state/v1.1.0-closeout-v1/v1.1.0-closeout-v1-RESUME.md`。上下文恢复后从其中记录的第一个未完成发布步骤继续，不重跑历史性能阶段。
+- 用户已将旧数值性能 Gate 对本次 `v1.1.0` 发布标记为 `SUPERSEDED_FOR_THIS_RELEASE`；旧报告中的 FAIL、样本、指标和测试条件必须原样保留。连接稳定性、认证安全、流量正确、V2Board/config 兼容、升级和自动回滚仍是硬阻断项。
+- 本次 Tier 0 最低系统为 Debian 11 与 Ubuntu 22.04；Ubuntu 20.04 不得主动破坏，但不再阻断本次发布。
+- 公开 GitHub Release notes 只写高层稳定性、兼容性和升级信息；安全问题、触发条件、验证过程及内部修复细节仅保存在 `.local` 的版本化内部报告。
+
 ## 产品身份与源码基线
 
-- `1.0.x` 是单一 Go 二进制产品线，首个候选版本为 `v1.0.0`，binary version 显示 `XrayR 1.0.0`。
+- `1.x` 是单一 Go 二进制产品线；当前收尾发布版本为 `v1.1.0`，binary version 显示 `XrayR 1.1.0`。
 - 开发基线必须是官方 `XrayR v0.9.0` commit `f95825395d192498adfc533ab925943088408cb4`；不得从 r3/r4 删除 Rust 后伪装成官方基线。
 - 历史 `v0.9.0`、`v0.9.0-r1`、`v0.9.0-r2`、`v0.9.0-r3`、`v0.9.0-r4` tags 不移动、不删除、不覆盖。
-- `v1.0.0` production package只包含一个主要运行二进制 `XrayR`。禁止依赖 `XrayR-fastengine`、`XrayR-legacy`、Rust runtime或三二进制 selector。
+- `v1.x` production package只包含一个主要运行二进制 `XrayR`。禁止依赖 `XrayR-fastengine`、`XrayR-legacy`、Rust runtime或三二进制 selector。
 
 ## 不可破坏的兼容合同
 
@@ -15,7 +42,7 @@
 - 必须保持 VMess、Shadowsocks、TCP、UDP、traffic accounting、online IP、SpeedLimit、DeviceLimit、rule、ETag与用户生命周期语义。
 - 必须保持 DNS、routing、`RouteConfigPath`、`OutboundConfigPath`、`InboundConfigPath`、custom files、ProxyProtocol、fallback、TLS/cert等官方 v0.9.0功能。
 - 用户的 `config.yml`、`route.json`、`custom_outbound.json`、`custom_inbound.json`、`dns.json`、`rulelist` 和 cert/key 默认只读保留；升级不得重写或迁移其内容。
-- Debian 11与Ubuntu 20.04是硬兼容目标；优先使用 `CGO_ENABLED=0`，禁止 `target-cpu=native`等不可移植构建。
+- Debian 11与Ubuntu 22.04是硬兼容目标；Ubuntu 20.04不得主动破坏，但不再阻断本次发布。优先使用 `CGO_ENABLED=0`，禁止 `target-cpu=native`等不可移植构建。
 - 正式 installer 必须支持 fresh install与官方 XrayR v0.9.0无损升级；启动/健康检查失败必须自动回滚。
 
 ## 实现边界
@@ -33,11 +60,11 @@
 - 正式主负载：10个独立 V2Board 1.6.0 sites、1000 registered/site、25 VMess + 25 SS active/site、500 TCP connections、4KiB/application write、1000Mbps aggregate application payload（500Mbps upload + echo返回500Mbps download）。
 - 正式server固定4 vCPU/4GiB；1C1G只用于maximum-sustainable辅助结果。发布主判定使用独立物理/云Proxy Host，暂不可用时使用独立KVM virtio P-path并明确标注；本机veth/netns只作系统下界、开发回归和调度诊断，loopback不得作为Release Gate。
 - 原版与candidate必须使用相同硬件、CPU affinity/quota、MemoryMax、kernel、完整config/route/outbound/rulelist、用户、连接、流量、功能开关、warmup和measurement。负载发生器仍以1000Mbps aggregate application payload为目标；执行时实测吞吐达到`950Mbps`即通过筛选与正式throughput Gate，CPU按实际成功传输的application bytes归一化。不得为了过Gate主动降低发送计划、连接数或功能。
-- CPU发布硬目标：在正式P-path 1000Mbps固定吞吐主负载中，candidate cgroup normalized CPU cost `<=70%` exact official v0.9.0，即改善`>=30%`。`30%–40%`可接受，`>=40%`为优先目标；低于`30%`不得发布`v1.0.0`。Mixed必须达到该Gate；VMess-only和SS-only各自目标`>=20%`且任何一个不得回退超过`5%`。同时报告same-P代码收益、task-clock ms/MB和CPU/Mbps，不得把单纯P-width变化冒充源码收益。
+- CPU发布硬目标：在正式P-path 1000Mbps固定吞吐主负载中，candidate cgroup normalized CPU cost `<=70%` exact official v0.9.0，即改善`>=30%`。`30%–40%`可接受，`>=40%`为优先目标；低于`30%`不得发布`v1.0.x`。Mixed必须达到该Gate；VMess-only和SS-only各自目标`>=20%`且任何一个不得回退超过`5%`。同时报告same-P代码收益、task-clock ms/MB和CPU/Mbps，不得把单纯P-width变化冒充源码收益。
 - RAM硬目标：candidate RSS `<=50%` official，并记录heap、objects、goroutines、FD和时间斜率。
 - 筛选至少3轮、warmup至少30秒、measurement至少60秒；正式结果至少10轮交叉/随机顺序且measurement至少180秒，不得挑最好一次。
 - 主测试必须开启traffic accounting、online IP/device、SpeedLimit、DeviceLimit、route/outbound/rulelist、panel polling/submit与UDP support。
-- 任一CPU、RAM、功能、OS、soak、安全、升级或rollback Gate失败时，不得发布`v1.0.0`、不得更新master安装入口、不得宣称完成。
+- 任一CPU、RAM、功能、OS、soak、安全、升级或rollback Gate失败时，不得发布`v1.0.x`、不得更新master安装入口、不得宣称完成；用户明确接受且在Release notes完整披露的特定安全例外除外，该例外不得自动延伸到其他版本。
 
 ## 证据驱动开发
 
@@ -59,8 +86,13 @@
 
 ## Git、报告与交流
 
+- oldxr 唯一允许使用的 GitHub 仓库是 `https://github.com/statusX7/oldxr`。
+- 禁止新建、上传、迁移或保留任何其他名称中包含 `oldxr` 的 GitHub 仓库，包括 `oldxr-gnet`、`oldxr-xray-core`、`oldxr-giouring` 等独立依赖仓库。
+- oldxr 的正式源码、必要维护依赖、版本更新、tag 和 Release 必须统一进入 `statusX7/oldxr`；需要维护的 fork 源码应放入本仓库受控目录，不得另建远程仓库。
+- 删除旧 GitHub 仓库不授权删除任何对应本地源码、配置、构建产物、实验结果或 Git mirror；本地证据必须完整保留。
+- 任何与 oldxr 无关的 GitHub 仓库均不在操作范围内，禁止修改、删除、重命名或迁移。
 - 不force push，不重写/删除历史tag；实验只在独立branch，Gate通过前不merge main/master。
 - Git commit message保持英文，每个commit只解决一个逻辑问题。
-- 性能、pprof、perf、内部研究、审计和升级报告只写入`/root/projects/oldxr-reports/go-v1/`，不得提交GitHub。
+- 性能、pprof、perf、内部研究、审计和升级报告只写入 `/root/projects/oldxr/.local/reports/`，不得提交GitHub。
 - GitHub只保留production source、必要tests/fixtures、build/install scripts、AGENTS与极简README。
 - 所有用户可见交流和本地人类可读报告使用简体中文；代码标识符、配置key、路径、命令、API字段和commit message保持英文。

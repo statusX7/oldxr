@@ -12,8 +12,8 @@ archive_name="$(basename "${archive}")"
 checksum="${archive}.sha256"
 release_version="$(sed -n 's/^CURRENT_V1="\([^"]*\)"/\1/p' "${install_script}")"
 
-if [[ ! "${release_version}" =~ ^v1\.0\.[0-9]+$ ]]; then
-    echo "错误：无法从 install.sh 解析 v1.0.x Release。" >&2
+if [[ ! "${release_version}" =~ ^v1\.[0-9]+\.[0-9]+$ ]]; then
+    echo "错误：无法从 install.sh 解析 v1.x Release。" >&2
     exit 1
 fi
 for required in "${archive}" "${checksum}" "${install_script}"; do
@@ -70,8 +70,8 @@ run_installer() {
         bash "${install_script}" "$@"
 }
 
-echo "执行 v1.0.0 单二进制 fresh install"
-fresh_output="$(run_installer 1.0.0)"
+echo "执行 ${release_version} 单二进制 fresh install"
+fresh_output="$(run_installer)"
 grep -F "目标 oldxr 版本：${release_version}" <<<"${fresh_output}" >/dev/null
 grep -F "oldxr ${release_version} 安装完成" <<<"${fresh_output}" >/dev/null
 
@@ -110,7 +110,7 @@ fi
 
 config_hash_before="$(sha256sum "${install_root}/etc/XrayR/config.yml" | awk '{print $1}')"
 touch "${systemctl_state}"
-echo "执行 v1.0.0 事务更新"
+echo "执行 ${release_version} 事务更新"
 update_output="$(run_installer "${release_version}")"
 grep -F "XrayR service 已启动" <<<"${update_output}" >/dev/null
 grep -F "可回滚备份：" <<<"${update_output}" >/dev/null
@@ -139,7 +139,7 @@ echo "执行 checksum 失败停服前保护"
 binary_hash_before="$(sha256sum "${install_root}/usr/local/XrayR/XrayR" | awk '{print $1}')"
 stop_count_before="$(grep -c '^stop XrayR$' "${systemctl_log}" || true)"
 printf 'corrupt' >> "${release_root}/${release_version}/${archive_name}"
-if run_installer 1.0.0 >/dev/null 2>&1; then
+if run_installer "${release_version#v}" >/dev/null 2>&1; then
     echo "错误：损坏的 archive 未被 checksum 拒绝。" >&2
     exit 1
 fi
@@ -156,4 +156,4 @@ if run_installer 0.9.0 >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "PASS：v1.0.0 单二进制 fresh install、update、备份、manager、systemd 与 checksum pre-stop Gate 均通过。"
+echo "PASS：${release_version} 单二进制 fresh install、update、备份、manager、systemd 与 checksum pre-stop Gate 均通过。"

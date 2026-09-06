@@ -6,11 +6,12 @@ green='\033[0;32m'
 yellow='\033[0;33m'
 plain='\033[0m'
 
-version="v1.0.0"
+version="v1.1.0"
 repo="statusX7/oldxr"
-stable_branch="master"
+stable_branch="v1.1.0"
 raw_base="${OLDXR_RAW_BASE:-https://raw.githubusercontent.com/${repo}/${stable_branch}}"
 install_url="${raw_base}/install.sh"
+bbr_script_url="${OLDXR_BBR_SCRIPT_URL:-https://raw.githubusercontent.com/chiakge/Linux-NetSpeed/master/tcp.sh}"
 install_root="${OLDXR_INSTALL_ROOT:-}"
 systemctl_bin="${OLDXR_SYSTEMCTL_BIN:-systemctl}"
 service_file="${OLDXR_SERVICE_FILE:-${install_root}/etc/systemd/system/XrayR.service}"
@@ -58,11 +59,11 @@ run_installer() {
 }
 
 install_xrayr() {
-    run_installer "${1:-1.0.0}"
+    run_installer "${1:-${version#v}}"
 }
 
 update_xrayr() {
-    local requested="${1:-1.0.0}"
+    local requested="${1:-${version#v}}"
     if run_installer "${requested}"; then
         echo -e "${green}更新完成；服务状态已由事务安装器验证。${plain}"
     else
@@ -104,13 +105,32 @@ restart_xrayr() {
 }
 
 show_status() {
+    local status
     if check_status; then
-        echo -e "XrayR 状态：${green}运行中${plain}"
+        status=0
     else
-        case $? in
-            2) echo -e "XrayR 状态：${red}未安装${plain}" ;;
-            *) echo -e "XrayR 状态：${yellow}未运行${plain}" ;;
-        esac
+        status=$?
+    fi
+    case "${status}" in
+        0)
+            echo -e "XrayR状态: ${green}已运行${plain}"
+            show_enable_status
+            ;;
+        2)
+            echo -e "XrayR状态: ${red}未安装${plain}"
+            ;;
+        *)
+            echo -e "XrayR状态: ${yellow}未运行${plain}"
+            show_enable_status
+            ;;
+    esac
+}
+
+show_enable_status() {
+    if run_systemctl is-enabled --quiet XrayR; then
+        echo -e "是否开机自启: ${green}是${plain}"
+    else
+        echo -e "是否开机自启: ${red}否${plain}"
     fi
 }
 
@@ -178,6 +198,31 @@ update_shell() {
     echo -e "${green}管理脚本升级完成。${plain}"
 }
 
+install_bbr() {
+    local temporary
+    local status
+    temporary="$(mktemp)"
+    echo -e "${yellow}即将运行原版菜单使用的第三方内核/BBR脚本。该脚本会修改系统内核并可能要求重启。${plain}"
+    if ! curl --fail --location --silent --show-error --retry 3 --output "${temporary}" "${bbr_script_url}"; then
+        rm -f -- "${temporary}"
+        echo -e "${red}下载 BBR 安装脚本失败：${bbr_script_url}${plain}" >&2
+        return 1
+    fi
+    if ! bash -n "${temporary}"; then
+        rm -f -- "${temporary}"
+        echo -e "${red}BBR 安装脚本语法校验失败，已拒绝执行。${plain}" >&2
+        return 1
+    fi
+    if bash "${temporary}"; then
+        status=0
+    else
+        status=$?
+        echo -e "${red}第三方内核/BBR脚本执行失败，退出码：${status}${plain}" >&2
+    fi
+    rm -f -- "${temporary}"
+    return "${status}"
+}
+
 uninstall_xrayr() {
     local answer
     read -r -p "确定卸载 XrayR 并删除 /etc/XrayR 吗？[y/N]: " answer
@@ -196,54 +241,64 @@ uninstall_xrayr() {
 show_usage() {
     cat <<'USAGE'
 XrayR 管理命令：
-  XrayR install [1.0.x]
-  XrayR update [1.0.x]
+  XrayR install [1.x.y]
+  XrayR update [1.x.y]
   XrayR start|stop|restart|status|log
   XrayR enable|disable
-  XrayR config|version|update_shell|uninstall
+  XrayR config|version|bbr|update_shell|uninstall
 USAGE
 }
 
 show_menu() {
     local choice
-    echo -e "${green}oldxr ${version} 单 Go 二进制管理脚本${plain}"
+    echo -e "
+  ${green}XrayR 后端管理脚本，${plain}${red}不适用于docker${plain}
+--- https://github.com/statusX7/oldxr ---
+  ${green}0.${plain} 修改配置
+————————————————
+  ${green}1.${plain} 安装 XrayR
+  ${green}2.${plain} 更新 XrayR
+  ${green}3.${plain} 卸载 XrayR
+————————————————
+  ${green}4.${plain} 启动 XrayR
+  ${green}5.${plain} 停止 XrayR
+  ${green}6.${plain} 重启 XrayR
+  ${green}7.${plain} 查看 XrayR 状态
+  ${green}8.${plain} 查看 XrayR 日志
+————————————————
+  ${green}9.${plain} 设置 XrayR 开机自启
+ ${green}10.${plain} 取消 XrayR 开机自启
+————————————————
+ ${green}11.${plain} 一键安装 bbr (最新内核)
+ ${green}12.${plain} 查看 XrayR 版本
+ ${green}13.${plain} 升级维护脚本
+"
     show_status
-    cat <<'MENU'
-1. 安装
-2. 更新
-3. 启动
-4. 停止
-5. 重启
-6. 查看状态
-7. 查看日志
-8. 修改配置
-9. 查看版本
-10. 升级管理脚本
-11. 卸载
-0. 退出
-MENU
-    read -r -p "请选择 [0-11]: " choice
+    echo
+    read -r -p "请输入选择 [0-13]: " choice
     case "${choice}" in
-        1) install_xrayr 1.0.0 ;;
-        2) update_xrayr 1.0.0 ;;
-        3) start_xrayr ;;
-        4) stop_xrayr ;;
-        5) restart_xrayr ;;
-        6) show_service_status ;;
-        7) show_log ;;
-        8) edit_config ;;
-        9) show_version ;;
-        10) update_shell ;;
-        11) uninstall_xrayr ;;
-        0) return 0 ;;
-        *) echo -e "${red}无效选择。${plain}" >&2; return 2 ;;
+        0) edit_config ;;
+        1) install_xrayr "${version#v}" ;;
+        2) update_xrayr "${version#v}" ;;
+        3) uninstall_xrayr ;;
+        4) start_xrayr ;;
+        5) stop_xrayr ;;
+        6) restart_xrayr ;;
+        7) show_service_status ;;
+        8) show_log ;;
+        9) enable_xrayr ;;
+        10) disable_xrayr ;;
+        11) install_bbr ;;
+        12) show_version ;;
+        13) update_shell ;;
+        *) echo -e "${red}请输入正确的数字 [0-13]${plain}" >&2; return 2 ;;
     esac
 }
 
 case "${1:-}" in
     "") show_menu ;;
-    install) install_xrayr "${2:-1.0.0}" ;;
-    update) check_install; update_xrayr "${2:-1.0.0}" ;;
+    install) install_xrayr "${2:-${version#v}}" ;;
+    update) check_install; update_xrayr "${2:-${version#v}}" ;;
     start) start_xrayr ;;
     stop) stop_xrayr ;;
     restart) restart_xrayr ;;
@@ -253,6 +308,7 @@ case "${1:-}" in
     log) show_log ;;
     config) edit_config ;;
     version) show_version ;;
+    bbr) install_bbr ;;
     update_shell) update_shell ;;
     uninstall) check_install; uninstall_xrayr ;;
     help|-h|--help) show_usage ;;

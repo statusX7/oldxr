@@ -1,5 +1,7 @@
+# oldxr 默认配置模板。
+# VMess+TCP 与 Shadowsocks AES-128-GCM 无 TLS 时，只需填写面板地址、密钥、节点 ID 和 NodeType。
 Log:
-  Level: warning # Log level: none, error, warning, info, debug 
+  Level: none # 排障时可临时改为 error、warning、info 或 debug
   AccessPath: # /etc/XrayR/access.Log
   ErrorPath: # /etc/XrayR/error.log
 DnsConfigPath: # /etc/XrayR/dns.json # Path to dns config, check https://xtls.github.io/config/dns.html for help
@@ -7,14 +9,14 @@ RouteConfigPath: # /etc/XrayR/route.json # Path to route config, check https://x
 InboundConfigPath: # /etc/XrayR/custom_inbound.json # Path to custom inbound config, check https://xtls.github.io/config/inbound.html for help
 OutboundConfigPath: # /etc/XrayR/custom_outbound.json # Path to custom outbound config, check https://xtls.github.io/config/outbound.html for help
 ConnectionConfig:
-  Handshake: 4 # Handshake time limit, Second
-  ConnIdle: 30 # Connection idle time limit, Second
-  UplinkOnly: 2 # Time limit when the connection downstream is closed, Second
-  DownlinkOnly: 4 # Time limit when the connection is closed after the uplink is closed, Second
-  BufferSize: 64 # The internal cache size of each connection, kB
+  Handshake: 8 # 握手超时，单位秒
+  ConnIdle: 21600 # 静默长连接最长保留6小时
+  UplinkOnly: 300 # 下行结束后的半关闭保留时间，单位秒
+  DownlinkOnly: 300 # 上行结束后的半关闭保留时间，单位秒
+  BufferSize: 256 # 每条连接的内部缓存上限，单位kB
 Nodes:
   -
-    PanelType: "SSpanel" # Panel type: SSpanel, V2board, NewV2board, PMpanel, Proxypanel, V2RaySocks
+    PanelType: "V2board" # Panel type: SSpanel, V2board, NewV2board, PMpanel, Proxypanel, V2RaySocks
     ApiConfig:
       ApiHost: "http://127.0.0.1:667"
       ApiKey: "123"
@@ -32,6 +34,10 @@ Nodes:
       UpdatePeriodic: 60 # Time to update the nodeinfo, how many sec.
       EnableDNS: false # Use custom DNS config, Please ensure that you set the dns.json well
       DNSType: AsIs # AsIs, UseIP, UseIPv4, UseIPv6, DNS strategy
+      DisableUploadTraffic: false # 保持流量统计和失败重试
+      DisableGetRule: false # 保持面板规则和本地rulelist
+      DisableSniffing: false # 保持域名嗅探和route.json语义
+      DisableIVCheck: false # 保持Shadowsocks replay/IV检查
       EnableProxyProtocol: false # Only works for WebSocket and TCP
       AutoSpeedLimitConfig:
         Limit: 0 # Warned speed. Set to 0 to disable AutoSpeedLimit (mbps)
@@ -54,15 +60,7 @@ Nodes:
           Dest: 80 # Required, Destination of fallback, check https://xtls.github.io/config/features/fallback.html for details.
           ProxyProtocolVer: 0 # Send PROXY protocol version, 0 for dsable
       CertConfig:
-        CertMode: dns # Option about how to get certificate: none, file, http, tls, dns. Choose "none" will forcedly disable the tls config.
-        CertDomain: "node1.test.com" # Domain to cert
-        CertFile: /etc/XrayR/cert/node1.test.com.cert # Provided if the CertMode is file
-        KeyFile: /etc/XrayR/cert/node1.test.com.key
-        Provider: alidns # DNS cert provider, Get the full support list here: https://go-acme.github.io/lego/dns/
-        Email: test@me.com
-        DNSEnv: # DNS ENV option used by DNS provider
-          ALICLOUD_ACCESS_KEY: aaa
-          ALICLOUD_SECRET_KEY: bbb
+        CertMode: none # 仅在节点传输确实需要证书时改为file/http/tls/dns
   # -
   #   PanelType: "NewV2board" # Panel type: SSpanel, V2board, NewV2board, PMpanel, Proxypanel, V2RaySocks
   #   ApiConfig:
@@ -80,12 +78,4 @@ Nodes:
   #     UpdatePeriodic: 10 # Time to update the nodeinfo, how many sec.
   #     EnableDNS: false # Use custom DNS config, Please ensure that you set the dns.json well
   #     CertConfig:
-  #       CertMode: dns # Option about how to get certificate: none, file, http, dns
-  #       CertDomain: "node1.test.com" # Domain to cert
-  #       CertFile: /etc/XrayR/cert/node1.test.com.cert # Provided if the CertMode is file
-  #       KeyFile: /etc/XrayR/cert/node1.test.com.pem
-  #       Provider: alidns # DNS cert provider, Get the full support list here: https://go-acme.github.io/lego/dns/
-  #       Email: test@me.com
-  #       DNSEnv: # DNS ENV option used by DNS provider
-  #         ALICLOUD_ACCESS_KEY: aaa
-  #         ALICLOUD_SECRET_KEY: bbb
+  #       CertMode: none # 无TLS节点不需要证书
